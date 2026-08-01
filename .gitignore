@@ -1,0 +1,16 @@
+# Rust
+/target/
+
+# Project-local PostgreSQL instance
+/testdata/
+
+# Nix
+.direnv/
+result
+result-*/
+
+# Editor / OS
+*.swp
+*.swo
+*~
+.DS_Store
