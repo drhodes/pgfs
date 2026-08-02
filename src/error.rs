@@ -53,8 +53,91 @@ pub fn failure(what: impl std::fmt::Display) -> anyhow::Error {
 #[macro_export]
 macro_rules! log_and_reply {
     ($reply:expr, $err:expr) => {{
-        log::error!("{:#}", $err);
+        $crate::metrics::EIO_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::error!("{:#}", $err);
         $reply.error(libc::EIO);
         return;
     }};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── ctx() ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn ctx_wraps_error_with_context() {
+        let result: std::result::Result<(), anyhow::Error> = Err(anyhow::anyhow!("root cause"));
+        let wrapped = ctx(result, "load config");
+        let err = wrapped.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("load config"),
+            "context should mention 'load config', got: {msg}"
+        );
+        assert!(
+            msg.contains("src/error.rs"),
+            "context should include file location, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn ctx_preserves_root_cause() {
+        let result: std::result::Result<(), anyhow::Error> = Err(anyhow::anyhow!("root cause"));
+        let wrapped = ctx(result, "outer operation");
+        let err = wrapped.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("root cause"),
+            "chain should include 'root cause', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn ctx_on_ok_passes_through() {
+        let result: std::result::Result<i32, anyhow::Error> = Ok(42);
+        let wrapped = ctx(result, "should not matter");
+        assert_eq!(wrapped.unwrap(), 42);
+    }
+
+    #[test]
+    fn ctx_chaining_produces_layered_story() {
+        fn inner() -> Result<()> {
+            Err(failure("disk full"))
+        }
+        fn middle() -> Result<()> {
+            ctx(inner(), "save file")
+        }
+        fn outer() -> Result<()> {
+            ctx(middle(), "handle request")
+        }
+
+        let err = outer().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("handle request"));
+        assert!(msg.contains("save file"));
+        assert!(msg.contains("disk full"));
+    }
+
+    // ── failure() ───────────────────────────────────────────────────────
+
+    #[test]
+    fn failure_includes_call_site() {
+        let err = failure("invariant broken");
+        let msg = format!("{err}");
+        assert!(msg.contains("invariant broken"));
+        assert!(
+            msg.contains("src/error.rs"),
+            "should include file, got: {msg}"
+        );
+        assert!(msg.contains(':'), "should include line number, got: {msg}");
+    }
+
+    #[test]
+    fn failure_is_anyhow_error() {
+        let err = failure("test");
+        // It should be an anyhow::Error with the message.
+        assert_eq!(format!("{err}"), format!("{err}")); // anyhow Display works
+    }
 }

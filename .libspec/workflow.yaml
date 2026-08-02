@@ -1,0 +1,21 @@
+# Agent Workflow Hooks configuration file.
+# Hooks are run automatically at the named lifecycle stage.
+
+hooks:
+  post-edit:
+    - "Validate spec: `uv run libspec diff`"
+  #
+  pre-diff:
+    - "Ensure deps: `uv sync`"
+  #
+  post-implement:
+    - "Type-check: `cargo check`"
+    - "Format check: `cargo fmt --check`"
+    - "Lint: `cargo clippy -- -D warnings`"
+    - "Run tests: `cargo test`"
+  #
+  pre-commit:
+    - "Type-check: `cargo check`"
+    - "Format check: `cargo fmt --check`"
+    - "Lint: `cargo clippy -- -D warnings`"
+    - "Run tests: `cargo test`"
