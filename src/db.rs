@@ -38,6 +38,17 @@ pub struct Db {
     stmt_unlink: Statement,
     stmt_rmdir: Statement,
     stmt_list: Statement,
+
+    /// Cached replica freshness verdict and monotonic timestamp of last check (millis).
+    pub freshness_cached: bool,
+    pub freshness_checked_at: Option<u64>,
+}
+
+const FRESHNESS_TTL_MS: u64 = 500;
+
+fn now_mono_millis() -> u64 {
+    static BOOT: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    BOOT.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +169,8 @@ impl Db {
             stmt_unlink,
             stmt_rmdir,
             stmt_list,
+            freshness_cached: false,
+            freshness_checked_at: None,
         })
     }
 
@@ -206,6 +219,21 @@ impl Db {
         }
     }
 
+    /// Cached replica freshness check. Reuses the cached verdict if checked
+    /// within FRESHNESS_TTL_MS to eliminate 3-query pre-check overhead.
+    pub fn replica_fresh_cached(&mut self) -> bool {
+        let now = now_mono_millis();
+        if let Some(last_check) = self.freshness_checked_at {
+            if now.saturating_sub(last_check) < FRESHNESS_TTL_MS {
+                return self.freshness_cached;
+            }
+        }
+        let fresh = self.replica_fresh();
+        self.freshness_cached = fresh;
+        self.freshness_checked_at = Some(now);
+        fresh
+    }
+
     /// Human-readable replica health for the SIGUSR1 state dump
     /// (spec/replica.py ReplicaObservability: the SIGUSR1 state dump
     /// reports replica freshness). One of: "none" (no --replica),
@@ -214,7 +242,7 @@ impl Db {
         if self.replica.is_none() {
             return "none".to_string();
         }
-        if self.replica_fresh() {
+        if self.replica_fresh_cached() {
             "fresh".to_string()
         } else {
             "stale or unreachable".to_string()
@@ -255,7 +283,7 @@ impl Db {
     /// Children of a directory, sorted by name. Ordering is cosmetic here;
     /// fs.rs re-iterates this on every readdir.
     pub fn list(&mut self, parent: &str) -> Result<Vec<FileMeta>> {
-        if self.replica.is_some() && self.replica_fresh() {
+        if self.replica.is_some() && self.replica_fresh_cached() {
             crate::metrics::REPLICA_READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let replica = self.replica.as_mut().expect("replica present");
             let _span = debug_span!("db::list", parent).entered();
@@ -277,7 +305,7 @@ impl Db {
     }
 
     pub fn getattr(&mut self, parent: &str, name: &str) -> Result<Option<FileMeta>> {
-        if self.replica.is_some() && self.replica_fresh() {
+        if self.replica.is_some() && self.replica_fresh_cached() {
             crate::metrics::REPLICA_READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let replica = self.replica.as_mut().expect("replica present");
             let _span = debug_span!("db::getattr", parent, name).entered();
@@ -299,7 +327,7 @@ impl Db {
     }
 
     pub fn read(&mut self, parent: &str, name: &str) -> Result<Option<Vec<u8>>> {
-        if self.replica.is_some() && self.replica_fresh() {
+        if self.replica.is_some() && self.replica_fresh_cached() {
             crate::metrics::REPLICA_READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let replica = self.replica.as_mut().expect("replica present");
             let _span = debug_span!("db::read", parent, name).entered();
@@ -600,6 +628,21 @@ mod tests {
             val, "off",
             "synchronous_commit must be tuned off on connection"
         );
+    }
+
+    #[test]
+    fn replica_freshness_caches_verdict() {
+        let mut db = db_connect();
+        // Without replica, replica_fresh_cached returns false and sets cache timestamp.
+        assert!(!db.replica_fresh_cached());
+        let first_check = db.freshness_checked_at;
+        assert!(
+            first_check.is_some(),
+            "freshness timestamp must be initialized"
+        );
+        // Second immediate call within TTL should return cached verdict without updating timestamp.
+        assert!(!db.replica_fresh_cached());
+        assert_eq!(db.freshness_checked_at, first_check);
     }
 
     /// With no replica configured, every read must be served from the
