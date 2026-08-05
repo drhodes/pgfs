@@ -47,8 +47,9 @@ dd if=/dev/urandom of="$SRC_10M" bs=64k count=160 status=none
 SRC_10M_HASH=$(sha256sum "$SRC_10M" | awk '{print $1}')
 
 # Generate 362 MB deterministic data file
-dd if=/dev/zero of="$SRC_362M" bs=1M count=362 status=none
+dd if=/dev/urandom of="$SRC_362M" bs=1M count=362 status=none
 SRC_362M_HASH=$(sha256sum "$SRC_362M" | awk '{print $1}')
+
 
 echo "==> Benchmarking 1 MB File Copy (cp)"
 T0=$(date +%s%N)

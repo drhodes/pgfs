@@ -67,4 +67,5 @@ clean:
 
 packout:
 	packout spec/*.py src/*.rs flake.nix scripts/* design/chats/* Cargo.toml build.rs > /tmp/out
+	git log >> /tmp/out
 	xclip -selection clipboard < /tmp/out
