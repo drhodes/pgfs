@@ -1,0 +1,130 @@
+Looking at the actual code (not hypothetically), here's where the real time is going and what I'd fix, roughly in order of impact:
+
+1. Chunked storage instead of whole-blob read-modify-write — biggest win
+fs.rs::write() and setattr() (and db.rs::write) always read the entire file, patch bytes in memory, and rewrite the entire blob (write "N bytes" to entries.data). Your own bench_profile.sh calls this out by name ("write-ampl"). A 16MB file written in 4KB chunks does ~4000 read-modify-writes, each shipping the whole growing blob over the wire and rewriting the whole row (UPDATE ... SET data = $3), which also bloats the table until VACUUM. Fix: a blocks(parent, name, block_no, data) table with a fixed block size (64–256KB). Writes become UPDATE/INSERT on just the touched blocks; reads become a range SELECT instead of "fetch everything, slice in Rust." This turns O(filesize) work per write into O(block size).
+
+2. Replica freshness check runs on every single read — quietly very expensive
+db.rs::replica_fresh() fires up to three extra round trips (pg_is_in_recovery, pg_current_wal_lsn, pg_last_wal_replay_lsn) on every read/getattr/list call when --replica is set. That's 3x the query volume for anything read-heavy. Cache the freshness verdict with a short TTL (e.g. 200ms–1s, refreshed by a background thread) instead of re-querying per FUSE op.
+
+3. Unnamed/unprepared statements are re-parsed every call
+Every client.query/execute in db.rs sends a fresh SQL string through the extended protocol — Postgres re-parses and re-plans it each time. Since the query set is small and fixed (getattr, read, write, create, mkdir, unlink, rmdir, list, rename), client.prepare() once at connect time and reuse the Statement handles. Cheap change, removes parse/plan overhead from the hot path.
+
+4. Synchronous commit / WAL fsync per operation
+Each execute() is its own implicit transaction and, by default, Postgres fsyncs the WAL on commit (synchronous_commit = on). For a filesystem doing lots of small metadata ops (create, write, rename), that's an fsync per syscall. For dev/test workloads where you don't need crash durability to the disk, set synchronous_commit = off on the connection, or mark entries UNLOGGED (skips WAL entirely — you lose the table on crash, which may be fine for a POC). This is probably the single cheapest config change for metadata-heavy throughput.
+
+5. Kernel-side caching is too aggressive at the wrong layer
+TTL in fs.rs is 1 second for both attr and entry caches — fine as a default, but if the workload is read-heavy and doesn't need near-real-time consistency, bumping it to a few seconds cuts lookup/getattr calls into the daemon substantially (they're currently DB round trips even for repeated stat on the same file within a second... actually within a second the kernel does cache, so this mostly matters if you're doing stat-heavy tools like find/git status — worth testing with strace -c on such a workload).
+
+6. Single connection, single-threaded dispatch — no concurrency
+fuser::Session here is single-threaded and Db holds one postgres::Client behind &mut self. Every FUSE request is fully serialized even though the kernel could dispatch several in parallel. Two options: (a) fuser's multi-threaded session + a small connection pool (r2d2_postgres or hand-rolled), or (b) switch to tokio-postgres and pipeline independent requests. This matters most for workloads with concurrency (many small files, parallel builds) rather than a single sequential dd.
+
+7. Buffer writes instead of flushing on every write() syscall
+Right now every kernel write() (which can be as small as a page) triggers a full DB round trip via write_primary. Buffering dirty bytes in memory and flushing on flush/release/fsync (which is currently a no-op anyway) would coalesce many small writes into one DB write per file-close, at the cost of needing to handle crash-loses-buffer semantics.
+
+How I'd validate before spending time: you already have the profiling infra wired up (pprof/tracing-chrome, scripts/bench_profile.sh). Run it, and the flamegraph + span trace will show directly whether the time is in write (blob RMW, #1), db::* spans (query overhead, #2/#3), or idle waiting on fsync (#4) — worth doing before guessing further, since #1 and #4 look like the two biggest levers from reading the code, but the actual bottleneck depends on your workload shape (few large files vs. many small ones).
+
+ok but what about dropping fuse?
+
+Weighed FUSE alternatives against database bottleneck realities
+Weighed FUSE alternatives against database bottleneck realities
+
+Worth separating two different things: "FUSE overhead" and "the mount as a concept." Dropping FUSE gets you very different amounts of speedup depending on which one you mean.
+
+The overhead FUSE actually adds is probably not your bottleneck
+
+Every syscall on the mount goes app → VFS → FUSE kernel module → /dev/fuse → your daemon → reply → back. That round trip costs low-single-digit microseconds (a page copy plus a context switch or two). Compare that to what's actually happening in fs.rs's hot path right now: a postgres::Client query over a Unix socket, unprepared SQL getting re-parsed, and (per fix #4 from before) a WAL fsync on commit — that's high-microseconds to low-milliseconds. FUSE is roughly 1-2 orders of magnitude cheaper than the Postgres round trip it's wrapping. Dropping FUSE without fixing the DB path first would shave off the smaller number and leave the bigger one untouched.
+
+If you still want to drop it, here's what "replace FUSE" actually means:
+
+Ditch POSIX entirely, talk to Postgres directly (gRPC/HTTP/CLI). This is the only option that meaningfully removes overhead — no VFS, no kernel round trip at all, client links straight against the query layer. But it kills the entire premise of the project: git init, ls, cat, arbitrary tools working against it for free. You'd be building a database client library, not a filesystem. Fastest, but a different project.
+NFS or 9p userspace server instead of FUSE. Sounds like "not FUSE" but isn't actually faster — you still go through the kernel VFS, plus now a network protocol (even on loopback) and RPC marshaling on top. This is generally a lateral move or a regression, not a speedup, for a local mount.
+FUSE-over-io_uring (newer kernels). This is "keep FUSE, replace the /dev/fuse read/write transport with io_uring," which cuts syscall and copy overhead substantially for high-IOPS small-op workloads — real published numbers show meaningful gains. The catch: this landed in mainline fairly recently and I'm not confident the fuser crate (the pure-Rust fuse_pure.rs / fuse3.rs backends you're using) has support yet — worth checking upstream before betting on it.
+Enable writeback caching + splice within FUSE itself (no architecture change at all). Filesystem::init() negotiates capabilities with the kernel via KernelConfig; if fuser exposes writeback-cache and splice-read/write capability flags, turning them on lets the kernel page cache coalesce small write()s before they ever reach your daemon, and avoids a userspace copy on the data path. This directly attacks the write-amplification problem from before, and it's a config change, not a rewrite.
+
+My honest ranking: fix the Postgres side first (prepared statements, chunked writes, synchronous_commit=off/unlogged table) — that's where the milliseconds are. Then, if FUSE is still visibly on the flamegraph after that, check writeback cache/splice (#4) before reaching for io_uring (#3). Only go to #1 if you decide POSIX compatibility isn't actually a requirement, since that's a different project, not an optimization.
+
+Reconciled user's architectural vision with Postgres's actual in-process design constraints
+Reconciled user's architectural vision with Postgres's actual in-process design constraints
+
+Fair — let me be precise about where your model matches Postgres's real architecture and where it doesn't, because you're not wrong that the layering exists. I was too casual saying "impossible" without walking through why.
+
+What you've described is real, and it has a name: the Table Access Method (TAM) API, added in Postgres 12. The pipeline is genuinely: parser → analyzer/rewriter → planner (produces a plan tree) → executor → calls into a TableAmRoutine — a struct of C function pointers (tuple_insert, tuple_update, scan_getnextslot, etc.) that the default heap implementation (heapam_handler.c) fills in. That's the pluggable "storage engine" boundary, and it's exactly why extensions like columnar storage engines exist — they implement their own TableAmRoutine and skip the heap entirely below the executor.
+
+Here's the specific place your plan breaks, and it's not "SQL is mandatory" — it's what kind of thing that boundary is. TableAmRoutine is a struct of function pointers inside a running backend process's address space. It is not a wire protocol. There's no socket, port, or IPC channel where "storage engine requests" arrive — calling it is a C function call within the same process that's already holding:
+
+a snapshot (MVCC visibility state — which rows are visible to this transaction, computed from xmin/xmax against the active transaction list),
+pins and locks on shared buffer pool pages (the buffer pool is a shmem segment shared across every backend — writes to it without going through the buffer manager's locking protocol from a different process is a race condition, not an optimization),
+an open transaction with a WAL insertion point,
+catalog cache entries (relcache/syscache) that tell it how to interpret the raw bytes on a heap page for this specific table — and those caches are themselves populated by reading catalog tables through the same heap access path, which is the bootstrapping reason you can't have a truly standalone "storage client" that doesn't first speak enough Postgres to load its own catalog.
+
+There's no external process on the other end of this you can connect to and send "insert this tuple" to. The only way to invoke TableAmRoutine methods is to be code running inside the Postgres backend process — as a shared library the backend dlopens (an extension), operating in that backend's memory context, honoring its locks, participating in its transaction.
+
+The analogy that's probably closest to your own systems intuition: this is like wanting to skip a hypervisor's syscall interface and call the block driver's ioctl handlers directly from a different process's userspace. The function pointers are real and documented. But they're not exposed across a process boundary, they're not safe to call without the surrounding subsystem's locks held correctly, and the state they mutate (the buffer pool) is privately owned by that other process. "Talk directly to the storage engine" from an external API server isn't a socket you're missing — it's a category of access that only exists in-process.
+
+The other route — read/write the on-disk heap page format directly, bypassing Postgres's process entirely — is real and documented (item pointers, tuple headers, xmin/xmax visibility bits, TOAST pointers). But it only works safely offline, against files no live postgres process is touching. Do it concurrently with a running server and you get silent corruption: the buffer manager caches pages in shared memory and has no idea your out-of-band writes happened, so it'll overwrite them with stale cached versions, or your writes will be invisible until a checkpoint, or both. This isn't a hardening gap you tune away — it's what the buffer manager and WAL exist to prevent, and going around them means reimplementing MVCC visibility computation and crash-safe writes yourself, at which point you've built your own database engine that happens to reuse Postgres's page layout.
+
+What actually gets you what you want, staying inside the real architecture: a Postgres extension or background worker that runs inside the backend process and calls the heap AM functions directly — heap_insert, systable_beginscan, index_insert — skipping SQL text, the parser, and the planner entirely. This is real, used by production extensions, and given you're already in Rust, pgrx is the framework for exactly this (Rust bindings into the extension ABI, background worker support, direct access to the same internals C extensions use). You'd write your API layer as a pgrx background worker: it starts inside postmaster, gets its own backend-like connection to shared memory, and your gRPC/whatever-frontend code calls Postgres internals directly in the same address space — genuinely zero SQL parsing, zero wire protocol between your API and storage.
+
+Set your expectations on the payoff correctly before committing to this, though — this is the part that actually matters for your goal. You're already on prepared statements, so parse+plan overhead on your hot path is close to zero today — that's not what's left in your ~100µs p50. What's left is the stuff that doesn't go away just because you called heap_insert instead of sending INSERT: snapshot acquisition, buffer pin/lock, WAL record construction, transaction bookkeeping, catalog lookups to resolve the relation. Those are inherent to being a transactional MVCC engine, not artifacts of having a SQL front end. Bypassing SQL text plausibly saves you tens of microseconds off a ~100µs number, not most of it — and you pay for that with your API layer becoming permanently version-coupled to Postgres's internal ABI (which changes across major versions), losing the ability to run as an independent scalable process (a pgrx bgworker lives inside one Postgres instance's postmaster, not as a separately deployable service), and taking on a much harder-to-debug codebase.
+
+Is the actual motivation here "I want the last 10-20% of latency no matter the engineering cost," or is it still "I want an API layer instead of POSIX" — because if it's the latter, tokio-postgres + prepared statements + pipelining gets you nearly all of the win with none of the ABI coupling, and the SQL-bypass is a much bigger bet for a much smaller remaining prize.
+
+Fantastic that's right, I'm talking about using FFI in rust and linking directly into the postgres codebase.
+
+Weighed pgrx FFI architecture tradeoffs, concurrency constraints, and performance realities
+Weighed pgrx FFI architecture tradeoffs, concurrency constraints, and performance realities
+
+Good — that's the correct name for the mechanism, and yes, it's real and buildable. pgrx gives you raw pg_sys::* FFI bindings to the actual C structs and functions (pg_sys::heap_insert, pg_sys::table_open, pg_sys::index_insert, pg_sys::GetTransactionSnapshot, etc.) — no wrapper, no SQL text, no planner. Let me walk through what you're actually signing up for, because there are two costs in this design that aren't about whether it's possible, but about what shape the result takes.
+
+Cost 1: Postgres's concurrency model doesn't disappear just because you're inside the process.
+
+A Postgres backend is single-threaded and stateful — one active transaction, one snapshot, one set of pinned buffers, one memory context stack, at a time. This isn't an artifact of the SQL layer; it's how the whole engine is built. So "one Rust process that accepts many concurrent gRPC requests and calls heap_insert for each" doesn't work the way a normal async server does — you can't have two logical operations in flight inside the same backend simultaneously without corrupting that state. The two real options:
+
+N background workers, each handling one thing at a time — which is structurally identical to Postgres's own backend-per-connection model, just with your protocol standing in for libpq. You're not eliminating that architecture; you're rebuilding it with a thinner front end.
+One bgworker, fully serialized — an async runtime outside the Postgres calls is fine (accepting connections, buffering), but the actual heap_insert/heap_update/scan calls must run one at a time, in order, on effectively one "backend" of state.
+
+Either way, you're not skipping the serialization Postgres already does per-connection — you're just choosing where the queue forms.
+
+Cost 2: skipping the executor means you inherit what the executor was doing for you.
+
+This is the bigger one, and it's not optional. heap_insert alone does not give you a correct row. The executor, when it runs an INSERT, also:
+
+calls index_insert for every index on the table (skip this and your indexes silently go stale — reads through them return wrong/missing results),
+runs constraint checks (NOT NULL, CHECK, foreign keys) — skip this and you've built an engine that doesn't enforce the schema anymore,
+handles TOAST out-of-line storage for values over ~2KB (your 64KB blocks are already past this threshold — you'd need to call the TOAST machinery yourself, not just heap_insert the raw bytes),
+constructs the WAL record correctly for crash recovery,
+manages the command counter (CommandId) so later statements in the same transaction see earlier ones.
+
+None of that is SQL-layer overhead — it's correctness machinery that lives below the SQL layer, which is why bypassing SQL doesn't make it go away. You'd be reimplementing a meaningful slice of execMain.c/heapam.c by hand for every operation type (insert, update, delete, scan), and every bug in that reimplementation is silent data corruption or a stale index, not a query error you'd notice.
+
+So what does bypassing the front end actually buy you, concretely?
+
+Given you're already on prepared statements, the SQL text parser and planner aren't in your current ~100µs p50 at all — prepared statements skip both. What direct FFI removes on top of that is: the executor's general-purpose plan-node dispatch (ExecProcNode state machine overhead for a query shape that, in your case, is always the same one or two node types), and the wire-protocol encode/decode between your process and the backend — since there is no separate backend anymore, it's the same process. That's a real saving, plausibly tens of microseconds, but it's layered on top of snapshot acquisition, buffer pin/lock, and WAL append, which don't move.
+
+Cost 3 — the one that outlasts the performance question: ABI coupling. pg_sys::heap_insert's signature, the tuple header layout, TableAmRoutine's method set — none of this is the stable public interface SQL is. It changes across major versions without deprecation cycles the way SQL syntax does. Pin to PG17 today and a PG18 upgrade is a pgrx rebuild against new internals, not a pg_upgrade. That's a real, ongoing maintenance tax, not a one-time cost.
+
+If you want to actually build this, the concrete shape:
+
+rust
+// pgrx background worker, registered at extension init.
+// Runs inside postmaster's shared memory, gets its own backend-like
+// connection via BackgroundWorkerInitializeConnection.
+#[pg_guard]
+extern "C" fn pgfs_worker_main(_arg: pg_sys::Datum) {
+    unsafe {
+        BackgroundWorkerInitializeConnection(c"pgfs".as_ptr(), std::ptr::null(), 0);
+    }
+    // Your own accept loop (Unix socket / whatever your API protocol is)
+    // goes here — but each request, inside, does:
+    unsafe {
+        pg_sys::StartTransactionCommand();
+        let rel = pg_sys::table_open(your_relid, pg_sys::RowExclusiveLock as i32);
+        // build a HeapTuple by hand, call pg_sys::heap_insert(...)
+        // call pg_sys::index_insert(...) for each index yourself
+        // handle TOAST yourself if the value exceeds the inline threshold
+        pg_sys::table_close(rel, pg_sys::RowExclusiveLock as i32);
+        pg_sys::CommitTransactionCommand();
+    }
+}
+
+Given the correctness burden (cost 2) is the real risk here, not the concurrency model or the ABI coupling — both of which are annoying but manageable — I'd actually suggest a middle rung before committing to raw heap AM calls: SPI with prepared, cached plans, still inside a pgrx bgworker, still zero network round trip and zero SQL text at the call site (you build the plan once via SPI_prepare, then SPI_execute_plan repeatedly with bound parameters). SPI goes through the executor, so you keep index maintenance, TOAST, and constraint checking for free — you're only skipping parse+plan+network, which is the part that's actually cheap to skip safely. That gets you the process-boundary elimination and most of the reachable latency win, without you becoming responsible for reimplementing index maintenance correctly by hand. Worth doing that first and measuring — if SPI's still not fast enough after that, then the case for hand-rolled heap_insert + manual index/TOAST handling is much easier to justify, because you'll know exactly how many microseconds are left on the table rather than guessing.
