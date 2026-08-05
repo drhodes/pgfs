@@ -321,15 +321,7 @@ impl Filesystem for PgFs {
                 reply.error(EISDIR);
                 return;
             }
-            // read-modify-write: the old bytes MUST come from the primary so
-            // a stale replica can never feed the truncate its own stale copy.
-            let mut current = match self.db.read_primary(parent, name) {
-                Ok(Some(d)) => d,
-                Ok(None) => Vec::new(),
-                Err(e) => crate::log_and_reply!(reply, e),
-            };
-            current.resize(new_size as usize, 0);
-            if let Err(e) = self.db.write(parent, name, &current) {
+            if let Err(e) = self.db.truncate(parent, name, new_size) {
                 crate::log_and_reply!(reply, e);
             }
         }
@@ -367,21 +359,18 @@ impl Filesystem for PgFs {
             }
         };
         let (parent, name) = split_path(&path);
-        match self.db.read(parent, name) {
-            Ok(Some(data)) => {
-                let start = (offset as usize).min(data.len());
-                let end = (start + size as usize).min(data.len());
-                reply.data(&data[start..end]);
-            }
+        match self
+            .db
+            .read_range(parent, name, offset as u64, size as usize)
+        {
+            Ok(Some(data)) => reply.data(&data),
             Ok(None) => reply.error(ENOENT),
             Err(e) => crate::log_and_reply!(reply, e),
         }
     }
 
-    /// Whole-blob read-modify-write, exactly as blunt as it sounds. Every
-    /// write re-reads the full file, patches the byte range, and writes the
-    /// full thing back. Fine for small files and for getting this working;
-    /// the natural next step is chunked storage once this is the bottleneck.
+    /// Block-level chunked write. Touched blocks are updated without whole-blob
+    /// read-modify-write amplification.
     fn write(
         &mut self,
         _req: &Request,
@@ -407,25 +396,7 @@ impl Filesystem for PgFs {
         };
         let (parent, name) = split_path(&path);
 
-        // read-modify-write: the old bytes MUST come from the primary so a
-        // stale replica can never feed the write its own stale copy (that
-        // would be a lost update on the primary).
-        let mut current = match self.db.read_primary(parent, name) {
-            Ok(Some(d)) => d,
-            Ok(None) => {
-                reply.error(ENOENT);
-                return;
-            }
-            Err(e) => crate::log_and_reply!(reply, e),
-        };
-
-        let offset = offset as usize;
-        if current.len() < offset + data.len() {
-            current.resize(offset + data.len(), 0);
-        }
-        current[offset..offset + data.len()].copy_from_slice(data);
-
-        match self.db.write(parent, name, &current) {
+        match self.db.write_range(parent, name, offset as u64, data) {
             Ok(()) => reply.written(data.len() as u32),
             Err(e) => crate::log_and_reply!(reply, e),
         }

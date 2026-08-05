@@ -31,19 +31,23 @@ pub struct Db {
 
     // Pre-compiled SQL statement handles on the primary connection.
     stmt_getattr: Statement,
-    stmt_read: Statement,
-    stmt_write: Statement,
     stmt_create: Statement,
     stmt_mkdir: Statement,
     stmt_unlink: Statement,
     stmt_rmdir: Statement,
     stmt_list: Statement,
 
+    stmt_read_blocks: Statement,
+    stmt_upsert_block: Statement,
+    stmt_prune_blocks: Statement,
+    stmt_delete_blocks: Statement,
+
     /// Cached replica freshness verdict and monotonic timestamp of last check (millis).
     pub freshness_cached: bool,
     pub freshness_checked_at: Option<u64>,
 }
 
+pub const BLOCK_SIZE: usize = 64 * 1024;
 const FRESHNESS_TTL_MS: u64 = 500;
 
 fn now_mono_millis() -> u64 {
@@ -92,7 +96,8 @@ impl Db {
         )?;
         error::ctx(
             client.batch_execute(
-                "SET synchronous_commit = off;
+                "BEGIN;
+                SELECT pg_advisory_xact_lock(42424242);
                 CREATE TABLE IF NOT EXISTS entries (
                     parent text NOT NULL,
                     name   text NOT NULL,
@@ -101,7 +106,16 @@ impl Db {
                     size   bigint NOT NULL DEFAULT 0,
                     mtime  timestamptz NOT NULL DEFAULT now(),
                     PRIMARY KEY (parent, name)
-                )",
+                );
+                CREATE TABLE IF NOT EXISTS blocks (
+                    parent   text NOT NULL,
+                    name     text NOT NULL,
+                    block_no integer NOT NULL,
+                    data     bytea NOT NULL,
+                    PRIMARY KEY (parent, name, block_no)
+                );
+                COMMIT;
+                SET synchronous_commit = off;",
             ),
             "ensure schema exists and configure synchronous_commit = off",
         )?;
@@ -111,14 +125,6 @@ impl Db {
                 "SELECT name, kind, size, mtime FROM entries WHERE parent = $1 AND name = $2",
             ),
             "prepare stmt_getattr",
-        )?;
-        let stmt_read = error::ctx(
-            client.prepare("SELECT data FROM entries WHERE parent = $1 AND name = $2"),
-            "prepare stmt_read",
-        )?;
-        let stmt_write = error::ctx(
-            client.prepare("UPDATE entries SET data = $3, size = $4, mtime = now() WHERE parent = $1 AND name = $2"),
-            "prepare stmt_write",
         )?;
         let stmt_create = error::ctx(
             client.prepare("INSERT INTO entries (parent, name, kind, data, size) VALUES ($1, $2, 'file', '', 0) ON CONFLICT (parent, name) DO NOTHING"),
@@ -143,6 +149,27 @@ impl Db {
             "prepare stmt_list",
         )?;
 
+        let stmt_read_blocks = error::ctx(
+            client.prepare(
+                "SELECT block_no, data FROM blocks WHERE parent = $1 AND name = $2 AND block_no >= $3 AND block_no <= $4 ORDER BY block_no",
+            ),
+            "prepare stmt_read_blocks",
+        )?;
+        let stmt_upsert_block = error::ctx(
+            client.prepare(
+                "INSERT INTO blocks (parent, name, block_no, data) VALUES ($1, $2, $3, $4) ON CONFLICT (parent, name, block_no) DO UPDATE SET data = EXCLUDED.data",
+            ),
+            "prepare stmt_upsert_block",
+        )?;
+        let stmt_prune_blocks = error::ctx(
+            client.prepare("DELETE FROM blocks WHERE parent = $1 AND name = $2 AND block_no > $3"),
+            "prepare stmt_prune_blocks",
+        )?;
+        let stmt_delete_blocks = error::ctx(
+            client.prepare("DELETE FROM blocks WHERE parent = $1 AND name = $2"),
+            "prepare stmt_delete_blocks",
+        )?;
+
         let replica = match replica_conn {
             Some(s) => match Client::connect(s, NoTls) {
                 Ok(c) => Some(c),
@@ -162,13 +189,15 @@ impl Db {
             client,
             replica,
             stmt_getattr,
-            stmt_read,
-            stmt_write,
             stmt_create,
             stmt_mkdir,
             stmt_unlink,
             stmt_rmdir,
             stmt_list,
+            stmt_read_blocks,
+            stmt_upsert_block,
+            stmt_prune_blocks,
+            stmt_delete_blocks,
             freshness_cached: false,
             freshness_checked_at: None,
         })
@@ -326,27 +355,6 @@ impl Db {
         }
     }
 
-    pub fn read(&mut self, parent: &str, name: &str) -> Result<Option<Vec<u8>>> {
-        if self.replica.is_some() && self.replica_fresh_cached() {
-            crate::metrics::REPLICA_READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let replica = self.replica.as_mut().expect("replica present");
-            let _span = debug_span!("db::read", parent, name).entered();
-            let _t0 = Instant::now();
-            let row = error::ctx(
-                replica.query_opt(
-                    "SELECT data FROM entries WHERE parent = $1 AND name = $2",
-                    &[&parent, &name],
-                ),
-                &format!("read contents of {name:?} in {parent:?}"),
-            )?;
-            crate::metrics::DB_LATENCY.record(_t0.elapsed());
-            Ok(row.map(|r| r.get::<_, Vec<u8>>("data")))
-        } else {
-            self.record_replica_fallback_if_configured();
-            self.read_primary(parent, name)
-        }
-    }
-
     fn record_replica_fallback_if_configured(&mut self) {
         if self.replica.is_some() {
             crate::metrics::REPLICA_FALLBACK_COUNT
@@ -367,36 +375,220 @@ impl Db {
         }
     }
 
-    /// read forced to the primary. Used by the write path's
-    /// read-modify-write (fs.rs) so a stale replica can never supply the
-    /// "old" bytes a write is about to patch over — that would silently
-    /// lose concurrent primary writes.
-    pub fn read_primary(&mut self, parent: &str, name: &str) -> Result<Option<Vec<u8>>> {
-        let _span = debug_span!("db::read", parent, name).entered();
+    pub fn read_range_primary(
+        &mut self,
+        parent: &str,
+        name: &str,
+        offset: u64,
+        len: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        let _span = debug_span!("db::read_range", parent, name, offset, len).entered();
         let _t0 = Instant::now();
-        let row = error::ctx(
-            self.client.query_opt(&self.stmt_read, &[&parent, &name]),
-            &format!("read contents of {name:?} in {parent:?}"),
+        let meta = match self.getattr_primary(parent, name)? {
+            Some(m) if m.kind == Kind::File => m,
+            _ => return Ok(None),
+        };
+        if offset >= meta.size {
+            return Ok(Some(Vec::new()));
+        }
+        let actual_len = (len as u64).min(meta.size - offset) as usize;
+        if actual_len == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let start_block = (offset / BLOCK_SIZE as u64) as i32;
+        let end_block = ((offset + actual_len as u64 - 1) / BLOCK_SIZE as u64) as i32;
+
+        let rows = error::ctx(
+            self.client.query(
+                &self.stmt_read_blocks,
+                &[&parent, &name, &start_block, &end_block],
+            ),
+            &format!("read blocks for {name:?} in {parent:?}"),
         )?;
+
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let b_no: i32 = row.get("block_no");
+            let b_data: Vec<u8> = row.get("data");
+            map.insert(b_no, b_data);
+        }
+
+        let mut result = Vec::with_capacity(actual_len);
+        let mut current_offset = offset;
+        let end_offset = offset + actual_len as u64;
+
+        while current_offset < end_offset {
+            let block_no = (current_offset / BLOCK_SIZE as u64) as i32;
+            let block_start = (block_no as u64) * (BLOCK_SIZE as u64);
+            let block_offset = (current_offset - block_start) as usize;
+            let bytes_in_block =
+                ((block_start + BLOCK_SIZE as u64).min(end_offset) - current_offset) as usize;
+
+            if let Some(b_data) = map.get(&block_no) {
+                let slice_end = (block_offset + bytes_in_block).min(b_data.len());
+                if block_offset < b_data.len() {
+                    result.extend_from_slice(&b_data[block_offset..slice_end]);
+                    if slice_end < block_offset + bytes_in_block {
+                        result.resize(
+                            result.len() + (block_offset + bytes_in_block - slice_end),
+                            0,
+                        );
+                    }
+                } else {
+                    result.resize(result.len() + bytes_in_block, 0);
+                }
+            } else {
+                result.resize(result.len() + bytes_in_block, 0);
+            }
+            current_offset += bytes_in_block as u64;
+        }
         crate::metrics::DB_LATENCY.record(_t0.elapsed());
-        Ok(row.map(|r| r.get::<_, Vec<u8>>("data")))
+        Ok(Some(result))
     }
 
-    /// Whole-blob write. Simplest possible thing that works: read-modify-write
-    /// happens in fs.rs (it fetches, patches the byte range, calls this with
-    /// the full new contents). No chunking yet — that's a later upgrade.
-    pub fn write(&mut self, parent: &str, name: &str, data: &[u8]) -> Result<()> {
-        let _span = debug_span!("db::write", parent, name, len = data.len()).entered();
+    pub fn read_range(
+        &mut self,
+        parent: &str,
+        name: &str,
+        offset: u64,
+        len: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        self.record_replica_fallback_if_configured();
+        self.read_range_primary(parent, name, offset, len)
+    }
+
+    pub fn write_range(
+        &mut self,
+        parent: &str,
+        name: &str,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        let _span =
+            debug_span!("db::write_range", parent, name, offset, len = data.len()).entered();
         let _t0 = Instant::now();
+        if data.is_empty() {
+            return Ok(());
+        }
+        let start_block = (offset / BLOCK_SIZE as u64) as i32;
+        let end_block = ((offset + data.len() as u64 - 1) / BLOCK_SIZE as u64) as i32;
+
+        for b_no in start_block..=end_block {
+            let block_start = (b_no as u64) * (BLOCK_SIZE as u64);
+            let block_end = block_start + BLOCK_SIZE as u64;
+
+            let write_start = offset.max(block_start);
+            let write_end = (offset + data.len() as u64).min(block_end);
+
+            let in_data_start = (write_start - offset) as usize;
+            let in_data_end = (write_end - offset) as usize;
+            let chunk = &data[in_data_start..in_data_end];
+
+            let block_offset = (write_start - block_start) as usize;
+
+            let mut block_data = if block_offset > 0 || chunk.len() < BLOCK_SIZE {
+                self.read_range_primary(parent, name, block_start, BLOCK_SIZE)?
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
+            if block_data.len() < block_offset + chunk.len() {
+                block_data.resize(block_offset + chunk.len(), 0);
+            }
+            block_data[block_offset..block_offset + chunk.len()].copy_from_slice(chunk);
+
+            error::ctx(
+                self.client.execute(
+                    &self.stmt_upsert_block,
+                    &[&parent, &name, &b_no, &block_data],
+                ),
+                &format!("upsert block {b_no} for {name:?} in {parent:?}"),
+            )?;
+        }
+
+        let meta = self.getattr_primary(parent, name)?;
+        let old_size = meta.as_ref().map(|m| m.size).unwrap_or(0);
+        let new_size = old_size.max(offset + data.len() as u64);
+
         error::ctx(
             self.client.execute(
-                &self.stmt_write,
-                &[&parent, &name, &data, &(data.len() as i64)],
+                "UPDATE entries SET size = $3, mtime = now() WHERE parent = $1 AND name = $2",
+                &[&parent, &name, &(new_size as i64)],
             ),
-            &format!("write {} bytes to {name:?} in {parent:?}", data.len()),
+            &format!("update size of {name:?} in {parent:?}"),
         )?;
         crate::metrics::DB_LATENCY.record(_t0.elapsed());
         Ok(())
+    }
+
+    pub fn truncate(&mut self, parent: &str, name: &str, new_size: u64) -> Result<()> {
+        let _span = debug_span!("db::truncate", parent, name, new_size).entered();
+        let _t0 = Instant::now();
+        let meta = match self.getattr_primary(parent, name)? {
+            Some(m) if m.kind == Kind::File => m,
+            _ => {
+                return Err(error::failure(format!(
+                    "truncate target {name:?} in {parent:?} not a file"
+                )))
+            }
+        };
+
+        if new_size < meta.size {
+            let last_valid_block = (new_size / BLOCK_SIZE as u64) as i32;
+            error::ctx(
+                self.client.execute(
+                    &self.stmt_prune_blocks,
+                    &[&parent, &name, &last_valid_block],
+                ),
+                &format!("prune blocks past {new_size} for {name:?} in {parent:?}"),
+            )?;
+
+            let block_rem = (new_size % BLOCK_SIZE as u64) as usize;
+            if block_rem > 0 {
+                if let Some(mut block_data) = self.read_range_primary(
+                    parent,
+                    name,
+                    (last_valid_block as u64) * BLOCK_SIZE as u64,
+                    BLOCK_SIZE,
+                )? {
+                    block_data.truncate(block_rem);
+                    error::ctx(
+                        self.client.execute(
+                            &self.stmt_upsert_block,
+                            &[&parent, &name, &last_valid_block, &block_data],
+                        ),
+                        &format!("patch boundary block for {name:?} in {parent:?}"),
+                    )?;
+                }
+            }
+        }
+
+        error::ctx(
+            self.client.execute(
+                "UPDATE entries SET size = $3, mtime = now() WHERE parent = $1 AND name = $2",
+                &[&parent, &name, &(new_size as i64)],
+            ),
+            &format!("update size of {name:?} in {parent:?}"),
+        )?;
+        crate::metrics::DB_LATENCY.record(_t0.elapsed());
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn read(&mut self, parent: &str, name: &str) -> Result<Option<Vec<u8>>> {
+        self.read_range(parent, name, 0, usize::MAX)
+    }
+
+    #[allow(dead_code)]
+    pub fn read_primary(&mut self, parent: &str, name: &str) -> Result<Option<Vec<u8>>> {
+        self.read_range_primary(parent, name, 0, usize::MAX)
+    }
+
+    #[allow(dead_code)]
+    pub fn write(&mut self, parent: &str, name: &str, data: &[u8]) -> Result<()> {
+        self.truncate(parent, name, 0)?;
+        self.write_range(parent, name, 0, data)
     }
 
     pub fn create(&mut self, parent: &str, name: &str) -> Result<()> {
@@ -427,6 +619,11 @@ impl Db {
         error::ctx(
             self.client.execute(&self.stmt_unlink, &[&parent, &name]),
             &format!("remove file {name:?} from {parent:?}"),
+        )?;
+        error::ctx(
+            self.client
+                .execute(&self.stmt_delete_blocks, &[&parent, &name]),
+            &format!("remove blocks of file {name:?} from {parent:?}"),
         )?;
         crate::metrics::DB_LATENCY.record(_t0.elapsed());
         Ok(())
@@ -495,6 +692,13 @@ impl Db {
                 ),
                 &format!("remove target {new_path:?} before overwrite"),
             )?;
+            error::ctx(
+                txn.execute(
+                    "DELETE FROM blocks WHERE parent = $1 AND name = $2",
+                    &[&new_parent, &new_name],
+                ),
+                &format!("remove target blocks for {new_path:?} before overwrite"),
+            )?;
         }
 
         if meta.kind == Kind::Dir {
@@ -507,6 +711,15 @@ impl Db {
                 ),
                 &format!("rewrite descendant parent paths for directory {old_path:?}"),
             )?;
+            error::ctx(
+                txn.execute(
+                    "UPDATE blocks
+                     SET parent = $1 || substring(parent FROM $2 + 1)
+                     WHERE parent = $3 OR parent LIKE $3 || '/%'",
+                    &[&new_path, &(old_path.len() as i32), &old_path],
+                ),
+                &format!("rewrite descendant block parent paths for directory {old_path:?}"),
+            )?;
         }
 
         let moved = error::ctx(
@@ -516,6 +729,15 @@ impl Db {
                 &[&new_parent, &new_name, &old_parent, &old_name],
             ),
             &format!("move entry {old_path:?} -> {new_path:?}"),
+        )?;
+
+        error::ctx(
+            txn.execute(
+                "UPDATE blocks SET parent = $1, name = $2
+                 WHERE parent = $3 AND name = $4",
+                &[&new_parent, &new_name, &old_parent, &old_name],
+            ),
+            &format!("move blocks {old_path:?} -> {new_path:?}"),
         )?;
 
         if moved == 0 {
@@ -643,6 +865,40 @@ mod tests {
         // Second immediate call within TTL should return cached verdict without updating timestamp.
         assert!(!db.replica_fresh_cached());
         assert_eq!(db.freshness_checked_at, first_check);
+    }
+
+    #[test]
+    fn block_storage_partial_write_and_read_range() {
+        let mut db = db_connect();
+        let root = root_dir(&mut db);
+
+        db.create(&root, "block.bin").unwrap();
+        db.write_range(&root, "block.bin", 0, b"Hello ").unwrap();
+        db.write_range(&root, "block.bin", 6, b"World!").unwrap();
+
+        let full = db.read_range(&root, "block.bin", 0, 12).unwrap().unwrap();
+        assert_eq!(full, b"Hello World!");
+
+        let slice = db.read_range(&root, "block.bin", 6, 5).unwrap().unwrap();
+        assert_eq!(slice, b"World");
+
+        cleanup(&mut db, &root);
+    }
+
+    #[test]
+    fn block_storage_truncate_prunes_blocks() {
+        let mut db = db_connect();
+        let root = root_dir(&mut db);
+
+        db.create(&root, "trunc.bin").unwrap();
+        let payload = vec![1u8; 100 * 1024]; // 100 KB spanning two 64KB blocks
+        db.write_range(&root, "trunc.bin", 0, &payload).unwrap();
+
+        db.truncate(&root, "trunc.bin", 10).unwrap();
+        let truncated = db.read_range(&root, "trunc.bin", 0, 100).unwrap().unwrap();
+        assert_eq!(truncated, vec![1u8; 10]);
+
+        cleanup(&mut db, &root);
     }
 
     /// With no replica configured, every read must be served from the
