@@ -612,6 +612,65 @@ impl Db {
         Ok(())
     }
 
+    pub fn write_blocks_batch(
+        &mut self,
+        parent: &str,
+        name: &str,
+        blocks: &std::collections::HashMap<i32, Vec<u8>>,
+        new_size: u64,
+    ) -> Result<()> {
+        let _span = debug_span!(
+            "db::write_blocks_batch",
+            parent,
+            name,
+            count = blocks.len(),
+            new_size
+        )
+        .entered();
+        let _t0 = Instant::now();
+        if blocks.is_empty() && new_size == 0 {
+            return Ok(());
+        }
+
+        let meta = if new_size > 0 {
+            self.getattr_primary(parent, name)?
+        } else {
+            None
+        };
+
+        let mut txn = error::ctx(
+            self.client.transaction(),
+            &format!("begin write_blocks_batch for {name:?} in {parent:?}"),
+        )?;
+
+        for (b_no, block_data) in blocks {
+            error::ctx(
+                txn.execute(&self.stmt_upsert_block, &[&parent, &name, b_no, block_data]),
+                &format!("upsert block {b_no} for {name:?} in {parent:?}"),
+            )?;
+        }
+
+        if new_size > 0 {
+            let old_size = meta.as_ref().map(|m| m.size).unwrap_or(0);
+            let updated_size = old_size.max(new_size);
+
+            error::ctx(
+                txn.execute(
+                    "UPDATE entries SET size = $3, mtime = now() WHERE parent = $1 AND name = $2",
+                    &[&parent, &name, &(updated_size as i64)],
+                ),
+                &format!("update size of {name:?} in {parent:?}"),
+            )?;
+        }
+
+        error::ctx(
+            txn.commit(),
+            &format!("commit write_blocks_batch for {name:?} in {parent:?}"),
+        )?;
+        crate::metrics::DB_LATENCY.record(_t0.elapsed());
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub fn read(&mut self, parent: &str, name: &str) -> Result<Option<Vec<u8>>> {
         self.read_range(parent, name, 0, usize::MAX)
@@ -966,6 +1025,27 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(read_back, payload);
+
+        cleanup(&mut db, &root);
+    }
+
+    #[test]
+    fn write_blocks_batch_flushes_dirty_blocks() {
+        let mut db = db_connect();
+        let root = root_dir(&mut db);
+
+        db.create(&root, "buffered.bin").unwrap();
+
+        let mut dirty = std::collections::HashMap::new();
+        dirty.insert(0, b"Hello Buffered ".to_vec());
+        db.write_blocks_batch(&root, "buffered.bin", &dirty, 15)
+            .unwrap();
+
+        let content = db
+            .read_range(&root, "buffered.bin", 0, 15)
+            .unwrap()
+            .unwrap();
+        assert_eq!(content, b"Hello Buffered ");
 
         cleanup(&mut db, &root);
     }

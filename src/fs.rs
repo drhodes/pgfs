@@ -34,12 +34,55 @@ const TTL: Duration = Duration::from_secs(1);
 const ROOT_INO: u64 = 1;
 const ROOT_PATH: &str = "";
 
+pub struct HandleBuffer {
+    parent: String,
+    name: String,
+    dirty_blocks: HashMap<i32, Vec<u8>>,
+    max_size: u64,
+}
+
+impl HandleBuffer {
+    fn write(&mut self, offset: u64, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        let end = offset + data.len() as u64;
+        self.max_size = self.max_size.max(end);
+
+        let start_block = (offset / crate::db::BLOCK_SIZE as u64) as i32;
+        let end_block = ((end - 1) / crate::db::BLOCK_SIZE as u64) as i32;
+
+        for b_no in start_block..=end_block {
+            let block_start = (b_no as u64) * (crate::db::BLOCK_SIZE as u64);
+            let block_end = block_start + crate::db::BLOCK_SIZE as u64;
+
+            let write_start = offset.max(block_start);
+            let write_end = end.min(block_end);
+
+            let in_data_start = (write_start - offset) as usize;
+            let in_data_end = (write_end - offset) as usize;
+            let chunk = &data[in_data_start..in_data_end];
+
+            let block_offset = (write_start - block_start) as usize;
+
+            let b_data = self.dirty_blocks.entry(b_no).or_default();
+
+            if b_data.len() < block_offset + chunk.len() {
+                b_data.resize(block_offset + chunk.len(), 0);
+            }
+            b_data[block_offset..block_offset + chunk.len()].copy_from_slice(chunk);
+        }
+    }
+}
+
 pub struct PgFs {
     db: Db,
     /// path -> inode, allocated lazily and never reused.
     ino_by_path: HashMap<String, u64>,
     path_by_ino: HashMap<u64, String>,
     next_ino: u64,
+    next_fh: u64,
+    open_handles: HashMap<u64, HandleBuffer>,
     /// Set by the signal-waiter thread on SIGUSR1 (main.rs). Callbacks
     /// poll it in the preamble and log a state dump when set
     /// (spec/observe.py StateIntrospection #1).
@@ -118,10 +161,29 @@ impl PgFs {
             ino_by_path,
             path_by_ino,
             next_ino: ROOT_INO + 1,
+            next_fh: 1,
+            open_handles: HashMap::new(),
             dump_requested,
             started: Instant::now(),
             attr_ttl,
         }
+    }
+
+    fn flush_handle(&mut self, fh: u64) -> crate::error::Result<()> {
+        if let Some(mut handle) = self.open_handles.remove(&fh) {
+            if !handle.dirty_blocks.is_empty() || handle.max_size > 0 {
+                self.db.write_blocks_batch(
+                    &handle.parent,
+                    &handle.name,
+                    &handle.dirty_blocks,
+                    handle.max_size,
+                )?;
+                handle.dirty_blocks.clear();
+                handle.max_size = 0;
+            }
+            self.open_handles.insert(fh, handle);
+        }
+        Ok(())
     }
 
     /// If a SIGUSR1 was received, log a full state dump from this callback:
@@ -352,7 +414,7 @@ impl Filesystem for PgFs {
         &mut self,
         _req: &Request,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         size: u32,
         _flags: i32,
@@ -360,9 +422,10 @@ impl Filesystem for PgFs {
         reply: ReplyData,
     ) {
         let _latency = metrics::FuseLatencyGuard::new();
-        let _span = info_span!("read", ino, offset, size).entered();
+        let _span = info_span!("read", ino, fh, offset, size).entered();
         callback_preamble!(self, reply);
         metrics::READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.flush_handle(fh);
         let path = match self.path_of_ino(ino) {
             Some(p) => p,
             None => {
@@ -387,7 +450,7 @@ impl Filesystem for PgFs {
         &mut self,
         _req: &Request,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         data: &[u8],
         _write_flags: u32,
@@ -396,9 +459,16 @@ impl Filesystem for PgFs {
         reply: ReplyWrite,
     ) {
         let _latency = metrics::FuseLatencyGuard::new();
-        let _span = info_span!("write", ino, offset, len = data.len()).entered();
+        let _span = info_span!("write", ino, fh, offset, len = data.len()).entered();
         callback_preamble!(self, reply);
         metrics::WRITE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        if let Some(buf) = self.open_handles.get_mut(&fh) {
+            buf.write(offset as u64, data);
+            reply.written(data.len() as u32);
+            return;
+        }
+
         let path = match self.path_of_ino(ino) {
             Some(p) => p,
             None => {
@@ -419,15 +489,61 @@ impl Filesystem for PgFs {
         let _span = info_span!("open", ino).entered();
         callback_preamble!(self, reply);
         metrics::OPEN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        reply.opened(0, 0);
+        let path = match self.path_of_ino(ino) {
+            Some(p) => p,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+        let (parent, name) = split_path(&path);
+        let fh = self.next_fh;
+        self.next_fh += 1;
+        self.open_handles.insert(
+            fh,
+            HandleBuffer {
+                parent: parent.to_string(),
+                name: name.to_string(),
+                dirty_blocks: HashMap::new(),
+                max_size: 0,
+            },
+        );
+        reply.opened(fh, 0);
     }
 
-    fn fsync(&mut self, _req: &Request, ino: u64, _fh: u64, _datasync: bool, reply: ReplyEmpty) {
+    fn flush(&mut self, _req: &Request, _ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
+        callback_preamble!(self, reply);
+        if let Err(e) = self.flush_handle(fh) {
+            crate::log_and_reply!(reply, e);
+        } else {
+            reply.ok();
+        }
+    }
+
+    fn fsync(&mut self, _req: &Request, _ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
         let _latency = metrics::FuseLatencyGuard::new();
-        let _span = info_span!("fsync", ino).entered();
+        let _span = info_span!("fsync", fh).entered();
         callback_preamble!(self, reply);
         metrics::FSYNC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Whole-blob writes go straight to Postgres; nothing buffered in userspace.
+        if let Err(e) = self.flush_handle(fh) {
+            crate::log_and_reply!(reply, e);
+        } else {
+            reply.ok();
+        }
+    }
+
+    fn release(
+        &mut self,
+        _req: &Request,
+        _ino: u64,
+        fh: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        let _ = self.flush_handle(fh);
+        self.open_handles.remove(&fh);
         reply.ok();
     }
 
@@ -565,10 +681,22 @@ impl Filesystem for PgFs {
             crate::log_and_reply!(reply, e);
         }
 
+        let fh = self.next_fh;
+        self.next_fh += 1;
+        self.open_handles.insert(
+            fh,
+            HandleBuffer {
+                parent: parent_path.to_string(),
+                name: name.to_string(),
+                dirty_blocks: HashMap::new(),
+                max_size: 0,
+            },
+        );
+
         let path = db::join(&parent_path, &name);
         let ino = self.ino_for(&path);
         let attr = Self::file_attr(ino, 0, std::time::SystemTime::now());
-        reply.created(&self.attr_ttl, &attr, 0, 0, 0);
+        reply.created(&self.attr_ttl, &attr, 0, fh, 0);
     }
 
     fn mkdir(
