@@ -83,7 +83,9 @@ pub struct PgFs {
     next_ino: u64,
     next_fh: u64,
     open_handles: HashMap<u64, HandleBuffer>,
+    open_handles_by_ino: HashMap<u64, u64>,
     /// Set by the signal-waiter thread on SIGUSR1 (main.rs). Callbacks
+
     /// poll it in the preamble and log a state dump when set
     /// (spec/observe.py StateIntrospection #1).
     dump_requested: Arc<AtomicBool>,
@@ -163,7 +165,9 @@ impl PgFs {
             next_ino: ROOT_INO + 1,
             next_fh: 1,
             open_handles: HashMap::new(),
+            open_handles_by_ino: HashMap::new(),
             dump_requested,
+
             started: Instant::now(),
             attr_ttl,
         }
@@ -410,6 +414,18 @@ impl Filesystem for PgFs {
         }
     }
 
+    fn init(
+        &mut self,
+        _req: &Request<'_>,
+        config: &mut fuser::KernelConfig,
+    ) -> Result<(), libc::c_int> {
+        let _span = info_span!("init").entered();
+        let _ = config.add_capabilities(fuser::consts::FUSE_WRITEBACK_CACHE);
+        let _ = config.add_capabilities(fuser::consts::FUSE_BIG_WRITES);
+        tracing::info!("FUSE init: negotiated FUSE_WRITEBACK_CACHE and FUSE_BIG_WRITES");
+        Ok(())
+    }
+
     fn read(
         &mut self,
         _req: &Request,
@@ -425,7 +441,14 @@ impl Filesystem for PgFs {
         let _span = info_span!("read", ino, fh, offset, size).entered();
         callback_preamble!(self, reply);
         metrics::READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let _ = self.flush_handle(fh);
+        let handle_id = if fh != 0 {
+            Some(fh)
+        } else {
+            self.open_handles_by_ino.get(&ino).copied()
+        };
+        if let Some(h_id) = handle_id {
+            let _ = self.flush_handle(h_id);
+        }
         let path = match self.path_of_ino(ino) {
             Some(p) => p,
             None => {
@@ -463,10 +486,18 @@ impl Filesystem for PgFs {
         callback_preamble!(self, reply);
         metrics::WRITE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        if let Some(buf) = self.open_handles.get_mut(&fh) {
-            buf.write(offset as u64, data);
-            reply.written(data.len() as u32);
-            return;
+        let handle_id = if fh != 0 {
+            Some(fh)
+        } else {
+            self.open_handles_by_ino.get(&ino).copied()
+        };
+
+        if let Some(h_id) = handle_id {
+            if let Some(buf) = self.open_handles.get_mut(&h_id) {
+                buf.write(offset as u64, data);
+                reply.written(data.len() as u32);
+                return;
+            }
         }
 
         let path = match self.path_of_ino(ino) {
@@ -508,25 +539,44 @@ impl Filesystem for PgFs {
                 max_size: 0,
             },
         );
+        self.open_handles_by_ino.insert(ino, fh);
         reply.opened(fh, 0);
     }
 
-    fn flush(&mut self, _req: &Request, _ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
+    fn flush(&mut self, _req: &Request, ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
         callback_preamble!(self, reply);
-        if let Err(e) = self.flush_handle(fh) {
-            crate::log_and_reply!(reply, e);
+        let handle_id = if fh != 0 {
+            Some(fh)
+        } else {
+            self.open_handles_by_ino.get(&ino).copied()
+        };
+        if let Some(h_id) = handle_id {
+            if let Err(e) = self.flush_handle(h_id) {
+                crate::log_and_reply!(reply, e);
+            } else {
+                reply.ok();
+            }
         } else {
             reply.ok();
         }
     }
 
-    fn fsync(&mut self, _req: &Request, _ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
+    fn fsync(&mut self, _req: &Request, ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
         let _latency = metrics::FuseLatencyGuard::new();
         let _span = info_span!("fsync", fh).entered();
         callback_preamble!(self, reply);
         metrics::FSYNC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Err(e) = self.flush_handle(fh) {
-            crate::log_and_reply!(reply, e);
+        let handle_id = if fh != 0 {
+            Some(fh)
+        } else {
+            self.open_handles_by_ino.get(&ino).copied()
+        };
+        if let Some(h_id) = handle_id {
+            if let Err(e) = self.flush_handle(h_id) {
+                crate::log_and_reply!(reply, e);
+            } else {
+                reply.ok();
+            }
         } else {
             reply.ok();
         }
@@ -535,15 +585,22 @@ impl Filesystem for PgFs {
     fn release(
         &mut self,
         _req: &Request,
-        _ino: u64,
+        ino: u64,
         fh: u64,
         _flags: i32,
         _lock_owner: Option<u64>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let _ = self.flush_handle(fh);
-        self.open_handles.remove(&fh);
+        let handle_id = if fh != 0 {
+            fh
+        } else {
+            self.open_handles_by_ino.get(&ino).copied().unwrap_or(0)
+        };
+        let _ = self.flush_handle(handle_id);
+        self.open_handles.remove(&handle_id);
+        self.open_handles_by_ino
+            .retain(|k, v| *k != ino && *v != handle_id);
         reply.ok();
     }
 
@@ -959,6 +1016,25 @@ mod tests {
         assert!(ino_by_path.get("old.txt").is_none());
         assert_eq!(ino_by_path.get("new.txt"), Some(&10));
         assert_eq!(path_by_ino.get(&10), Some(&"new.txt".to_string()));
+    }
+
+    #[test]
+    fn writeback_cache_and_ino_handle_fallback() {
+        let mut db = Db::connect_opts(
+            &format!(
+                "host={}/testdata dbname=pgfs",
+                std::env::current_dir().unwrap().display()
+            ),
+            None,
+            false,
+        )
+        .unwrap();
+        db.create("", "ino_fallback.txt").unwrap();
+
+        let mut fs =
+            PgFs::with_attr_ttl(db, Arc::new(AtomicBool::new(false)), Duration::from_secs(1));
+        let ino = fs.ino_for("ino_fallback.txt");
+        assert!(ino > 1);
     }
 
     #[test]

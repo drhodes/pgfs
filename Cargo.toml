@@ -10,7 +10,8 @@ panic = "abort"
 profiling = ["pprof", "tracing-chrome"]
 
 [dependencies]
-fuser = "0.14"
+fuser = { version = "0.14", features = ["abi-7-31"] }
+
 postgres = "0.19"
 r2d2 = "0.8"
 r2d2_postgres = "0.18"
