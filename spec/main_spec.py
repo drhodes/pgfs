@@ -3,9 +3,10 @@ main spec
 '''
 
 from libspec import Spec
-from . import app, observe, perf, replica
+from . import app, observe, optimize, perf, replica
 
 
 class MainSpec(Spec):
     def modules(self):
-        return [app, observe, perf, replica]
+        return [app, observe, optimize, perf, replica]
+

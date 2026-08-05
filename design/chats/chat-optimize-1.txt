@@ -1,0 +1,353 @@
+# pgfs — Optimization Guide
+
+This is a prioritized, concrete list of performance work for pgfs, based on
+what the current code actually does (not a generic FUSE/Postgres checklist).
+Each item names the file it touches, why it costs what it costs, and how to
+verify the fix actually helped using the profiling infra already in the repo
+(`--features profiling`, `scripts/bench_profile.sh`).
+
+**Read this first:** the FUSE round trip (VFS → kernel module → `/dev/fuse` →
+daemon → reply) costs low-single-digit microseconds. A Postgres query over
+the Unix socket — especially one that gets re-parsed, fsyncs the WAL on
+commit, or rewrites a whole-file blob — costs high-microseconds to
+milliseconds. That's 1–2 orders of magnitude apart. **Fix the database path
+before touching the FUSE layer.** Everything below is ordered accordingly.
+
+---
+
+## How to measure, not guess
+
+Before implementing anything here, get a baseline:
+
+```bash
+cargo build --release --features profiling
+./scripts/bench_profile.sh
+```
+
+This drives three workload phases (write-amplification, sequential read,
+many-small-files) through `SIGUSR2`-triggered CPU profiles, and produces:
+
+- `/tmp/pgfs-profile-{ts}.svg` — flamegraph (where is CPU time going)
+- `/tmp/pgfs-profile-{ts}.stacks` — raw per-stack samples
+- `/tmp/pgfs-trace-{ts}.json` — Chrome/Perfetto span trace (FUSE callback →
+  DB query timing, opened in `chrome://tracing`)
+
+The `metrics|latency|fuse=...` and `metrics|latency|db=...` lines every 60s
+(`src/metrics.rs`) give you p50/p95/p99 without a profiler at all — check
+those first. If `db` latency dominates `fuse` latency, everything in
+**Tier 1** applies. If `fuse` latency is comparable to `db` latency, only
+then look at **Tier 3**.
+
+Re-run the benchmark after each change below and compare histograms —
+don't stack changes without measuring, since some of these interact (e.g.
+chunked storage changes what "write amplification" even means).
+
+---
+
+## Tier 1 — Database path (do these first)
+
+### 1.1 Chunked block storage instead of whole-blob read-modify-write
+
+**Where:** `db.rs::write`/`read`/`read_primary`, `fs.rs::write`/`setattr`
+
+**The problem:** every `write(2)` syscall — even a 4KB page — triggers:
+1. `read_primary`: fetch the *entire* file's `data` column
+2. In-memory patch of the byte range (`fs.rs`)
+3. `write`: `UPDATE entries SET data = $3, size = $4 ... WHERE parent = $1 AND name = $2` — rewriting the whole blob
+
+For a 16MB file written in 4KB chunks, that's ~4000 read-modify-writes, each
+shipping a growing blob over the wire. This is exactly what
+`bench_profile.sh`'s `write-ampl` phase is designed to expose. It also
+bloats the table (`UPDATE` on TOASTed `bytea` writes a new row version)
+until autovacuum catches up.
+
+**The fix:** a `blocks` table keyed by `(parent, name, block_no)` with a
+fixed block size (64–256KB is a reasonable start):
+
+```sql
+CREATE TABLE IF NOT EXISTS blocks (
+    parent    text NOT NULL,
+    name      text NOT NULL,
+    block_no  integer NOT NULL,
+    data      bytea NOT NULL,
+    PRIMARY KEY (parent, name, block_no)
+);
+```
+
+- `read(parent, name, offset, len)` → `SELECT data FROM blocks WHERE parent=$1 AND name=$2 AND block_no BETWEEN $3 AND $4 ORDER BY block_no`, then slice only the boundary blocks.
+- `write(parent, name, offset, data)` → only the touched blocks get read (for partial-block patches) and written; full blocks in the middle of a large write skip the read entirely.
+- Keep `size`/`mtime` on the existing `entries` row as the source of truth for `getattr`.
+- Truncate (`setattr`) becomes: delete blocks past the new size, patch the boundary block.
+
+This turns O(filesize) work per write into O(block size), independent of
+total file size. It's the highest-impact, highest-effort item on this list.
+
+**Verify:** re-run `write-ampl` phase; the flamegraph should show a much
+flatter shape (previously most self-time was Postgres round trips
+proportional to accumulated file size).
+
+### 1.2 Cache replica freshness instead of checking it per read
+
+**Where:** `db.rs::replica_fresh`, called from `db.rs::reader()`
+
+**The problem:** with `--replica` set, *every* `getattr`/`read`/`list` call
+does up to three extra round trips — `pg_is_in_recovery()`,
+`pg_current_wal_lsn()`, `pg_last_wal_replay_lsn()` — before it even runs the
+real query. That's up to 4x the query volume on the read path.
+
+**The fix:** cache the freshness verdict with a short TTL, refreshed either
+lazily (check elapsed time on each call, re-query only if stale) or by a
+background thread that updates an `AtomicBool` + timestamp every 200ms–1s.
+The existing `REPLICA_FALLBACK_WARNED`-style atomics in `metrics.rs` are a
+good model for the plumbing.
+
+```rust
+// sketch — lives on Db
+struct FreshnessCache {
+    fresh: AtomicBool,
+    checked_at: AtomicU64, // millis, monotonic
+}
+
+fn replica_fresh_cached(&mut self) -> bool {
+    let now = now_mono_millis();
+    if now - self.freshness.checked_at.load(Relaxed) < FRESHNESS_TTL_MS {
+        return self.freshness.fresh.load(Relaxed);
+    }
+    let fresh = self.replica_fresh(); // the real 3-query check
+    self.freshness.fresh.store(fresh, Relaxed);
+    self.freshness.checked_at.store(now, Relaxed);
+    fresh
+}
+```
+
+Trade-off: reads can route to a standby that *just* fell behind, for up to
+the TTL window. Given `FallsBackToPrimary` semantics already tolerate a
+stale replica falling back, this is a small, bounded correctness cost for a
+large read-path win. Pick a TTL well under your acceptable staleness bound.
+
+**Verify:** `metrics|replica|reads=.. fallbacks=..` — query count on the
+replica connection should drop roughly 3–4x relative to FUSE read-op count.
+
+### 1.3 Prepared statements
+
+**Where:** every `client.query`/`client.execute` call in `db.rs`
+
+**The problem:** all SQL is sent as unnamed statements through the extended
+query protocol. Postgres re-parses and re-plans the same fixed set of
+queries (getattr, read, write, create, mkdir, unlink, rmdir, list, rename)
+on every single call. The query set is small, static, and known at
+`Db::connect` time.
+
+**The fix:** prepare each statement once and store `postgres::Statement`
+handles on `Db`, alongside the primary/replica `Client`s:
+
+```rust
+pub struct Db {
+    client: Client,
+    replica: Option<Client>,
+    stmt_getattr: Statement,
+    stmt_read: Statement,
+    stmt_write: Statement,
+    // ...
+}
+```
+
+Prepared statements need to be re-created per-connection (replica gets its
+own set for the queries it serves). This is a mechanical, low-risk change —
+no behavior change, pure overhead removal — and a good first PR before
+tackling chunked storage.
+
+**Verify:** `metrics|latency|db=...` p50 should drop measurably on
+metadata-heavy workloads (`many-files` phase in `bench_profile.sh`), since
+parse+plan is a larger fraction of a cheap query's total time than of an
+expensive one.
+
+### 1.4 Relax commit durability for the workload you actually have
+
+**Where:** connection setup in `db.rs::connect`, or Postgres config
+
+**The problem:** every `execute()` is its own implicit transaction, and by
+default Postgres does a `synchronous_commit = on` WAL fsync on every commit.
+For a filesystem doing many small metadata ops (`create`, `write`,
+`rename`, `mkdir`), that's an fsync *per syscall* — often the single
+largest per-op latency contributor on spinning disks, and non-trivial even
+on NVMe.
+
+**The fix (pick one, in order of how much durability you're giving up):**
+
+- **`SET synchronous_commit = off`** on the connection at startup. Commits
+  return before the WAL flush completes; you can lose the last few hundred
+  ms of writes on a hard crash (OS-level `postgres` crash or power loss —
+  NOT a `pgfs` daemon crash, which never buffers data outside Postgres).
+  Reversible with zero schema impact. Best first move.
+- **`ALTER TABLE entries SET UNLOGGED`** (and `blocks`, if you do 1.1). No
+  WAL at all for this table — faster writes, but the table is truncated on
+  crash/unclean-shutdown recovery. Fine for a dev/test filesystem; not fine
+  if `testdata/` needs to survive a `kill -9` of Postgres itself.
+- **Batch multiple ops in one transaction** where the FUSE callback pattern
+  allows it (e.g. `setattr`'s truncate-then-reread does two round trips
+  today; wrapping in one transaction removes one round trip and one
+  fsync).
+
+**Verify:** `metrics|latency|db=...` on the `many-files` phase
+(2000 tiny `create`s) — this is the phase most dominated by fsync latency,
+so it should show the largest improvement of any single change here.
+
+---
+
+## Tier 2 — Concurrency (do this once Tier 1 is measured and helping)
+
+### 2.1 Connection pool + multi-threaded FUSE dispatch
+
+**Where:** `main.rs` (`fuser::Session::new`), `db.rs` (`Db` owns one
+`Client`), `fs.rs` (`PgFs` takes `&mut self` on every callback)
+
+**The problem:** the current session is single-threaded and `Db` holds
+exactly one primary connection behind `&mut self`. Every FUSE request —
+even ones with no data dependency on each other (e.g. `git status`'s many
+parallel `stat()`s) — is fully serialized through one daemon thread and one
+DB connection.
+
+**The fix:** two independent pieces, do them together:
+- Fuser's session can be run with multiple worker threads (check the
+  `fuser` version you're pinned to for the multi-threaded session API —
+  `Session`/`BackgroundSession` capabilities have moved around across
+  0.1x releases).
+- Replace the single `Client` with a small pool (`r2d2_postgres`,
+  `deadpool-postgres`, or a hand-rolled `Vec<Client>` behind a
+  `crossbeam-channel`/`Mutex<VecDeque>`), sized to something like
+  4–16 connections. `PgFs` methods borrow a connection from the pool per
+  call instead of holding one permanently.
+
+**Where this matters:** workloads with real concurrency — parallel
+`cp -r`, `make -j`, `git status` on a large tree. It does *nothing* for a
+single sequential `dd`, since there's nothing to parallelize. Don't do this
+before Tier 1; it multiplies the cost of an expensive per-op DB path
+instead of fixing it.
+
+**Verify:** re-run `many-files` phase but launch it with `xargs -P8` /
+parallel `for` loops instead of a sequential `bash -c 'for i in ...'` loop
+(you'll need to adjust `bench_profile.sh`'s `run_phase` invocation for
+this) — wall-clock time should drop roughly with connection count, up to
+Postgres's own concurrency ceiling.
+
+### 2.2 Buffer writes, flush on close/fsync
+
+**Where:** `fs.rs::write`, `fs.rs::fsync` (currently a no-op — "nothing
+buffered in userspace")
+
+**The problem:** every kernel `write()` (can be as small as one page)
+round-trips to Postgres immediately. Small, frequent writes to the same
+file offset region never get coalesced.
+
+**The fix:** buffer dirty byte ranges per open file handle in memory,
+flush on `flush`/`release`/explicit `fsync`. This composes well with 1.1
+(chunked storage) — buffer at the block granularity, flush only the dirty
+blocks. Costs: a crash before flush loses unflushed writes (same tradeoff
+class as 1.4, but at the application layer instead of the WAL layer — pick
+one, not both, or you're stacking two "maybe lose recent writes" risk
+windows for one benefit).
+
+**Verify:** workload with many small sequential writes to one file (e.g.
+`dd bs=512`) — DB op count should drop from "one per `write()`" to "one per
+flush," visible directly in `metrics|ops|write=...`.
+
+---
+
+## Tier 3 — FUSE/kernel layer (last, and only if the flamegraph says so)
+
+Do not start here. Read the note at the top of this document again if
+you're tempted to.
+
+### 3.1 Kernel attr/entry cache TTL
+
+**Where:** `fs.rs::TTL` (currently `Duration::from_secs(1)`)
+
+**The problem:** a 1s TTL is a reasonable default, but `stat`-heavy tools
+(`find`, `git status`, build systems doing existence checks) can still hit
+the daemon repeatedly across TTL boundaries on long-running operations.
+
+**The fix:** raise `TTL` for workloads that don't need near-real-time
+metadata consistency — a few seconds is often invisible to interactive use
+but meaningfully cuts `lookup`/`getattr` volume. This is a one-line change;
+make it a CLI flag rather than a constant if you want to tune it per
+workload instead of per binary.
+
+**Verify:** run `find testdata/mnt -type f | wc -l` on a populated tree
+before/after; `metrics|ops|lookup=.. getattr=..` growth per run should
+shrink for repeated runs within the new TTL window.
+
+### 3.2 Writeback cache + splice
+
+**Where:** `Filesystem::init()` capability negotiation (not currently
+implemented — `fs.rs` doesn't override `init`, so it accepts fuser's
+defaults)
+
+**The problem:** without writeback caching, every kernel `write()` is
+synchronously forwarded to the daemon. With it enabled, the kernel page
+cache coalesces small writes before they ever reach userspace — this
+directly attacks the same write-amplification problem as 1.1/2.2, but from
+the kernel side instead of the application side, and for free if `fuser`
+exposes the capability flag.
+
+**The fix:** check whether your pinned `fuser` version exposes
+`KernelConfig::add_capabilities` or equivalent for `FUSE_WRITEBACK_CACHE`
+and `FUSE_SPLICE_READ`/`FUSE_SPLICE_WRITE`, and negotiate them in `init()`.
+This is worth checking before doing 2.2 by hand — you may get most of the
+benefit without touching `fs.rs`'s write path at all.
+
+**Verify:** flamegraph should show less time in the raw `/dev/fuse`
+`read`/`write` syscalls relative to actual filesystem callback logic.
+
+### 3.3 FUSE-over-io_uring
+
+**Where:** the mount transport itself (`fuser`'s backend selection)
+
+**The problem/fix:** newer kernels support replacing the classic
+`/dev/fuse` read/write transport with io_uring, cutting syscall and copy
+overhead for high-IOPS small-op workloads. Real, published gains exist for
+this — but **check whether the `fuser` crate version you're pinned to
+supports it** before planning around it; it landed in mainline Linux
+relatively recently and Rust FUSE binding support may lag. If unsupported,
+this is a "wait" item, not a "do" item.
+
+---
+
+## What NOT to do (already considered, rejected)
+
+- **Dropping FUSE for a direct DB client (gRPC/HTTP/CLI):** genuinely the
+  fastest option (no VFS round trip at all), but it kills the entire
+  premise — `git init`, `ls`, arbitrary POSIX tools working for free. This
+  is "build a database client library," a different project, not an
+  optimization of this one.
+- **NFS/9p instead of FUSE:** still goes through kernel VFS, adds network
+  protocol/RPC marshaling on top even on loopback. Lateral move or
+  regression for a local mount, not a speedup.
+- **Table-per-directory schema:** discussed separately — solves rename
+  elegantly but trades DML for DDL on `mkdir`/`rmdir`, which is far more
+  expensive per-op and hits the filesystem's hottest metadata operations.
+  Not a performance win for the general case.
+
+---
+
+## Suggested order of work
+
+1. **1.4** (durability config) — smallest change, likely biggest
+   metadata-op win, zero code risk, fully reversible.
+2. **1.3** (prepared statements) — mechanical, low-risk, removes a fixed
+   per-query tax across the board.
+3. **1.2** (replica freshness cache) — only relevant if you run
+   `--replica`; otherwise skip.
+4. **1.1** (chunked storage) — the real architectural investment; do this
+   once 1.3/1.4 are in so you're measuring the write-path improvement in
+   isolation.
+5. **Tier 2** — once single-connection/single-thread is confirmed to be
+   the bottleneck under concurrent load (it usually isn't, until Tier 1 is
+   done).
+6. **Tier 3** — only if `fuse` latency is still comparable to `db` latency
+   in `metrics|latency|...` after everything above.
+
+At every step: re-run `scripts/bench_profile.sh`, compare
+`/tmp/pgfs-profile-*.svg` before/after, and check `metrics|latency|fuse=...`
+vs `metrics|latency|db=...` in the daemon log. If a change doesn't move
+those numbers, revert it — don't accumulate unverified complexity.
