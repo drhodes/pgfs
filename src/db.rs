@@ -484,6 +484,15 @@ impl Db {
         let start_block = (offset / BLOCK_SIZE as u64) as i32;
         let end_block = ((offset + data.len() as u64 - 1) / BLOCK_SIZE as u64) as i32;
 
+        let meta = self.getattr_primary(parent, name)?;
+        let old_size = meta.as_ref().map(|m| m.size).unwrap_or(0);
+        let new_size = old_size.max(offset + data.len() as u64);
+
+        let mut txn = error::ctx(
+            self.client.transaction(),
+            &format!("begin write_range transaction for {name:?} in {parent:?}"),
+        )?;
+
         for b_no in start_block..=end_block {
             let block_start = (b_no as u64) * (BLOCK_SIZE as u64);
             let block_end = block_start + BLOCK_SIZE as u64;
@@ -498,7 +507,12 @@ impl Db {
             let block_offset = (write_start - block_start) as usize;
 
             let mut block_data = if block_offset > 0 || chunk.len() < BLOCK_SIZE {
-                self.read_range_primary(parent, name, block_start, BLOCK_SIZE)?
+                let rows = error::ctx(
+                    txn.query(&self.stmt_read_blocks, &[&parent, &name, &b_no, &b_no]),
+                    &format!("read block {b_no} inside write_range transaction"),
+                )?;
+                rows.first()
+                    .map(|r| r.get::<_, Vec<u8>>("data"))
                     .unwrap_or_default()
             } else {
                 Vec::new()
@@ -510,7 +524,7 @@ impl Db {
             block_data[block_offset..block_offset + chunk.len()].copy_from_slice(chunk);
 
             error::ctx(
-                self.client.execute(
+                txn.execute(
                     &self.stmt_upsert_block,
                     &[&parent, &name, &b_no, &block_data],
                 ),
@@ -518,16 +532,16 @@ impl Db {
             )?;
         }
 
-        let meta = self.getattr_primary(parent, name)?;
-        let old_size = meta.as_ref().map(|m| m.size).unwrap_or(0);
-        let new_size = old_size.max(offset + data.len() as u64);
-
         error::ctx(
-            self.client.execute(
+            txn.execute(
                 "UPDATE entries SET size = $3, mtime = now() WHERE parent = $1 AND name = $2",
                 &[&parent, &name, &(new_size as i64)],
             ),
             &format!("update size of {name:?} in {parent:?}"),
+        )?;
+        error::ctx(
+            txn.commit(),
+            &format!("commit write_range transaction for {name:?} in {parent:?}"),
         )?;
         crate::metrics::DB_LATENCY.record(_t0.elapsed());
         Ok(())
@@ -545,10 +559,15 @@ impl Db {
             }
         };
 
+        let mut txn = error::ctx(
+            self.client.transaction(),
+            &format!("begin truncate transaction for {name:?} in {parent:?}"),
+        )?;
+
         if new_size < meta.size {
             let last_valid_block = (new_size / BLOCK_SIZE as u64) as i32;
             error::ctx(
-                self.client.execute(
+                txn.execute(
                     &self.stmt_prune_blocks,
                     &[&parent, &name, &last_valid_block],
                 ),
@@ -557,15 +576,18 @@ impl Db {
 
             let block_rem = (new_size % BLOCK_SIZE as u64) as usize;
             if block_rem > 0 {
-                if let Some(mut block_data) = self.read_range_primary(
-                    parent,
-                    name,
-                    (last_valid_block as u64) * BLOCK_SIZE as u64,
-                    BLOCK_SIZE,
-                )? {
+                let rows = error::ctx(
+                    txn.query(
+                        &self.stmt_read_blocks,
+                        &[&parent, &name, &last_valid_block, &last_valid_block],
+                    ),
+                    &format!("read boundary block {last_valid_block} inside truncate transaction"),
+                )?;
+                if let Some(row) = rows.first() {
+                    let mut block_data: Vec<u8> = row.get("data");
                     block_data.truncate(block_rem);
                     error::ctx(
-                        self.client.execute(
+                        txn.execute(
                             &self.stmt_upsert_block,
                             &[&parent, &name, &last_valid_block, &block_data],
                         ),
@@ -576,11 +598,15 @@ impl Db {
         }
 
         error::ctx(
-            self.client.execute(
+            txn.execute(
                 "UPDATE entries SET size = $3, mtime = now() WHERE parent = $1 AND name = $2",
                 &[&parent, &name, &(new_size as i64)],
             ),
             &format!("update size of {name:?} in {parent:?}"),
+        )?;
+        error::ctx(
+            txn.commit(),
+            &format!("commit truncate transaction for {name:?} in {parent:?}"),
         )?;
         crate::metrics::DB_LATENCY.record(_t0.elapsed());
         Ok(())
@@ -922,6 +948,24 @@ mod tests {
         db.truncate(&root, "trunc.bin", 10).unwrap();
         let truncated = db.read_range(&root, "trunc.bin", 0, 100).unwrap().unwrap();
         assert_eq!(truncated, vec![1u8; 10]);
+
+        cleanup(&mut db, &root);
+    }
+
+    #[test]
+    fn transaction_batching_multi_block_write() {
+        let mut db = db_connect();
+        let root = root_dir(&mut db);
+
+        db.create(&root, "tx_batch.bin").unwrap();
+        let payload = vec![42u8; 150 * 1024]; // 150 KB across 3 blocks
+        db.write_range(&root, "tx_batch.bin", 0, &payload).unwrap();
+
+        let read_back = db
+            .read_range(&root, "tx_batch.bin", 0, payload.len())
+            .unwrap()
+            .unwrap();
+        assert_eq!(read_back, payload);
 
         cleanup(&mut db, &root);
     }
