@@ -141,9 +141,11 @@ class Profiling(Ctx):
     1. **CPU profiling via `pprof`.** Behind a `profiling` feature flag,
        the `pprof` crate provides a SIGUSR2-activated CPU profiler.
        Calling `pprof::ProfilerGuardBuilder::default().frequency(997)`
-       starts sampling; dropping the guard writes a `pprof` flamegraph
-       protobuf to `/tmp/pgfs-profile-{timestamp}.pb`. The file path is
-       logged at `info!`.
+       starts sampling; a second SIGUSR2 stops it and renders the report
+       to `/tmp/pgfs-profile-{timestamp}.svg` (inferno flamegraph) plus
+       `/tmp/pgfs-profile-{timestamp}.stacks` (per-stack sample dump) —
+       the `.pb` protobuf codec is deliberately not enabled. The paths
+       are logged at `info!`.
 
     2. **Span flamegraphs via `tracing-chrome`.** Behind the same
        feature flag, a `tracing_chrome::ChromeLayer` writes a Chrome
@@ -209,7 +211,8 @@ class HealthEndpoint(Ctx):
        deadlock in the FUSE session.
 
     3. **Readiness file.** A flag file
-       `/tmp/pgfs-{mountpoint-hash}.ready` is created after the FUSE
-       session enters `session.run()`. Supervisors (systemd, launch
-       scripts) poll for this file before declaring the mount ready.
+       `/tmp/pgfs-{mountpoint-hash}.ready` is created once the mount
+       session is set up, immediately before the FUSE dispatch loop
+       begins. Supervisors (systemd, launch scripts) poll for this file
+       before declaring the mount ready.
     """

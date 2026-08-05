@@ -14,3 +14,16 @@ result-*/
 *.swo
 *~
 .DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Bazel
+/bazel-*
+
+# Libspec cache
+.libspec/cache/*.bin
+!.libspec/cache/live.bin
+
+

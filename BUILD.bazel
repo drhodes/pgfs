@@ -1,0 +1,8 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library")
+
+rust_binary(
+    name = "pgfs",
+    srcs = glob(["src/**/*.rs"]),
+    edition = "2021",
+    visibility = ["//visibility:public"],
+)

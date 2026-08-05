@@ -1,0 +1,21 @@
+# .bazelrc
+
+# Enable remote execution and point to the Buildbarn frontend (default port is usually 8980)
+build:remote-exec --remote_executor=grpc://xeon40:8980
+build:remote-exec --remote_cache=grpc://xeon40:8980
+
+# Buildbarn uses an instance name to partition the cache and execution environment
+build:remote-exec --remote_instance_name=fuse
+
+# Do not upload local results if you are only running remotely
+build:remote-exec --remote_download_toplevel
+
+# Define the execution environment properties so the remote worker knows what image to run
+# This matches the platform properties defined in bb-deployments worker-fuse-ubuntu22-04.jsonnet
+build:remote-exec --remote_default_exec_properties=OSFamily=linux
+build:remote-exec --remote_default_exec_properties=container-image=docker://ghcr.io/catthehacker/ubuntu:act-22.04@sha256:dd7654ffb01d5b7b54b23b9ce928a1f7f2d08c7b3d7e320b6574b55d7ccde78b
+
+# Ensure remote actions use the remote container's standard PATH rather than inheriting local Nix store paths
+build:remote-exec --action_env=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+

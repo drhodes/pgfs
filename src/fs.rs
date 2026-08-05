@@ -24,6 +24,8 @@ use fuser::{
 use libc::{EINVAL, EISDIR, ENOENT, ENOTEMPTY};
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tracing::info_span;
 
@@ -37,6 +39,28 @@ pub struct PgFs {
     ino_by_path: HashMap<String, u64>,
     path_by_ino: HashMap<u64, String>,
     next_ino: u64,
+    /// Set by the signal-waiter thread on SIGUSR1 (main.rs). Callbacks
+    /// poll it in the preamble and log a state dump when set
+    /// (spec/observe.py StateIntrospection #1).
+    dump_requested: Arc<AtomicBool>,
+    /// Wall clock at mount time, for the state dump's uptime figure.
+    started: Instant,
+}
+
+/// Per-callback preamble: honor a pending SIGUSR1 state dump, then check
+/// the liveness heartbeat. On a stalled heartbeat the daemon is wedged:
+/// log ERROR, flag the watchdog thread (main.rs) to unmount cleanly, and
+/// reply EIO so the kernel request is not left hanging.
+macro_rules! callback_preamble {
+    ($self:expr, $reply:expr) => {{
+        $self.maybe_dump_state();
+        if !crate::metrics::check_liveness() {
+            tracing::error!("liveness heartbeat stalled (3x10s missed) - initiating clean unmount");
+            crate::metrics::DEADLOCK_DETECTED.store(true, Ordering::Release);
+            $reply.error(libc::EIO);
+            return;
+        }
+    }};
 }
 
 /// Split a full path into its (parent, name) key. Root entries have parent "".
@@ -77,13 +101,37 @@ fn rekey_maps(
 }
 
 impl PgFs {
-    pub fn new(db: Db) -> Self {
+    pub fn new(db: Db, dump_requested: Arc<AtomicBool>) -> Self {
         PgFs {
             db,
             ino_by_path: HashMap::new(),
             path_by_ino: HashMap::new(),
             next_ino: 2, // 1 is reserved for the root directory
+            dump_requested,
+            started: Instant::now(),
         }
+    }
+
+    /// If a SIGUSR1 was received, log a full state dump from this callback:
+    /// inode cache size, next inode, DB + replica status, uptime, and the
+    /// metrics histograms (spec/observe.py StateIntrospection #1).
+    fn maybe_dump_state(&mut self) {
+        if !self
+            .dump_requested
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let db_status = format!("connected (replica {})", self.db.replica_state());
+        tracing::info!(
+            "{}",
+            metrics::state_dump(
+                self.ino_by_path.len(),
+                self.next_ino,
+                &db_status,
+                self.started.elapsed(),
+            )
+        );
     }
 
     fn ino_for(&mut self, path: &str) -> u64 {
@@ -174,14 +222,14 @@ impl PgFs {
 
 impl Filesystem for PgFs {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        let _latency = metrics::FuseLatencyGuard::new();
         let _span = info_span!("lookup", parent, name = %name.to_string_lossy()).entered();
-        let t0 = Instant::now();
+        callback_preamble!(self, reply);
         metrics::LOOKUP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (parent_path, name) = match self.resolve(parent, name) {
             Ok(k) => k,
             Err(e) => {
                 metrics::ENOENT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                metrics::FUSE_LATENCY.record(t0.elapsed());
                 reply.error(e);
                 return;
             }
@@ -199,8 +247,9 @@ impl Filesystem for PgFs {
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
+        let _latency = metrics::FuseLatencyGuard::new();
         let _span = info_span!("getattr", ino).entered();
-        let _t0 = Instant::now();
+        callback_preamble!(self, reply);
         metrics::GETATTR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if ino == ROOT_INO {
             reply.attr(&TTL, &Self::root_attr());
@@ -239,8 +288,9 @@ impl Filesystem for PgFs {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        let _latency = metrics::FuseLatencyGuard::new();
         let _span = info_span!("setattr", ino, ?size).entered();
-        let _t0 = Instant::now();
+        callback_preamble!(self, reply);
         metrics::SETATTR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if ino == ROOT_INO {
             reply.attr(&TTL, &Self::root_attr());
@@ -255,7 +305,9 @@ impl Filesystem for PgFs {
         };
         let (parent, name) = split_path(&path);
 
-        let meta = match self.db.getattr(parent, name) {
+        // setattr can mutate (size change): the decision read must see the
+        // primary so a stale replica never triggers a wrong write.
+        let meta = match self.db.getattr_primary(parent, name) {
             Ok(Some(m)) => m,
             Ok(None) => {
                 reply.error(ENOENT);
@@ -269,7 +321,9 @@ impl Filesystem for PgFs {
                 reply.error(EISDIR);
                 return;
             }
-            let mut current = match self.db.read(parent, name) {
+            // read-modify-write: the old bytes MUST come from the primary so
+            // a stale replica can never feed the truncate its own stale copy.
+            let mut current = match self.db.read_primary(parent, name) {
                 Ok(Some(d)) => d,
                 Ok(None) => Vec::new(),
                 Err(e) => crate::log_and_reply!(reply, e),
@@ -280,7 +334,10 @@ impl Filesystem for PgFs {
             }
         }
 
-        match self.db.getattr(parent, name) {
+        // Reply attributes come from the primary: this getattr reports the
+        // result of the mutation just committed and the kernel caches it
+        // with a TTL, so a stale replica would cache wrong size/mtime.
+        match self.db.getattr_primary(parent, name) {
             Ok(Some(meta)) => reply.attr(&TTL, &Self::attr(ino, &meta)),
             Ok(None) => reply.error(ENOENT),
             Err(e) => crate::log_and_reply!(reply, e),
@@ -298,8 +355,9 @@ impl Filesystem for PgFs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
+        let _latency = metrics::FuseLatencyGuard::new();
         let _span = info_span!("read", ino, offset, size).entered();
-        let _t0 = Instant::now();
+        callback_preamble!(self, reply);
         metrics::READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = match self.path_of_ino(ino) {
             Some(p) => p,
@@ -336,8 +394,9 @@ impl Filesystem for PgFs {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
+        let _latency = metrics::FuseLatencyGuard::new();
         let _span = info_span!("write", ino, offset, len = data.len()).entered();
-        let _t0 = Instant::now();
+        callback_preamble!(self, reply);
         metrics::WRITE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = match self.path_of_ino(ino) {
             Some(p) => p,
@@ -348,7 +407,10 @@ impl Filesystem for PgFs {
         };
         let (parent, name) = split_path(&path);
 
-        let mut current = match self.db.read(parent, name) {
+        // read-modify-write: the old bytes MUST come from the primary so a
+        // stale replica can never feed the write its own stale copy (that
+        // would be a lost update on the primary).
+        let mut current = match self.db.read_primary(parent, name) {
             Ok(Some(d)) => d,
             Ok(None) => {
                 reply.error(ENOENT);
@@ -370,18 +432,18 @@ impl Filesystem for PgFs {
     }
 
     fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
+        let _latency = metrics::FuseLatencyGuard::new();
         let _span = info_span!("open", ino).entered();
-        let t0 = Instant::now();
+        callback_preamble!(self, reply);
         metrics::OPEN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        metrics::FUSE_LATENCY.record(t0.elapsed());
         reply.opened(0, 0);
     }
 
     fn fsync(&mut self, _req: &Request, ino: u64, _fh: u64, _datasync: bool, reply: ReplyEmpty) {
+        let _latency = metrics::FuseLatencyGuard::new();
         let _span = info_span!("fsync", ino).entered();
-        let t0 = Instant::now();
+        callback_preamble!(self, reply);
         metrics::FSYNC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        metrics::FUSE_LATENCY.record(t0.elapsed());
         // Whole-blob writes go straight to Postgres; nothing buffered in userspace.
         reply.ok();
     }
@@ -396,8 +458,9 @@ impl Filesystem for PgFs {
         flags: u32,
         reply: ReplyEmpty,
     ) {
+        let _latency = metrics::FuseLatencyGuard::new();
         let _span = info_span!("rename", parent, name = %name.to_string_lossy(), newparent, newname = %newname.to_string_lossy(), flags).entered();
-        let _t0 = Instant::now();
+        callback_preamble!(self, reply);
         metrics::RENAME_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if flags != 0 {
             reply.error(EINVAL);
@@ -431,7 +494,9 @@ impl Filesystem for PgFs {
             return;
         }
 
-        let source_meta = match self.db.getattr(&old_parent_path, &old_name) {
+        // Rename is a mutation: source/target checks MUST read the primary
+        // so a stale replica can never influence the write's outcome.
+        let source_meta = match self.db.getattr_primary(&old_parent_path, &old_name) {
             Ok(Some(m)) => m,
             Ok(None) => {
                 reply.error(ENOENT);
@@ -441,7 +506,7 @@ impl Filesystem for PgFs {
         };
 
         // POSIX: rename replaces the target; validate kind compatibility.
-        if let Ok(Some(target_meta)) = self.db.getattr(&new_parent_path, &new_name) {
+        if let Ok(Some(target_meta)) = self.db.getattr_primary(&new_parent_path, &new_name) {
             match (source_meta.kind, target_meta.kind) {
                 (Kind::File, Kind::Dir) => {
                     reply.error(libc::EISDIR);
@@ -453,8 +518,9 @@ impl Filesystem for PgFs {
                 }
                 (Kind::Dir, Kind::Dir) => {
                     // Target is a directory — only allow overwrite if empty.
+                    // Decision read: must see the primary, not a stale replica.
                     let target_path = db::join(&new_parent_path, &new_name);
-                    match self.db.list(&target_path) {
+                    match self.db.list_primary(&target_path) {
                         Ok(children) if !children.is_empty() => {
                             reply.error(ENOTEMPTY);
                             return;
@@ -489,8 +555,9 @@ impl Filesystem for PgFs {
         _flags: i32,
         reply: ReplyCreate,
     ) {
+        let _latency = metrics::FuseLatencyGuard::new();
         let _span = info_span!("create", parent, name = %name.to_string_lossy()).entered();
-        let _t0 = Instant::now();
+        callback_preamble!(self, reply);
         metrics::CREATE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (parent_path, name) = match self.resolve(parent, name) {
             Ok(k) => k,
@@ -500,7 +567,9 @@ impl Filesystem for PgFs {
             }
         };
 
-        match self.db.getattr(&parent_path, &name) {
+        // EEXIST check is a mutation decision: read the primary so a
+        // stale replica can never make us silently overwrite.
+        match self.db.getattr_primary(&parent_path, &name) {
             Ok(Some(_)) => {
                 reply.error(libc::EEXIST);
                 return;
@@ -528,8 +597,9 @@ impl Filesystem for PgFs {
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        let _latency = metrics::FuseLatencyGuard::new();
         let _span = info_span!("mkdir", parent, name = %name.to_string_lossy()).entered();
-        let _t0 = Instant::now();
+        callback_preamble!(self, reply);
         metrics::MKDIR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (parent_path, name) = match self.resolve(parent, name) {
             Ok(k) => k,
@@ -539,7 +609,9 @@ impl Filesystem for PgFs {
             }
         };
 
-        match self.db.getattr(&parent_path, &name) {
+        // EEXIST check is a mutation decision: read the primary (see
+        // WritesStayOnPrimary in spec/replica.py).
+        match self.db.getattr_primary(&parent_path, &name) {
             Ok(Some(_)) => {
                 reply.error(libc::EEXIST);
                 return;
@@ -558,8 +630,9 @@ impl Filesystem for PgFs {
     }
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let _latency = metrics::FuseLatencyGuard::new();
         let _span = info_span!("unlink", parent, name = %name.to_string_lossy()).entered();
-        let _t0 = Instant::now();
+        callback_preamble!(self, reply);
         metrics::UNLINK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (parent_path, name) = match self.resolve(parent, name) {
             Ok(k) => k,
@@ -582,8 +655,9 @@ impl Filesystem for PgFs {
     }
 
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let _latency = metrics::FuseLatencyGuard::new();
         let _span = info_span!("rmdir", parent, name = %name.to_string_lossy()).entered();
-        let _t0 = Instant::now();
+        callback_preamble!(self, reply);
         metrics::RMDIR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (parent_path, name) = match self.resolve(parent, name) {
             Ok(k) => k,
@@ -593,7 +667,8 @@ impl Filesystem for PgFs {
             }
         };
 
-        match self.db.getattr(&parent_path, &name) {
+        // rmdir is a mutation: existence check reads the primary.
+        match self.db.getattr_primary(&parent_path, &name) {
             Ok(Some(_)) => {}
             Ok(None) => {
                 reply.error(ENOENT);
@@ -623,8 +698,9 @@ impl Filesystem for PgFs {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
+        let _latency = metrics::FuseLatencyGuard::new();
         let _span = info_span!("readdir", ino, offset).entered();
-        let _t0 = Instant::now();
+        callback_preamble!(self, reply);
         metrics::READDIR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = match self.path_of_ino(ino) {
             Some(p) => p,

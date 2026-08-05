@@ -8,6 +8,11 @@
 //! directory has parent = "". Names never contain '/', so the full path is
 //! unambiguous.
 //!
+//! Replicated mode: an optional second client to a physical streaming
+//! standby (spec/replica.py). Pure reads route to the standby when it has
+//! caught up with the primary's WAL; every mutation and every read a
+//! mutation depends on stays on the primary.
+//!
 //! Every method returns `error::Result`, wrapping the underlying
 //! `postgres::Error` with a description of what was being attempted and the
 //! file:line where it happened, so failures read as a story.
@@ -18,7 +23,11 @@ use std::time::{Instant, SystemTime};
 use tracing::debug_span;
 
 pub struct Db {
+    /// Primary connection — every write goes here.
     client: Client,
+    /// Optional physical streaming standby (see spec/replica.py). Reads
+    /// are served from it when it has caught up with the primary's WAL.
+    replica: Option<Client>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +57,14 @@ impl Db {
     /// Connects and makes sure the schema exists. `conn_str` is a normal
     /// libpq-style connection string, e.g.
     /// "host=/path/to/project/testdata dbname=pgfs" for a local Unix socket.
-    pub fn connect(conn_str: &str) -> Result<Self> {
+    ///
+    /// `replica_conn` is an optional libpq string for a physical streaming
+    /// standby. When present, read operations (getattr/list/read) are served
+    /// from the standby once it has replayed WAL up to the primary's current
+    /// position; writes always go to the primary. A failure to reach the
+    /// replica is not fatal: reads fall back to the primary (see
+    /// `FallsBackToPrimary` in spec/replica.py).
+    pub fn connect(conn_str: &str, replica_conn: Option<&str>) -> Result<Self> {
         let mut client = error::ctx(
             Client::connect(conn_str, NoTls),
             &format!("connect to Postgres ({conn_str})"),
@@ -67,16 +83,169 @@ impl Db {
             ),
             "ensure the entries schema exists",
         )?;
-        Ok(Db { client })
+        let replica = match replica_conn {
+            Some(s) => match Client::connect(s, NoTls) {
+                Ok(c) => Some(c),
+                // Best-effort: an unreachable standby must never prevent the
+                // mount from starting (spec/replica.py ReplicaObservability).
+                // The mount runs primary-only and every read falls back.
+                Err(e) => {
+                    tracing::warn!(
+                        "replica standby unreachable at startup ({s}); running primary-only: {e}"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        Ok(Db { client, replica })
+    }
+
+    /// The client a read should use. Returns the replica when it is
+    /// configured and fresh (caught up with the primary's WAL), otherwise
+    /// the primary. Fallbacks are counted only when a replica is configured
+    /// (a single-node mount has nothing to fall back from).
+    fn reader(&mut self) -> &mut Client {
+        if self.replica.is_some() {
+            if self.replica_fresh() {
+                crate::metrics::REPLICA_READ_COUNT
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::debug!("read served from replica");
+                return self.replica.as_mut().expect("replica present when fresh");
+            }
+            crate::metrics::REPLICA_FALLBACK_COUNT
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if crate::metrics::REPLICA_FALLBACK_WARNED
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                // First fallback is worth a human's attention (spec/replica.py
+                // FallsBackToPrimary); the rest are routine and stay quiet.
+                tracing::warn!("reads falling back to primary (standby stale or unreachable)");
+            } else {
+                tracing::debug!("read served from primary (replica stale)");
+            }
+        }
+        &mut self.client
+    }
+
+    /// Is the replica fresh enough to serve reads? True iff a replica is
+    /// configured, reachable, and its last replayed WAL position is at or
+    /// ahead of the primary's current position. A standby that has never
+    /// replayed anything, or any error on either node, means not fresh.
+    fn replica_fresh(&mut self) -> bool {
+        let Some(replica) = self.replica.as_mut() else {
+            return false;
+        };
+
+        // A node that is not in recovery is itself a primary: authoritative.
+        let in_recovery: Option<bool> = replica
+            .query_opt("SELECT pg_is_in_recovery()", &[])
+            .ok()
+            .flatten()
+            .map(|r| r.get(0));
+        match in_recovery {
+            Some(false) => return true,
+            None => return false, // replica query failed
+            Some(true) => {}
+        }
+
+        let primary_lsn: Option<i64> = self
+            .client
+            .query_opt("SELECT (pg_current_wal_lsn() - '0/0'::pg_lsn)::bigint", &[])
+            .ok()
+            .flatten()
+            .map(|r| r.get(0));
+        let replay_lsn: Option<Option<i64>> = self
+            .replica
+            .as_mut()
+            .expect("replica present")
+            .query_opt(
+                "SELECT (pg_last_wal_replay_lsn() - '0/0'::pg_lsn)::bigint",
+                &[],
+            )
+            .ok()
+            .flatten()
+            .map(|r| r.get(0));
+
+        match (primary_lsn, replay_lsn) {
+            (Some(p), Some(Some(r))) => r >= p,
+            _ => false,
+        }
+    }
+
+    /// Human-readable replica health for the SIGUSR1 state dump
+    /// (spec/replica.py ReplicaObservability: the SIGUSR1 state dump
+    /// reports replica freshness). One of: "none" (no --replica),
+    /// "fresh", or "stale or unreachable".
+    pub fn replica_state(&mut self) -> String {
+        if self.replica.is_none() {
+            return "none".to_string();
+        }
+        if self.replica_fresh() {
+            "fresh".to_string()
+        } else {
+            "stale or unreachable".to_string()
+        }
+    }
+
+    /// getattr that is forced to read the primary. Used by mutation
+    /// decision paths (create/mkdir EEXIST checks, rmdir existence,
+    /// rename's source/target checks) so a stale replica can never
+    /// influence a write's outcome.
+    pub fn getattr_primary(&mut self, parent: &str, name: &str) -> Result<Option<FileMeta>> {
+        Self::getattr_on(&mut self.client, parent, name)
+    }
+
+    fn getattr_on(client: &mut Client, parent: &str, name: &str) -> Result<Option<FileMeta>> {
+        let _span = debug_span!("db::getattr", parent, name).entered();
+        let _t0 = Instant::now();
+        let row = error::ctx(
+            client.query_opt(
+                "SELECT name, kind, size, mtime FROM entries
+                 WHERE parent = $1 AND name = $2",
+                &[&parent, &name],
+            ),
+            &format!("get attributes of entry {name:?} in {parent:?}"),
+        )?;
+        let result = row.as_ref().map(row_to_meta).transpose();
+        crate::metrics::DB_LATENCY.record(_t0.elapsed());
+        result
+    }
+
+    /// list that is forced to read the primary. Used by rename's
+    /// target-emptiness check so a stale replica can never let a rename
+    /// overwrite a directory that is actually non-empty on the primary.
+    pub fn list_primary(&mut self, parent: &str) -> Result<Vec<FileMeta>> {
+        let client = &mut self.client;
+        let _span = debug_span!("db::list", parent).entered();
+        let _t0 = Instant::now();
+        let rows = error::ctx(
+            client.query(
+                "SELECT name, kind, size, mtime FROM entries
+                 WHERE parent = $1 ORDER BY name",
+                &[&parent],
+            ),
+            &format!("list children of directory {parent:?}"),
+        )?;
+        let result: Result<Vec<FileMeta>> = rows.iter().map(row_to_meta).collect();
+        crate::metrics::DB_LATENCY.record(_t0.elapsed());
+        result
     }
 
     /// Children of a directory, sorted by name. Ordering is cosmetic here;
     /// fs.rs re-iterates this on every readdir.
     pub fn list(&mut self, parent: &str) -> Result<Vec<FileMeta>> {
+        let client = self.reader();
         let _span = debug_span!("db::list", parent).entered();
         let _t0 = Instant::now();
         let rows = error::ctx(
-            self.client.query(
+            client.query(
                 "SELECT name, kind, size, mtime FROM entries
                  WHERE parent = $1 ORDER BY name",
                 &[&parent],
@@ -89,26 +258,35 @@ impl Db {
     }
 
     pub fn getattr(&mut self, parent: &str, name: &str) -> Result<Option<FileMeta>> {
-        let _span = debug_span!("db::getattr", parent, name).entered();
-        let _t0 = Instant::now();
-        let row = error::ctx(
-            self.client.query_opt(
-                "SELECT name, kind, size, mtime FROM entries
-                 WHERE parent = $1 AND name = $2",
-                &[&parent, &name],
-            ),
-            &format!("get attributes of entry {name:?} in {parent:?}"),
-        )?;
-        let result = row.as_ref().map(row_to_meta).transpose();
-        crate::metrics::DB_LATENCY.record(_t0.elapsed());
-        result
+        let client = self.reader();
+        Self::getattr_on(client, parent, name)
     }
 
     pub fn read(&mut self, parent: &str, name: &str) -> Result<Option<Vec<u8>>> {
+        let client = self.reader();
         let _span = debug_span!("db::read", parent, name).entered();
         let _t0 = Instant::now();
         let row = error::ctx(
-            self.client.query_opt(
+            client.query_opt(
+                "SELECT data FROM entries WHERE parent = $1 AND name = $2",
+                &[&parent, &name],
+            ),
+            &format!("read contents of {name:?} in {parent:?}"),
+        )?;
+        crate::metrics::DB_LATENCY.record(_t0.elapsed());
+        Ok(row.map(|r| r.get::<_, Vec<u8>>("data")))
+    }
+
+    /// read forced to the primary. Used by the write path's
+    /// read-modify-write (fs.rs) so a stale replica can never supply the
+    /// "old" bytes a write is about to patch over — that would silently
+    /// lose concurrent primary writes.
+    pub fn read_primary(&mut self, parent: &str, name: &str) -> Result<Option<Vec<u8>>> {
+        let client = &mut self.client;
+        let _span = debug_span!("db::read", parent, name).entered();
+        let _t0 = Instant::now();
+        let row = error::ctx(
+            client.query_opt(
                 "SELECT data FROM entries WHERE parent = $1 AND name = $2",
                 &[&parent, &name],
             ),
@@ -202,8 +380,10 @@ impl Db {
             return Ok(());
         }
 
+        // Source-existence check must read the PRIMARY: the decision feeds
+        // a write transaction, so a stale replica must never influence it.
         let meta = self
-            .getattr(old_parent, old_name)?
+            .getattr_primary(old_parent, old_name)?
             .ok_or_else(|| error::failure(format!("rename source {old_path:?} does not exist")))?;
 
         let mut txn = error::ctx(
@@ -317,7 +497,7 @@ mod tests {
             "host={}/testdata dbname=pgfs",
             std::env::current_dir().unwrap().display()
         );
-        Db::connect(&conn_str).expect("connect")
+        Db::connect(&conn_str, None).expect("connect")
     }
 
     /// Create a unique root-level directory for test isolation and return its path.
@@ -362,6 +542,26 @@ mod tests {
         let result = db.list("");
         // The entries table exists; listing root should succeed.
         assert!(result.is_ok(), "list root should work: {:?}", result.err());
+    }
+
+    /// With no replica configured, every read must be served from the
+    /// primary (replica routing degrades to a single-node mount).
+    #[test]
+    fn no_replica_serves_primary() {
+        let conn_str = format!(
+            "host={}/testdata dbname=pgfs",
+            std::env::current_dir().unwrap().display()
+        );
+        let mut db = Db::connect(&conn_str, None).expect("connect without replica");
+        assert!(db.replica.is_none(), "no replica client should be opened");
+
+        // A write + read round-trip through the public API must succeed,
+        // which exercises the fallback-to-primary path in reader().
+        let root = root_dir(&mut db);
+        db.create(&root, "r.txt").unwrap();
+        db.write(&root, "r.txt", b"primary").unwrap();
+        assert_eq!(db.read(&root, "r.txt").unwrap().unwrap(), b"primary");
+        cleanup(&mut db, &root);
     }
 
     // ── Create / Getattr ────────────────────────────────────────────────

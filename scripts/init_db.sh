@@ -20,9 +20,12 @@ if [ ! -d "$PGDATA" ]; then
     initdb -D "$PGDATA" --auth=trust --no-locale --encoding=UTF8
 fi
 
-echo "starting postgres (unix socket only, no TCP)"
+echo "starting postgres (unix socket + TCP on 127.0.0.1 only)"
+# -h 127.0.0.1 exposes loopback TCP so a physical streaming standby
+# (scripts/replica_db.sh) can pg_basebackup and stream WAL. Still never
+# binds a non-loopback interface; pg_hba.conf only trusts 127.0.0.1.
 pg_ctl -D "$PGDATA" -l "$LOGFILE" \
-    -o "-k $SOCKDIR -h ''" \
+    -o "-k $SOCKDIR -h 127.0.0.1" \
     start
 
 # createdb needs a moment after start; retry briefly.

@@ -9,8 +9,8 @@
 //! is bumped by a background thread; FUSE callbacks check it to detect
 //! deadlock.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 // ── FUSE operation counters ────────────────────────────────────────────
 
@@ -38,12 +38,77 @@ counters! {
     ENOTDIR_COUNT, EINVAL_COUNT,
 }
 
+// ── Replica routing counters ──────────────────────────────────────────
+
+/// Reads served from the replica standby (see spec/replica.py).
+pub static REPLICA_READ_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Reads that fell back to the primary because the standby was unreachable
+/// or had not caught up with the primary's WAL. Only incremented when a
+/// replica is configured (a single-node mount has nothing to fall back
+/// from). A rising count means replication is struggling.
+pub static REPLICA_FALLBACK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Set once the first fallback has been reported at WARN (rate limit so
+/// the log doesn't spam while a standby is down).
+pub static REPLICA_FALLBACK_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 // ── Liveness heartbeat ─────────────────────────────────────────────────
 
 /// Bumped by a background thread every N seconds. FUSE callbacks check this
-/// on entry; if it has not advanced within 3×N the daemon logs ERROR and
-/// initiates a clean unmount.
+/// on entry (see [`check_liveness`]); if it has not advanced within 3×N the
+/// daemon logs ERROR, flags [`DEADLOCK_DETECTED`], and a watchdog thread in
+/// main.rs performs the clean unmount.
 pub static LIVENESS: AtomicU64 = AtomicU64::new(0);
+
+/// Heartbeat cadence (N), and the stall deadline (3×N), in milliseconds.
+const HEARTBEAT_PERIOD_MS: u64 = 10_000;
+const HEARTBEAT_DEADLINE_MS: u64 = 3 * HEARTBEAT_PERIOD_MS;
+
+/// The LIVENESS value the last callback observed, and the monotonic
+/// deadline by which the next beat must arrive (millis since process
+/// boot). Used by [`check_liveness`].
+///
+/// Both are monotonic (see [`now_mono_millis`]) so a wall-clock jump (NTP
+/// step, manual `date`) can never cause a spurious "deadlock": the whole
+/// point of this check is to avoid false positives on an idle mount.
+static LAST_BEAT_SEEN: AtomicU64 = AtomicU64::new(u64::MAX);
+static BEAT_DEADLINE_AT: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Set by a FUSE callback that caught a stalled heartbeat; the watchdog
+/// thread in main.rs polls this and performs the clean unmount.
+pub static DEADLOCK_DETECTED: AtomicBool = AtomicBool::new(false);
+
+/// Call at the top of every FUSE callback. Returns true while the liveness
+/// heartbeat is advancing; false once the counter has not advanced within
+/// 3×N seconds (N = 10 s), i.e. the daemon is wedged. The first call
+/// always returns true — it only establishes the baseline.
+pub fn check_liveness() -> bool {
+    let now_ms = now_mono_millis();
+    let counter = LIVENESS.load(Ordering::Acquire);
+    let last_counter = LAST_BEAT_SEEN.load(Ordering::Relaxed);
+    if last_counter == u64::MAX || counter != last_counter {
+        // First observation, or the heartbeat advanced since the last
+        // callback: healthy. Arm a fresh deadline 3×N out.
+        LAST_BEAT_SEEN.store(counter, Ordering::Relaxed);
+        BEAT_DEADLINE_AT.store(now_ms + HEARTBEAT_DEADLINE_MS, Ordering::Relaxed);
+        true
+    } else {
+        // Counter unchanged since the last callback. Still healthy while
+        // the deadline (3×N after the last observed beat) has not passed;
+        // past it, the heartbeat is wedged.
+        now_ms < BEAT_DEADLINE_AT.load(Ordering::Relaxed)
+    }
+}
+
+/// Monotonic millis since process boot. Immune to wall-clock jumps, unlike
+/// `SystemTime::now()` — critical for a check whose job is avoiding false
+/// positives.
+fn now_mono_millis() -> u64 {
+    static BOOT: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    BOOT.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
 
 // ── Latency histogram ──────────────────────────────────────────────────
 //
@@ -138,6 +203,24 @@ fn bucket_label(bucket: usize) -> &'static str {
 /// FUSE callback latency (all ops pooled).
 pub static FUSE_LATENCY: Histogram = Histogram::new();
 
+/// RAII guard: records the enclosing FUSE callback's wall-clock duration
+/// into [`FUSE_LATENCY`] when it drops — i.e. on every exit path of the
+/// callback (happy path, early return, `log_and_reply!`, ...). Created at
+/// the top of every `Filesystem` method (spec/observe.py Metrics #2).
+pub struct FuseLatencyGuard(Instant);
+
+impl FuseLatencyGuard {
+    pub fn new() -> Self {
+        Self(Instant::now())
+    }
+}
+
+impl Drop for FuseLatencyGuard {
+    fn drop(&mut self) {
+        FUSE_LATENCY.record(self.0.elapsed());
+    }
+}
+
 /// DB query round-trip latency.
 pub static DB_LATENCY: Histogram = Histogram::new();
 
@@ -149,6 +232,10 @@ pub fn start_periodic_export() {
         .name("metrics-export".into())
         .spawn(|| loop {
             std::thread::sleep(Duration::from_secs(60));
+            // Re-arm the replica-fallback WARN so the first fallback of
+            // every period is reported (spec/replica.py FallsBackToPrimary:
+            // "The first fallback per period is logged at WARN").
+            REPLICA_FALLBACK_WARNED.store(false, Ordering::Relaxed);
             tracing::info!(
                 "metrics|ops|lookup={} getattr={} setattr={} read={} write={} create={} mkdir={} unlink={} rmdir={} rename={} readdir={} open={} fsync={}",
                 LOOKUP_COUNT.load(Ordering::Relaxed),
@@ -176,6 +263,11 @@ pub fn start_periodic_export() {
                 EINVAL_COUNT.load(Ordering::Relaxed),
             );
             tracing::info!(
+                "metrics|replica|reads={} fallbacks={}",
+                REPLICA_READ_COUNT.load(Ordering::Relaxed),
+                REPLICA_FALLBACK_COUNT.load(Ordering::Relaxed),
+            );
+            tracing::info!(
                 "metrics|latency|fuse={}",
                 FUSE_LATENCY.summary("fuse"),
             );
@@ -190,7 +282,6 @@ pub fn start_periodic_export() {
 // ── Liveness thread ────────────────────────────────────────────────────
 
 /// Spawn a daemon thread that bumps `LIVENESS` every 10 s.
-/// FUSE callbacks should check that it advances within 30 s.
 pub fn start_liveness_heartbeat() {
     std::thread::Builder::new()
         .name("liveness".into())
@@ -199,12 +290,6 @@ pub fn start_liveness_heartbeat() {
             std::thread::sleep(Duration::from_secs(10));
         })
         .expect("spawn liveness thread");
-}
-
-/// Return true if the liveness counter has advanced since `last_seen`.
-#[allow(dead_code)] // wired in future callback-level instrumentation pass
-pub fn liveness_changed_since(last_seen: u64) -> bool {
-    LIVENESS.load(Ordering::Acquire) != last_seen
 }
 
 // ── State dump ─────────────────────────────────────────────────────────
@@ -276,9 +361,36 @@ mod tests {
     }
 
     #[test]
-    fn liveness_seen() {
-        let seen = LIVENESS.load(Ordering::Acquire);
+    fn liveness_check_detects_stall() {
+        // NOTE: these tests mutate process-global statics (LIVENESS,
+        // BEAT_DEADLINE_AT, FUSE_LATENCY). They are only safe because no
+        // other test touches the same statics concurrently. If a future
+        // test calls check_liveness() or records FUSE_LATENCY, it must also
+        // snapshot/reset these statics.
+        // First observation initializes the baseline and reports healthy.
+        assert!(check_liveness());
+        // A beat arrives: still healthy.
         LIVENESS.fetch_add(1, Ordering::Release);
-        assert!(liveness_changed_since(seen));
+        assert!(check_liveness());
+        // No beat for >3×N: deadlocked. Forge a deadline that has already
+        // passed (0 = start of the process's monotonic clock) — this works
+        // regardless of how long the test process has been alive.
+        BEAT_DEADLINE_AT.store(0, Ordering::Relaxed);
+        assert!(!check_liveness());
+        // Recovery: the next beat arms a fresh deadline.
+        LIVENESS.fetch_add(1, Ordering::Release);
+        assert!(check_liveness());
+    }
+
+    #[test]
+    fn latency_guard_records_one_sample() {
+        let before = FUSE_LATENCY.snapshot();
+        {
+            let _guard = FuseLatencyGuard::new();
+            std::thread::sleep(Duration::from_micros(1));
+        }
+        let after = FUSE_LATENCY.snapshot();
+        let delta: u64 = after.iter().zip(before.iter()).map(|(a, b)| a - b).sum();
+        assert_eq!(delta, 1, "guard must record exactly one latency sample");
     }
 }
