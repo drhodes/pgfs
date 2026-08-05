@@ -89,34 +89,45 @@ impl Db {
     /// position; writes always go to the primary. A failure to reach the
     /// replica is not fatal: reads fall back to the primary (see
     /// `FallsBackToPrimary` in spec/replica.py).
+    #[allow(dead_code)]
     pub fn connect(conn_str: &str, replica_conn: Option<&str>) -> Result<Self> {
+        Self::connect_opts(conn_str, replica_conn, false)
+    }
+
+    pub fn connect_opts(
+        conn_str: &str,
+        replica_conn: Option<&str>,
+        unlogged: bool,
+    ) -> Result<Self> {
         let mut client = error::ctx(
             Client::connect(conn_str, NoTls),
             &format!("connect to Postgres ({conn_str})"),
         )?;
+        let unlogged_kw = if unlogged { "UNLOGGED " } else { "" };
+        let ddl = format!(
+            "BEGIN;
+            SELECT pg_advisory_xact_lock(42424242);
+            CREATE {unlogged_kw}TABLE IF NOT EXISTS entries (
+                parent text NOT NULL,
+                name   text NOT NULL,
+                kind   text NOT NULL DEFAULT 'file',
+                data   bytea NOT NULL DEFAULT '',
+                size   bigint NOT NULL DEFAULT 0,
+                mtime  timestamptz NOT NULL DEFAULT now(),
+                PRIMARY KEY (parent, name)
+            );
+            CREATE {unlogged_kw}TABLE IF NOT EXISTS blocks (
+                parent   text NOT NULL,
+                name     text NOT NULL,
+                block_no integer NOT NULL,
+                data     bytea NOT NULL,
+                PRIMARY KEY (parent, name, block_no)
+            );
+            COMMIT;
+            SET synchronous_commit = off;"
+        );
         error::ctx(
-            client.batch_execute(
-                "BEGIN;
-                SELECT pg_advisory_xact_lock(42424242);
-                CREATE TABLE IF NOT EXISTS entries (
-                    parent text NOT NULL,
-                    name   text NOT NULL,
-                    kind   text NOT NULL DEFAULT 'file',
-                    data   bytea NOT NULL DEFAULT '',
-                    size   bigint NOT NULL DEFAULT 0,
-                    mtime  timestamptz NOT NULL DEFAULT now(),
-                    PRIMARY KEY (parent, name)
-                );
-                CREATE TABLE IF NOT EXISTS blocks (
-                    parent   text NOT NULL,
-                    name     text NOT NULL,
-                    block_no integer NOT NULL,
-                    data     bytea NOT NULL,
-                    PRIMARY KEY (parent, name, block_no)
-                );
-                COMMIT;
-                SET synchronous_commit = off;",
-            ),
+            client.batch_execute(&ddl),
             "ensure schema exists and configure synchronous_commit = off",
         )?;
 
@@ -849,6 +860,20 @@ mod tests {
         assert_eq!(
             val, "off",
             "synchronous_commit must be tuned off on connection"
+        );
+    }
+
+    #[test]
+    fn connect_with_unlogged_tables() {
+        let conn_str = format!(
+            "host={}/testdata dbname=pgfs",
+            std::env::current_dir().unwrap().display()
+        );
+        let db = Db::connect_opts(&conn_str, None, true);
+        assert!(
+            db.is_ok(),
+            "connect_opts with unlogged = true must succeed: {:?}",
+            db.err()
         );
     }
 

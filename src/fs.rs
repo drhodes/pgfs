@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tracing::info_span;
 
+#[allow(dead_code)]
 const TTL: Duration = Duration::from_secs(1);
 const ROOT_INO: u64 = 1;
 const ROOT_PATH: &str = "";
@@ -45,6 +46,7 @@ pub struct PgFs {
     dump_requested: Arc<AtomicBool>,
     /// Wall clock at mount time, for the state dump's uptime figure.
     started: Instant,
+    attr_ttl: Duration,
 }
 
 /// Per-callback preamble: honor a pending SIGUSR1 state dump, then check
@@ -101,14 +103,24 @@ fn rekey_maps(
 }
 
 impl PgFs {
+    #[allow(dead_code)]
     pub fn new(db: Db, dump_requested: Arc<AtomicBool>) -> Self {
-        PgFs {
+        Self::with_attr_ttl(db, dump_requested, TTL)
+    }
+
+    pub fn with_attr_ttl(db: Db, dump_requested: Arc<AtomicBool>, attr_ttl: Duration) -> Self {
+        let mut ino_by_path = HashMap::new();
+        let mut path_by_ino = HashMap::new();
+        ino_by_path.insert(ROOT_PATH.to_string(), ROOT_INO);
+        path_by_ino.insert(ROOT_INO, ROOT_PATH.to_string());
+        Self {
             db,
-            ino_by_path: HashMap::new(),
-            path_by_ino: HashMap::new(),
-            next_ino: 2, // 1 is reserved for the root directory
+            ino_by_path,
+            path_by_ino,
+            next_ino: ROOT_INO + 1,
             dump_requested,
             started: Instant::now(),
+            attr_ttl,
         }
     }
 
@@ -239,7 +251,7 @@ impl Filesystem for PgFs {
             Ok(Some(meta)) => {
                 let path = db::join(&parent_path, &name);
                 let ino = self.ino_for(&path);
-                reply.entry(&TTL, &Self::attr(ino, &meta), 0);
+                reply.entry(&self.attr_ttl, &Self::attr(ino, &meta), 0);
             }
             Ok(None) => reply.error(ENOENT),
             Err(e) => crate::log_and_reply!(reply, e),
@@ -252,7 +264,7 @@ impl Filesystem for PgFs {
         callback_preamble!(self, reply);
         metrics::GETATTR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if ino == ROOT_INO {
-            reply.attr(&TTL, &Self::root_attr());
+            reply.attr(&self.attr_ttl, &Self::root_attr());
             return;
         }
         let path = match self.path_of_ino(ino) {
@@ -264,7 +276,7 @@ impl Filesystem for PgFs {
         };
         let (parent, name) = split_path(&path);
         match self.db.getattr(parent, name) {
-            Ok(Some(meta)) => reply.attr(&TTL, &Self::attr(ino, &meta)),
+            Ok(Some(meta)) => reply.attr(&self.attr_ttl, &Self::attr(ino, &meta)),
             Ok(None) => reply.error(ENOENT),
             Err(e) => crate::log_and_reply!(reply, e),
         }
@@ -293,7 +305,7 @@ impl Filesystem for PgFs {
         callback_preamble!(self, reply);
         metrics::SETATTR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if ino == ROOT_INO {
-            reply.attr(&TTL, &Self::root_attr());
+            reply.attr(&self.attr_ttl, &Self::root_attr());
             return;
         }
         let path = match self.path_of_ino(ino) {
@@ -330,7 +342,7 @@ impl Filesystem for PgFs {
         // result of the mutation just committed and the kernel caches it
         // with a TTL, so a stale replica would cache wrong size/mtime.
         match self.db.getattr_primary(parent, name) {
-            Ok(Some(meta)) => reply.attr(&TTL, &Self::attr(ino, &meta)),
+            Ok(Some(meta)) => reply.attr(&self.attr_ttl, &Self::attr(ino, &meta)),
             Ok(None) => reply.error(ENOENT),
             Err(e) => crate::log_and_reply!(reply, e),
         }
@@ -556,7 +568,7 @@ impl Filesystem for PgFs {
         let path = db::join(&parent_path, &name);
         let ino = self.ino_for(&path);
         let attr = Self::file_attr(ino, 0, std::time::SystemTime::now());
-        reply.created(&TTL, &attr, 0, 0, 0);
+        reply.created(&self.attr_ttl, &attr, 0, 0, 0);
     }
 
     fn mkdir(
@@ -597,7 +609,7 @@ impl Filesystem for PgFs {
 
         let path = db::join(&parent_path, &name);
         let ino = self.ino_for(&path);
-        reply.entry(&TTL, &Self::dir_attr(ino), 0);
+        reply.entry(&self.attr_ttl, &Self::dir_attr(ino), 0);
     }
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {

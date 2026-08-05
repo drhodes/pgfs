@@ -37,6 +37,14 @@ struct Args {
     /// scripts/replica_db.sh.
     #[arg(long)]
     replica: Option<String>,
+
+    /// Kernel attribute and entry cache TTL in seconds (spec/optimize.py KernelAttrCacheTtlReq).
+    #[arg(long, default_value_t = 1.0)]
+    attr_ttl: f64,
+
+    /// Create entries and blocks tables as UNLOGGED tables (spec/optimize.py UnloggedTableOptReq).
+    #[arg(long, default_value_t = false)]
+    unlogged: bool,
 }
 
 fn main() {
@@ -140,7 +148,7 @@ fn run(args: &Args) -> Result<()> {
         }
     }
 
-    let db = Db::connect(&args.conn, args.replica.as_deref())?;
+    let db = Db::connect_opts(&args.conn, args.replica.as_deref(), args.unlogged)?;
 
     if let Some(replica) = &args.replica {
         tracing::info!("replica mode: reads served from standby ({replica}) when fresh");
@@ -172,9 +180,10 @@ fn run(args: &Args) -> Result<()> {
     let dump_requested = Arc::new(AtomicBool::new(false));
 
     println!("mounting pgfs at {}", args.mountpoint);
+    let attr_ttl = std::time::Duration::from_secs_f64(args.attr_ttl);
     let mut session = error::ctx(
         fuser::Session::new(
-            PgFs::new(db, Arc::clone(&dump_requested)),
+            PgFs::with_attr_ttl(db, Arc::clone(&dump_requested), attr_ttl),
             std::path::Path::new(&args.mountpoint),
             &options,
         ),
