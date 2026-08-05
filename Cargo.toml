@@ -12,7 +12,10 @@ profiling = ["pprof", "tracing-chrome"]
 [dependencies]
 fuser = "0.14"
 postgres = "0.19"
+r2d2 = "0.8"
+r2d2_postgres = "0.18"
 libc = "0.2"
+
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap = { version = "4", features = ["derive"] }

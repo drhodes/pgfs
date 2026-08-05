@@ -22,12 +22,187 @@ use postgres::{Client, NoTls, Statement};
 use std::time::{Instant, SystemTime};
 use tracing::debug_span;
 
+use r2d2::Pool;
+use r2d2_postgres::PostgresConnectionManager;
+
+pub enum DbClient {
+    #[allow(dead_code)]
+    Direct(Client),
+    Pooled(r2d2::PooledConnection<PostgresConnectionManager<NoTls>>),
+}
+
+impl std::ops::Deref for DbClient {
+    type Target = Client;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Direct(c) => c,
+            Self::Pooled(c) => c,
+        }
+    }
+}
+
+impl std::ops::DerefMut for DbClient {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Direct(c) => c,
+            Self::Pooled(c) => c,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct DbPool {
+    primary: Pool<PostgresConnectionManager<NoTls>>,
+    replica: Option<Pool<PostgresConnectionManager<NoTls>>>,
+}
+
+#[derive(Debug)]
+struct DbCustomizer {
+    unlogged: bool,
+}
+
+impl r2d2::CustomizeConnection<postgres::Client, postgres::Error> for DbCustomizer {
+    fn on_acquire(
+        &self,
+        client: &mut postgres::Client,
+    ) -> std::result::Result<(), postgres::Error> {
+        let unlogged_kw = if self.unlogged { "UNLOGGED " } else { "" };
+        let ddl = format!(
+            "BEGIN;
+            SELECT pg_advisory_xact_lock(42424242);
+            CREATE {unlogged_kw}TABLE IF NOT EXISTS entries (
+                parent text NOT NULL,
+                name   text NOT NULL,
+                kind   text NOT NULL DEFAULT 'file',
+                data   bytea NOT NULL DEFAULT '',
+                size   bigint NOT NULL DEFAULT 0,
+                mtime  timestamptz NOT NULL DEFAULT now(),
+                PRIMARY KEY (parent, name)
+            );
+            CREATE {unlogged_kw}TABLE IF NOT EXISTS blocks (
+                parent   text NOT NULL,
+                name     text NOT NULL,
+                block_no integer NOT NULL,
+                data     bytea NOT NULL,
+                PRIMARY KEY (parent, name, block_no)
+            );
+            COMMIT;
+            SET synchronous_commit = off;"
+        );
+        client.batch_execute(&ddl)?;
+        Ok(())
+    }
+}
+
+impl DbPool {
+    pub fn connect_opts(
+        conn_str: &str,
+        replica_conn: Option<&str>,
+        unlogged: bool,
+        max_size: u32,
+    ) -> Result<Self> {
+        let config = conn_str.parse().map_err(|e| {
+            error::failure(format!("invalid postgres conn string {conn_str:?}: {e}"))
+        })?;
+        let manager = PostgresConnectionManager::new(config, NoTls);
+        let primary = r2d2::Pool::builder()
+            .max_size(max_size)
+            .connection_customizer(Box::new(DbCustomizer { unlogged }))
+            .build(manager)
+            .map_err(|e| error::failure(format!("failed to build primary connection pool: {e}")))?;
+
+        let replica = match replica_conn {
+            Some(s) => match s.parse() {
+                Ok(c) => {
+                    let m = PostgresConnectionManager::new(c, NoTls);
+                    r2d2::Pool::builder().max_size(max_size).build(m).ok()
+                }
+                Err(_) => None,
+            },
+            None => None,
+        };
+
+        Ok(Self { primary, replica })
+    }
+
+    pub fn get(&self) -> Result<Db> {
+        let mut client = error::ctx(self.primary.get(), "acquire primary connection from pool")?;
+
+        let stmt_getattr = error::ctx(
+            client.prepare(
+                "SELECT name, kind, size, mtime FROM entries WHERE parent = $1 AND name = $2",
+            ),
+            "prepare stmt_getattr",
+        )?;
+        let stmt_create = error::ctx(
+            client.prepare("INSERT INTO entries (parent, name, kind, data, size) VALUES ($1, $2, 'file', '', 0) ON CONFLICT (parent, name) DO NOTHING"),
+            "prepare stmt_create",
+        )?;
+        let stmt_mkdir = error::ctx(
+            client.prepare("INSERT INTO entries (parent, name, kind, data, size) VALUES ($1, $2, 'dir', '', 0) ON CONFLICT (parent, name) DO NOTHING"),
+            "prepare stmt_mkdir",
+        )?;
+        let stmt_unlink = error::ctx(
+            client.prepare("DELETE FROM entries WHERE parent = $1 AND name = $2"),
+            "prepare stmt_unlink",
+        )?;
+        let stmt_rmdir = error::ctx(
+            client.prepare("DELETE FROM entries WHERE parent = $1 AND name = $2"),
+            "prepare stmt_rmdir",
+        )?;
+        let stmt_list = error::ctx(
+            client.prepare(
+                "SELECT name, kind, size, mtime FROM entries WHERE parent = $1 ORDER BY name",
+            ),
+            "prepare stmt_list",
+        )?;
+        let stmt_read_blocks = error::ctx(
+            client.prepare("SELECT block_no, data FROM blocks WHERE parent = $1 AND name = $2 AND block_no >= $3 AND block_no <= $4 ORDER BY block_no"),
+            "prepare stmt_read_blocks",
+        )?;
+        let stmt_upsert_block = error::ctx(
+            client.prepare("INSERT INTO blocks (parent, name, block_no, data) VALUES ($1, $2, $3, $4) ON CONFLICT (parent, name, block_no) DO UPDATE SET data = EXCLUDED.data"),
+            "prepare stmt_upsert_block",
+        )?;
+        let stmt_prune_blocks = error::ctx(
+            client.prepare("DELETE FROM blocks WHERE parent = $1 AND name = $2 AND block_no > $3"),
+            "prepare stmt_prune_blocks",
+        )?;
+        let stmt_delete_blocks = error::ctx(
+            client.prepare("DELETE FROM blocks WHERE parent = $1 AND name = $2"),
+            "prepare stmt_delete_blocks",
+        )?;
+
+        let replica = match &self.replica {
+            Some(p) => p.get().ok(),
+            None => None,
+        };
+
+        Ok(Db {
+            client: DbClient::Pooled(client),
+            replica: replica.map(DbClient::Pooled),
+            stmt_getattr,
+            stmt_create,
+            stmt_mkdir,
+            stmt_unlink,
+            stmt_rmdir,
+            stmt_list,
+            stmt_read_blocks,
+            stmt_upsert_block,
+            stmt_prune_blocks,
+            stmt_delete_blocks,
+            freshness_cached: false,
+            freshness_checked_at: None,
+        })
+    }
+}
+
 pub struct Db {
     /// Primary connection — every write goes here.
-    client: Client,
+    client: DbClient,
     /// Optional physical streaming standby (see spec/replica.py). Reads
     /// are served from it when it has caught up with the primary's WAL.
-    replica: Option<Client>,
+    replica: Option<DbClient>,
 
     // Pre-compiled SQL statement handles on the primary connection.
     stmt_getattr: Statement,
@@ -99,119 +274,8 @@ impl Db {
         replica_conn: Option<&str>,
         unlogged: bool,
     ) -> Result<Self> {
-        let mut client = error::ctx(
-            Client::connect(conn_str, NoTls),
-            &format!("connect to Postgres ({conn_str})"),
-        )?;
-        let unlogged_kw = if unlogged { "UNLOGGED " } else { "" };
-        let ddl = format!(
-            "BEGIN;
-            SELECT pg_advisory_xact_lock(42424242);
-            CREATE {unlogged_kw}TABLE IF NOT EXISTS entries (
-                parent text NOT NULL,
-                name   text NOT NULL,
-                kind   text NOT NULL DEFAULT 'file',
-                data   bytea NOT NULL DEFAULT '',
-                size   bigint NOT NULL DEFAULT 0,
-                mtime  timestamptz NOT NULL DEFAULT now(),
-                PRIMARY KEY (parent, name)
-            );
-            CREATE {unlogged_kw}TABLE IF NOT EXISTS blocks (
-                parent   text NOT NULL,
-                name     text NOT NULL,
-                block_no integer NOT NULL,
-                data     bytea NOT NULL,
-                PRIMARY KEY (parent, name, block_no)
-            );
-            COMMIT;
-            SET synchronous_commit = off;"
-        );
-        error::ctx(
-            client.batch_execute(&ddl),
-            "ensure schema exists and configure synchronous_commit = off",
-        )?;
-
-        let stmt_getattr = error::ctx(
-            client.prepare(
-                "SELECT name, kind, size, mtime FROM entries WHERE parent = $1 AND name = $2",
-            ),
-            "prepare stmt_getattr",
-        )?;
-        let stmt_create = error::ctx(
-            client.prepare("INSERT INTO entries (parent, name, kind, data, size) VALUES ($1, $2, 'file', '', 0) ON CONFLICT (parent, name) DO NOTHING"),
-            "prepare stmt_create",
-        )?;
-        let stmt_mkdir = error::ctx(
-            client.prepare("INSERT INTO entries (parent, name, kind, data, size) VALUES ($1, $2, 'dir', '', 0) ON CONFLICT (parent, name) DO NOTHING"),
-            "prepare stmt_mkdir",
-        )?;
-        let stmt_unlink = error::ctx(
-            client.prepare("DELETE FROM entries WHERE parent = $1 AND name = $2"),
-            "prepare stmt_unlink",
-        )?;
-        let stmt_rmdir = error::ctx(
-            client.prepare("DELETE FROM entries WHERE parent = $1 AND name = $2"),
-            "prepare stmt_rmdir",
-        )?;
-        let stmt_list = error::ctx(
-            client.prepare(
-                "SELECT name, kind, size, mtime FROM entries WHERE parent = $1 ORDER BY name",
-            ),
-            "prepare stmt_list",
-        )?;
-
-        let stmt_read_blocks = error::ctx(
-            client.prepare(
-                "SELECT block_no, data FROM blocks WHERE parent = $1 AND name = $2 AND block_no >= $3 AND block_no <= $4 ORDER BY block_no",
-            ),
-            "prepare stmt_read_blocks",
-        )?;
-        let stmt_upsert_block = error::ctx(
-            client.prepare(
-                "INSERT INTO blocks (parent, name, block_no, data) VALUES ($1, $2, $3, $4) ON CONFLICT (parent, name, block_no) DO UPDATE SET data = EXCLUDED.data",
-            ),
-            "prepare stmt_upsert_block",
-        )?;
-        let stmt_prune_blocks = error::ctx(
-            client.prepare("DELETE FROM blocks WHERE parent = $1 AND name = $2 AND block_no > $3"),
-            "prepare stmt_prune_blocks",
-        )?;
-        let stmt_delete_blocks = error::ctx(
-            client.prepare("DELETE FROM blocks WHERE parent = $1 AND name = $2"),
-            "prepare stmt_delete_blocks",
-        )?;
-
-        let replica = match replica_conn {
-            Some(s) => match Client::connect(s, NoTls) {
-                Ok(c) => Some(c),
-                // Best-effort: an unreachable standby must never prevent the
-                // mount from starting (spec/replica.py ReplicaObservability).
-                // The mount runs primary-only and every read falls back.
-                Err(e) => {
-                    tracing::warn!(
-                        "replica standby unreachable at startup ({s}); running primary-only: {e}"
-                    );
-                    None
-                }
-            },
-            None => None,
-        };
-        Ok(Db {
-            client,
-            replica,
-            stmt_getattr,
-            stmt_create,
-            stmt_mkdir,
-            stmt_unlink,
-            stmt_rmdir,
-            stmt_list,
-            stmt_read_blocks,
-            stmt_upsert_block,
-            stmt_prune_blocks,
-            stmt_delete_blocks,
-            freshness_cached: false,
-            freshness_checked_at: None,
-        })
+        let pool = DbPool::connect_opts(conn_str, replica_conn, unlogged, 10)?;
+        pool.get()
     }
 
     /// Is the replica fresh enough to serve reads? True iff a replica is
@@ -1048,6 +1112,27 @@ mod tests {
         assert_eq!(content, b"Hello Buffered ");
 
         cleanup(&mut db, &root);
+    }
+
+    #[test]
+    fn db_pool_concurrent_queries() {
+        let conn_str = format!(
+            "host={}/testdata dbname=pgfs",
+            std::env::current_dir().unwrap().display()
+        );
+        let pool = DbPool::connect_opts(&conn_str, None, false, 5).expect("connect DbPool");
+        let handles: Vec<_> = (0..5)
+            .map(|_| {
+                let p = pool.clone();
+                std::thread::spawn(move || {
+                    let mut conn = p.get().expect("get pooled conn");
+                    let _ = conn.list("");
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     /// With no replica configured, every read must be served from the
