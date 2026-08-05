@@ -18,7 +18,7 @@
 //! file:line where it happened, so failures read as a story.
 
 use crate::error::{self, Result};
-use postgres::{Client, NoTls};
+use postgres::{Client, NoTls, Statement};
 use std::time::{Instant, SystemTime};
 use tracing::debug_span;
 
@@ -28,6 +28,16 @@ pub struct Db {
     /// Optional physical streaming standby (see spec/replica.py). Reads
     /// are served from it when it has caught up with the primary's WAL.
     replica: Option<Client>,
+
+    // Pre-compiled SQL statement handles on the primary connection.
+    stmt_getattr: Statement,
+    stmt_read: Statement,
+    stmt_write: Statement,
+    stmt_create: Statement,
+    stmt_mkdir: Statement,
+    stmt_unlink: Statement,
+    stmt_rmdir: Statement,
+    stmt_list: Statement,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,7 +81,8 @@ impl Db {
         )?;
         error::ctx(
             client.batch_execute(
-                "CREATE TABLE IF NOT EXISTS entries (
+                "SET synchronous_commit = off;
+                CREATE TABLE IF NOT EXISTS entries (
                     parent text NOT NULL,
                     name   text NOT NULL,
                     kind   text NOT NULL DEFAULT 'file',
@@ -81,8 +92,46 @@ impl Db {
                     PRIMARY KEY (parent, name)
                 )",
             ),
-            "ensure the entries schema exists",
+            "ensure schema exists and configure synchronous_commit = off",
         )?;
+
+        let stmt_getattr = error::ctx(
+            client.prepare(
+                "SELECT name, kind, size, mtime FROM entries WHERE parent = $1 AND name = $2",
+            ),
+            "prepare stmt_getattr",
+        )?;
+        let stmt_read = error::ctx(
+            client.prepare("SELECT data FROM entries WHERE parent = $1 AND name = $2"),
+            "prepare stmt_read",
+        )?;
+        let stmt_write = error::ctx(
+            client.prepare("UPDATE entries SET data = $3, size = $4, mtime = now() WHERE parent = $1 AND name = $2"),
+            "prepare stmt_write",
+        )?;
+        let stmt_create = error::ctx(
+            client.prepare("INSERT INTO entries (parent, name, kind, data, size) VALUES ($1, $2, 'file', '', 0) ON CONFLICT (parent, name) DO NOTHING"),
+            "prepare stmt_create",
+        )?;
+        let stmt_mkdir = error::ctx(
+            client.prepare("INSERT INTO entries (parent, name, kind, data, size) VALUES ($1, $2, 'dir', '', 0) ON CONFLICT (parent, name) DO NOTHING"),
+            "prepare stmt_mkdir",
+        )?;
+        let stmt_unlink = error::ctx(
+            client.prepare("DELETE FROM entries WHERE parent = $1 AND name = $2"),
+            "prepare stmt_unlink",
+        )?;
+        let stmt_rmdir = error::ctx(
+            client.prepare("DELETE FROM entries WHERE parent = $1 AND name = $2"),
+            "prepare stmt_rmdir",
+        )?;
+        let stmt_list = error::ctx(
+            client.prepare(
+                "SELECT name, kind, size, mtime FROM entries WHERE parent = $1 ORDER BY name",
+            ),
+            "prepare stmt_list",
+        )?;
+
         let replica = match replica_conn {
             Some(s) => match Client::connect(s, NoTls) {
                 Ok(c) => Some(c),
@@ -98,40 +147,18 @@ impl Db {
             },
             None => None,
         };
-        Ok(Db { client, replica })
-    }
-
-    /// The client a read should use. Returns the replica when it is
-    /// configured and fresh (caught up with the primary's WAL), otherwise
-    /// the primary. Fallbacks are counted only when a replica is configured
-    /// (a single-node mount has nothing to fall back from).
-    fn reader(&mut self) -> &mut Client {
-        if self.replica.is_some() {
-            if self.replica_fresh() {
-                crate::metrics::REPLICA_READ_COUNT
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                tracing::debug!("read served from replica");
-                return self.replica.as_mut().expect("replica present when fresh");
-            }
-            crate::metrics::REPLICA_FALLBACK_COUNT
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if crate::metrics::REPLICA_FALLBACK_WARNED
-                .compare_exchange(
-                    false,
-                    true,
-                    std::sync::atomic::Ordering::Relaxed,
-                    std::sync::atomic::Ordering::Relaxed,
-                )
-                .is_ok()
-            {
-                // First fallback is worth a human's attention (spec/replica.py
-                // FallsBackToPrimary); the rest are routine and stay quiet.
-                tracing::warn!("reads falling back to primary (standby stale or unreachable)");
-            } else {
-                tracing::debug!("read served from primary (replica stale)");
-            }
-        }
-        &mut self.client
+        Ok(Db {
+            client,
+            replica,
+            stmt_getattr,
+            stmt_read,
+            stmt_write,
+            stmt_create,
+            stmt_mkdir,
+            stmt_unlink,
+            stmt_rmdir,
+            stmt_list,
+        })
     }
 
     /// Is the replica fresh enough to serve reads? True iff a replica is
@@ -199,18 +226,10 @@ impl Db {
     /// rename's source/target checks) so a stale replica can never
     /// influence a write's outcome.
     pub fn getattr_primary(&mut self, parent: &str, name: &str) -> Result<Option<FileMeta>> {
-        Self::getattr_on(&mut self.client, parent, name)
-    }
-
-    fn getattr_on(client: &mut Client, parent: &str, name: &str) -> Result<Option<FileMeta>> {
         let _span = debug_span!("db::getattr", parent, name).entered();
         let _t0 = Instant::now();
         let row = error::ctx(
-            client.query_opt(
-                "SELECT name, kind, size, mtime FROM entries
-                 WHERE parent = $1 AND name = $2",
-                &[&parent, &name],
-            ),
+            self.client.query_opt(&self.stmt_getattr, &[&parent, &name]),
             &format!("get attributes of entry {name:?} in {parent:?}"),
         )?;
         let result = row.as_ref().map(row_to_meta).transpose();
@@ -222,15 +241,10 @@ impl Db {
     /// target-emptiness check so a stale replica can never let a rename
     /// overwrite a directory that is actually non-empty on the primary.
     pub fn list_primary(&mut self, parent: &str) -> Result<Vec<FileMeta>> {
-        let client = &mut self.client;
         let _span = debug_span!("db::list", parent).entered();
         let _t0 = Instant::now();
         let rows = error::ctx(
-            client.query(
-                "SELECT name, kind, size, mtime FROM entries
-                 WHERE parent = $1 ORDER BY name",
-                &[&parent],
-            ),
+            self.client.query(&self.stmt_list, &[&parent]),
             &format!("list children of directory {parent:?}"),
         )?;
         let result: Result<Vec<FileMeta>> = rows.iter().map(row_to_meta).collect();
@@ -241,40 +255,88 @@ impl Db {
     /// Children of a directory, sorted by name. Ordering is cosmetic here;
     /// fs.rs re-iterates this on every readdir.
     pub fn list(&mut self, parent: &str) -> Result<Vec<FileMeta>> {
-        let client = self.reader();
-        let _span = debug_span!("db::list", parent).entered();
-        let _t0 = Instant::now();
-        let rows = error::ctx(
-            client.query(
-                "SELECT name, kind, size, mtime FROM entries
-                 WHERE parent = $1 ORDER BY name",
-                &[&parent],
-            ),
-            &format!("list children of directory {parent:?}"),
-        )?;
-        let result: Result<Vec<FileMeta>> = rows.iter().map(row_to_meta).collect();
-        crate::metrics::DB_LATENCY.record(_t0.elapsed());
-        result
+        if self.replica.is_some() && self.replica_fresh() {
+            crate::metrics::REPLICA_READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let replica = self.replica.as_mut().expect("replica present");
+            let _span = debug_span!("db::list", parent).entered();
+            let _t0 = Instant::now();
+            let rows = error::ctx(
+                replica.query(
+                    "SELECT name, kind, size, mtime FROM entries WHERE parent = $1 ORDER BY name",
+                    &[&parent],
+                ),
+                &format!("list children of directory {parent:?}"),
+            )?;
+            let result: Result<Vec<FileMeta>> = rows.iter().map(row_to_meta).collect();
+            crate::metrics::DB_LATENCY.record(_t0.elapsed());
+            result
+        } else {
+            self.record_replica_fallback_if_configured();
+            self.list_primary(parent)
+        }
     }
 
     pub fn getattr(&mut self, parent: &str, name: &str) -> Result<Option<FileMeta>> {
-        let client = self.reader();
-        Self::getattr_on(client, parent, name)
+        if self.replica.is_some() && self.replica_fresh() {
+            crate::metrics::REPLICA_READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let replica = self.replica.as_mut().expect("replica present");
+            let _span = debug_span!("db::getattr", parent, name).entered();
+            let _t0 = Instant::now();
+            let row = error::ctx(
+                replica.query_opt(
+                    "SELECT name, kind, size, mtime FROM entries WHERE parent = $1 AND name = $2",
+                    &[&parent, &name],
+                ),
+                &format!("get attributes of entry {name:?} in {parent:?}"),
+            )?;
+            let result = row.as_ref().map(row_to_meta).transpose();
+            crate::metrics::DB_LATENCY.record(_t0.elapsed());
+            result
+        } else {
+            self.record_replica_fallback_if_configured();
+            self.getattr_primary(parent, name)
+        }
     }
 
     pub fn read(&mut self, parent: &str, name: &str) -> Result<Option<Vec<u8>>> {
-        let client = self.reader();
-        let _span = debug_span!("db::read", parent, name).entered();
-        let _t0 = Instant::now();
-        let row = error::ctx(
-            client.query_opt(
-                "SELECT data FROM entries WHERE parent = $1 AND name = $2",
-                &[&parent, &name],
-            ),
-            &format!("read contents of {name:?} in {parent:?}"),
-        )?;
-        crate::metrics::DB_LATENCY.record(_t0.elapsed());
-        Ok(row.map(|r| r.get::<_, Vec<u8>>("data")))
+        if self.replica.is_some() && self.replica_fresh() {
+            crate::metrics::REPLICA_READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let replica = self.replica.as_mut().expect("replica present");
+            let _span = debug_span!("db::read", parent, name).entered();
+            let _t0 = Instant::now();
+            let row = error::ctx(
+                replica.query_opt(
+                    "SELECT data FROM entries WHERE parent = $1 AND name = $2",
+                    &[&parent, &name],
+                ),
+                &format!("read contents of {name:?} in {parent:?}"),
+            )?;
+            crate::metrics::DB_LATENCY.record(_t0.elapsed());
+            Ok(row.map(|r| r.get::<_, Vec<u8>>("data")))
+        } else {
+            self.record_replica_fallback_if_configured();
+            self.read_primary(parent, name)
+        }
+    }
+
+    fn record_replica_fallback_if_configured(&mut self) {
+        if self.replica.is_some() {
+            crate::metrics::REPLICA_FALLBACK_COUNT
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if crate::metrics::REPLICA_FALLBACK_WARNED
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                tracing::warn!("reads falling back to primary (standby stale or unreachable)");
+            } else {
+                tracing::debug!("read served from primary (replica stale)");
+            }
+        }
     }
 
     /// read forced to the primary. Used by the write path's
@@ -282,14 +344,10 @@ impl Db {
     /// "old" bytes a write is about to patch over — that would silently
     /// lose concurrent primary writes.
     pub fn read_primary(&mut self, parent: &str, name: &str) -> Result<Option<Vec<u8>>> {
-        let client = &mut self.client;
         let _span = debug_span!("db::read", parent, name).entered();
         let _t0 = Instant::now();
         let row = error::ctx(
-            client.query_opt(
-                "SELECT data FROM entries WHERE parent = $1 AND name = $2",
-                &[&parent, &name],
-            ),
+            self.client.query_opt(&self.stmt_read, &[&parent, &name]),
             &format!("read contents of {name:?} in {parent:?}"),
         )?;
         crate::metrics::DB_LATENCY.record(_t0.elapsed());
@@ -304,8 +362,7 @@ impl Db {
         let _t0 = Instant::now();
         error::ctx(
             self.client.execute(
-                "UPDATE entries SET data = $3, size = $4, mtime = now()
-                 WHERE parent = $1 AND name = $2",
+                &self.stmt_write,
                 &[&parent, &name, &data, &(data.len() as i64)],
             ),
             &format!("write {} bytes to {name:?} in {parent:?}", data.len()),
@@ -318,11 +375,7 @@ impl Db {
         let _span = debug_span!("db::create", parent, name).entered();
         let _t0 = Instant::now();
         error::ctx(
-            self.client.execute(
-                "INSERT INTO entries (parent, name, kind, data, size) VALUES ($1, $2, 'file', '', 0)
-                 ON CONFLICT (parent, name) DO NOTHING",
-                &[&parent, &name],
-            ),
+            self.client.execute(&self.stmt_create, &[&parent, &name]),
             &format!("create file {name:?} in {parent:?}"),
         )?;
         crate::metrics::DB_LATENCY.record(_t0.elapsed());
@@ -333,11 +386,7 @@ impl Db {
         let _span = debug_span!("db::mkdir", parent, name).entered();
         let _t0 = Instant::now();
         error::ctx(
-            self.client.execute(
-                "INSERT INTO entries (parent, name, kind, data, size) VALUES ($1, $2, 'dir', '', 0)
-                 ON CONFLICT (parent, name) DO NOTHING",
-                &[&parent, &name],
-            ),
+            self.client.execute(&self.stmt_mkdir, &[&parent, &name]),
             &format!("create directory {name:?} in {parent:?}"),
         )?;
         crate::metrics::DB_LATENCY.record(_t0.elapsed());
@@ -348,10 +397,7 @@ impl Db {
         let _span = debug_span!("db::unlink", parent, name).entered();
         let _t0 = Instant::now();
         error::ctx(
-            self.client.execute(
-                "DELETE FROM entries WHERE parent = $1 AND name = $2",
-                &[&parent, &name],
-            ),
+            self.client.execute(&self.stmt_unlink, &[&parent, &name]),
             &format!("remove file {name:?} from {parent:?}"),
         )?;
         crate::metrics::DB_LATENCY.record(_t0.elapsed());
@@ -475,12 +521,10 @@ impl Db {
             return Ok(false);
         }
         let deleted = error::ctx(
-            self.client.execute(
-                "DELETE FROM entries WHERE parent = $1 AND name = $2",
-                &[&parent, &name],
-            ),
+            self.client.execute(&self.stmt_rmdir, &[&parent, &name]),
             &format!("remove directory {name:?} from {parent:?}"),
         )?;
+
         crate::metrics::DB_LATENCY.record(_t0.elapsed());
         Ok(deleted > 0)
     }
@@ -542,6 +586,20 @@ mod tests {
         let result = db.list("");
         // The entries table exists; listing root should succeed.
         assert!(result.is_ok(), "list root should work: {:?}", result.err());
+    }
+
+    #[test]
+    fn connect_disables_synchronous_commit() {
+        let mut db = db_connect();
+        let row = db
+            .client
+            .query_one("SHOW synchronous_commit;", &[])
+            .expect("query synchronous_commit");
+        let val: String = row.get(0);
+        assert_eq!(
+            val, "off",
+            "synchronous_commit must be tuned off on connection"
+        );
     }
 
     /// With no replica configured, every read must be served from the
