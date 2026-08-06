@@ -9,4 +9,9 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-libspec = { path = "../libspec" }
+libspec = { git = "https://github.com/drhodes/libspec" }
+
+[tool.uv.workspace]
+members = [
+    "testdata/mnt",
+]

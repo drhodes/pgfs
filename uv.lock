@@ -6,6 +6,12 @@ resolution-markers = [
     "python_full_version < '3.14'",
 ]
 
+[manifest]
+members = [
+    "mnt",
+    "pgfs",
+]
+
 [[package]]
 name = "aiofiles"
 version = "25.1.0"
@@ -350,7 +356,7 @@ wheels = [
 [[package]]
 name = "libspec"
 version = "10.3.1"
-source = { directory = "../libspec" }
+source = { git = "https://github.com/drhodes/libspec#0934a84153a82229d5c0734aa8f58a37c7fc62af" }
 dependencies = [
     { name = "aiofiles" },
     { name = "click" },
@@ -362,36 +368,6 @@ dependencies = [
     { name = "pyyaml" },
     { name = "skillkit" },
     { name = "toml" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "aiofiles", specifier = ">=25.1.0" },
-    { name = "click", specifier = ">=8.1.8" },
-    { name = "colored", specifier = ">=2.3.2" },
-    { name = "jinja2", specifier = ">=3.1.6" },
-    { name = "mcp", specifier = ">=1.27.0" },
-    { name = "prompt-toolkit", specifier = ">=3.0.52" },
-    { name = "python-lsp-server", specifier = ">=1.12.2" },
-    { name = "pyyaml", specifier = ">=6.0.2" },
-    { name = "skillkit", specifier = ">=0.4.0" },
-    { name = "toml", specifier = ">=0.10.2" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "coverage", specifier = ">=7.14.1" },
-    { name = "mkdocs", specifier = ">=1.6.0" },
-    { name = "mkdocs-material", specifier = ">=9.5.0" },
-    { name = "mkdocstrings", extras = ["python"], specifier = ">=0.25.0" },
-    { name = "mutmut", specifier = ">=3.6.0" },
-    { name = "mypy", specifier = ">=2.1.0" },
-    { name = "pudb", specifier = ">=2025.1.5" },
-    { name = "pytest", specifier = ">=9.0.2" },
-    { name = "pytest-cov", specifier = ">=7.1.0" },
-    { name = "pytest-xdist", specifier = ">=3.6.1" },
-    { name = "radon", specifier = ">=6.0.1" },
-    { name = "ruff", specifier = ">=0.15.12" },
 ]
 
 [[package]]
@@ -485,6 +461,11 @@ wheels = [
 ]
 
 [[package]]
+name = "mnt"
+version = "0.1.0"
+source = { virtual = "testdata/mnt" }
+
+[[package]]
 name = "mypy-extensions"
 version = "1.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -541,7 +522,7 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "libspec", directory = "../libspec" }]
+requires-dist = [{ name = "libspec", git = "https://github.com/drhodes/libspec" }]
 
 [[package]]
 name = "platformdirs"

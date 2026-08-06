@@ -3,6 +3,7 @@
 
 # Project-local PostgreSQL instance
 /testdata/
+/testdata/mnt
 
 # Nix
 .direnv/
