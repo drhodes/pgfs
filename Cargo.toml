@@ -23,5 +23,6 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 async-trait = "0.1"
 thiserror = "2"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 pprof = { version = "0.14", features = ["flamegraph"], optional = true }
 tracing-chrome = { version = "0.7", optional = true }

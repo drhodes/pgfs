@@ -213,6 +213,199 @@ pub trait PgfsBackend: Send + Sync {
     }
 }
 
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct LocalBackend {
+    db: std::sync::Arc<crate::db::Db>,
+}
+
+#[allow(dead_code)]
+impl LocalBackend {
+    pub fn new(db: crate::db::Db) -> Self {
+        Self {
+            db: std::sync::Arc::new(db),
+        }
+    }
+
+    pub fn from_arc(db: std::sync::Arc<crate::db::Db>) -> Self {
+        Self { db }
+    }
+
+    pub fn db(&self) -> &std::sync::Arc<crate::db::Db> {
+        &self.db
+    }
+}
+
+#[async_trait]
+impl PgfsBackend for LocalBackend {
+    async fn lookup(&self, parent_ino: u64, name: &str) -> Result<Option<FileAttr>, StorageError> {
+        self.db.lookup(parent_ino, name).await
+    }
+    async fn getattr(&self, ino: u64) -> Result<FileAttr, StorageError> {
+        self.db.getattr(ino).await
+    }
+    async fn setattr(&self, ino: u64, attr: SetAttrInput) -> Result<FileAttr, StorageError> {
+        self.db.setattr(ino, attr).await
+    }
+    async fn readdir(&self, ino: u64, offset: i64) -> Result<Vec<DirEntry>, StorageError> {
+        self.db.readdir(ino, offset).await
+    }
+    async fn mkdir(
+        &self,
+        parent_ino: u64,
+        name: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<FileAttr, StorageError> {
+        self.db.mkdir(parent_ino, name, mode, uid, gid).await
+    }
+    async fn rmdir(&self, parent_ino: u64, name: &str) -> Result<(), StorageError> {
+        self.db.rmdir(parent_ino, name).await
+    }
+    async fn create(
+        &self,
+        parent_ino: u64,
+        name: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<FileAttr, StorageError> {
+        self.db.create(parent_ino, name, mode, uid, gid).await
+    }
+    async fn unlink(&self, parent_ino: u64, name: &str) -> Result<(), StorageError> {
+        self.db.unlink(parent_ino, name).await
+    }
+    async fn rename(
+        &self,
+        old_parent: u64,
+        old_name: &str,
+        new_parent: u64,
+        new_name: &str,
+    ) -> Result<(), StorageError> {
+        self.db
+            .rename(old_parent, old_name, new_parent, new_name)
+            .await
+    }
+    async fn read_block(&self, ino: u64, block_no: u32) -> Result<Vec<u8>, StorageError> {
+        self.db.read_block(ino, block_no).await
+    }
+    async fn write_block(
+        &self,
+        ino: u64,
+        block_no: u32,
+        data: &[u8],
+        offset_in_block: u32,
+    ) -> Result<u32, StorageError> {
+        self.db
+            .write_block(ino, block_no, data, offset_in_block)
+            .await
+    }
+    async fn truncate_blocks(&self, ino: u64, new_size: u64) -> Result<(), StorageError> {
+        self.db.truncate_blocks(ino, new_size).await
+    }
+}
+
+#[allow(dead_code)]
+pub struct RemoteBackend {
+    conn_str: String,
+}
+
+#[allow(dead_code)]
+impl RemoteBackend {
+    pub fn new(conn_str: impl Into<String>) -> Self {
+        Self {
+            conn_str: conn_str.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl PgfsBackend for RemoteBackend {
+    async fn lookup(
+        &self,
+        _parent_ino: u64,
+        _name: &str,
+    ) -> Result<Option<FileAttr>, StorageError> {
+        Err(StorageError::DatabaseError(
+            "RemoteBackend over IPC connecting to ".to_string() + &self.conn_str,
+        ))
+    }
+    async fn getattr(&self, _ino: u64) -> Result<FileAttr, StorageError> {
+        Err(StorageError::NotFound)
+    }
+    async fn setattr(&self, _ino: u64, _attr: SetAttrInput) -> Result<FileAttr, StorageError> {
+        Err(StorageError::NotFound)
+    }
+    async fn readdir(&self, _ino: u64, _offset: i64) -> Result<Vec<DirEntry>, StorageError> {
+        Ok(Vec::new())
+    }
+    async fn mkdir(
+        &self,
+        _parent_ino: u64,
+        _name: &str,
+        _mode: u32,
+        _uid: u32,
+        _gid: u32,
+    ) -> Result<FileAttr, StorageError> {
+        Err(StorageError::DatabaseError(
+            "RemoteBackend not connected".into(),
+        ))
+    }
+    async fn rmdir(&self, _parent_ino: u64, _name: &str) -> Result<(), StorageError> {
+        Err(StorageError::DatabaseError(
+            "RemoteBackend not connected".into(),
+        ))
+    }
+    async fn create(
+        &self,
+        _parent_ino: u64,
+        _name: &str,
+        _mode: u32,
+        _uid: u32,
+        _gid: u32,
+    ) -> Result<FileAttr, StorageError> {
+        Err(StorageError::DatabaseError(
+            "RemoteBackend not connected".into(),
+        ))
+    }
+    async fn unlink(&self, _parent_ino: u64, _name: &str) -> Result<(), StorageError> {
+        Err(StorageError::DatabaseError(
+            "RemoteBackend not connected".into(),
+        ))
+    }
+    async fn rename(
+        &self,
+        _old_parent: u64,
+        _old_name: &str,
+        _new_parent: u64,
+        _new_name: &str,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::DatabaseError(
+            "RemoteBackend not connected".into(),
+        ))
+    }
+    async fn read_block(&self, _ino: u64, _block_no: u32) -> Result<Vec<u8>, StorageError> {
+        Ok(Vec::new())
+    }
+    async fn write_block(
+        &self,
+        _ino: u64,
+        _block_no: u32,
+        _data: &[u8],
+        _offset_in_block: u32,
+    ) -> Result<u32, StorageError> {
+        Err(StorageError::DatabaseError(
+            "RemoteBackend not connected".into(),
+        ))
+    }
+    async fn truncate_blocks(&self, _ino: u64, _new_size: u64) -> Result<(), StorageError> {
+        Err(StorageError::DatabaseError(
+            "RemoteBackend not connected".into(),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +462,18 @@ mod tests {
         assert_eq!(&block[0..5], &[9u8; 5]);
         assert_eq!(&block[5..8], &[5u8, 6, 7]);
         assert_eq!(&block[8..20], &[9u8; 12]);
+    }
+
+    #[test]
+    fn test_remote_backend_unimplemented_stubs() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let remote = RemoteBackend::new("postgresql://localhost:5432/test");
+            assert!(remote.getattr(1).await.is_err());
+            assert!(remote.lookup(1, "file.txt").await.is_err());
+            assert_eq!(remote.readdir(1, 0).await.unwrap().len(), 0);
+        });
     }
 }

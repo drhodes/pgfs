@@ -83,58 +83,61 @@ impl DbPool {
             error::failure(format!("invalid postgres conn string {conn_str:?}: {e}"))
         })?;
 
-        // Initialize schema once per pool creation
-        if let Ok(mut init_client) = config.connect(NoTls) {
-            let unlogged_kw = if unlogged { "UNLOGGED " } else { "" };
-            let ddl = format!(
-                "BEGIN;
-                CREATE {unlogged_kw}TABLE IF NOT EXISTS entries (
-                    ino bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                    parent_ino bigint NOT NULL DEFAULT 1,
-                    parent text NOT NULL DEFAULT '',
-                    name   text NOT NULL,
-                    kind   text NOT NULL DEFAULT 'file',
-                    data   bytea NOT NULL DEFAULT '',
-                    size   bigint NOT NULL DEFAULT 0,
-                    mode   integer NOT NULL DEFAULT 33188,
-                    uid    integer NOT NULL DEFAULT 1000,
-                    gid    integer NOT NULL DEFAULT 1000,
-                    atime  timestamptz NOT NULL DEFAULT now(),
-                    mtime  timestamptz NOT NULL DEFAULT now(),
-                    ctime  timestamptz NOT NULL DEFAULT now(),
-                    CONSTRAINT unique_parent_name UNIQUE (parent, name)
+        // Initialize schema once per process initialization
+        static DDL_INIT: std::sync::Once = std::sync::Once::new();
+        DDL_INIT.call_once(|| {
+            if let Ok(mut init_client) = config.connect(NoTls) {
+                let unlogged_kw = if unlogged { "UNLOGGED " } else { "" };
+                let ddl = format!(
+                    "BEGIN;
+                    CREATE {unlogged_kw}TABLE IF NOT EXISTS entries (
+                        ino bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                        parent_ino bigint NOT NULL DEFAULT 1,
+                        parent text NOT NULL DEFAULT '',
+                        name   text NOT NULL,
+                        kind   text NOT NULL DEFAULT 'file',
+                        data   bytea NOT NULL DEFAULT '',
+                        size   bigint NOT NULL DEFAULT 0,
+                        mode   integer NOT NULL DEFAULT 33188,
+                        uid    integer NOT NULL DEFAULT 1000,
+                        gid    integer NOT NULL DEFAULT 1000,
+                        atime  timestamptz NOT NULL DEFAULT now(),
+                        mtime  timestamptz NOT NULL DEFAULT now(),
+                        ctime  timestamptz NOT NULL DEFAULT now(),
+                        CONSTRAINT unique_parent_name UNIQUE (parent, name)
+                    );
+                    ALTER TABLE entries ADD COLUMN IF NOT EXISTS ino bigint GENERATED ALWAYS AS IDENTITY;
+                    ALTER TABLE entries ADD COLUMN IF NOT EXISTS parent_ino bigint NOT NULL DEFAULT 1;
+                    ALTER TABLE entries ADD COLUMN IF NOT EXISTS mode integer NOT NULL DEFAULT 33188;
+                    ALTER TABLE entries ADD COLUMN IF NOT EXISTS uid integer NOT NULL DEFAULT 1000;
+                    ALTER TABLE entries ADD COLUMN IF NOT EXISTS gid integer NOT NULL DEFAULT 1000;
+                    ALTER TABLE entries ADD COLUMN IF NOT EXISTS atime timestamptz NOT NULL DEFAULT now();
+                    ALTER TABLE entries ADD COLUMN IF NOT EXISTS ctime timestamptz NOT NULL DEFAULT now();
+
+                    CREATE INDEX IF NOT EXISTS idx_entries_parent_ino ON entries(parent_ino);
+                    CREATE INDEX IF NOT EXISTS idx_entries_parent ON entries(parent);
+
+                    CREATE {unlogged_kw}TABLE IF NOT EXISTS blocks (
+                        ino      bigint NOT NULL DEFAULT 1,
+                        parent   text NOT NULL DEFAULT '',
+                        name     text NOT NULL DEFAULT '',
+                        block_no integer NOT NULL,
+                        data     bytea NOT NULL,
+                        PRIMARY KEY (parent, name, block_no)
+                    );
+                    ALTER TABLE blocks ADD COLUMN IF NOT EXISTS ino bigint NOT NULL DEFAULT 1;
+                    CREATE INDEX IF NOT EXISTS idx_blocks_ino ON blocks(ino, block_no);
+
+                    INSERT INTO entries (ino, parent_ino, parent, name, kind, size, mode, uid, gid)
+                    OVERRIDING SYSTEM VALUE
+                    VALUES (1, 1, '', '', 'dir', 0, 16877, 1000, 1000)
+                    ON CONFLICT (parent, name) DO NOTHING;
+
+                    COMMIT;"
                 );
-                ALTER TABLE entries ADD COLUMN IF NOT EXISTS ino bigint GENERATED ALWAYS AS IDENTITY;
-                ALTER TABLE entries ADD COLUMN IF NOT EXISTS parent_ino bigint NOT NULL DEFAULT 1;
-                ALTER TABLE entries ADD COLUMN IF NOT EXISTS mode integer NOT NULL DEFAULT 33188;
-                ALTER TABLE entries ADD COLUMN IF NOT EXISTS uid integer NOT NULL DEFAULT 1000;
-                ALTER TABLE entries ADD COLUMN IF NOT EXISTS gid integer NOT NULL DEFAULT 1000;
-                ALTER TABLE entries ADD COLUMN IF NOT EXISTS atime timestamptz NOT NULL DEFAULT now();
-                ALTER TABLE entries ADD COLUMN IF NOT EXISTS ctime timestamptz NOT NULL DEFAULT now();
-
-                CREATE INDEX IF NOT EXISTS idx_entries_parent_ino ON entries(parent_ino);
-                CREATE INDEX IF NOT EXISTS idx_entries_parent ON entries(parent);
-
-                CREATE {unlogged_kw}TABLE IF NOT EXISTS blocks (
-                    ino      bigint NOT NULL DEFAULT 1,
-                    parent   text NOT NULL DEFAULT '',
-                    name     text NOT NULL DEFAULT '',
-                    block_no integer NOT NULL,
-                    data     bytea NOT NULL,
-                    PRIMARY KEY (parent, name, block_no)
-                );
-                ALTER TABLE blocks ADD COLUMN IF NOT EXISTS ino bigint NOT NULL DEFAULT 1;
-                CREATE INDEX IF NOT EXISTS idx_blocks_ino ON blocks(ino, block_no);
-
-                INSERT INTO entries (ino, parent_ino, parent, name, kind, size, mode, uid, gid)
-                OVERRIDING SYSTEM VALUE
-                VALUES (1, 1, '', '', 'dir', 0, 16877, 1000, 1000)
-                ON CONFLICT (parent, name) DO NOTHING;
-
-                COMMIT;"
-            );
-            let _ = init_client.batch_execute(&ddl);
-        }
+                let _ = init_client.batch_execute(&ddl);
+            }
+        });
 
         let manager = PostgresConnectionManager::new(config, NoTls);
         let primary = r2d2::Pool::builder()
