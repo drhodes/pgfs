@@ -19,6 +19,7 @@
 
 use crate::error::{self, Result};
 use postgres::{Client, NoTls, Statement};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 use tracing::debug_span;
 
@@ -239,8 +240,8 @@ impl DbPool {
         };
 
         Ok(Db {
-            client: std::sync::Mutex::new(DbClient::Pooled(client)),
-            replica: replica.map(|r| std::sync::Mutex::new(DbClient::Pooled(r))),
+            client: Arc::new(std::sync::Mutex::new(DbClient::Pooled(client))),
+            replica: replica.map(|r| Arc::new(std::sync::Mutex::new(DbClient::Pooled(r)))),
             stmt_getattr,
             stmt_create,
             stmt_mkdir,
@@ -263,12 +264,13 @@ impl DbPool {
     }
 }
 
+#[derive(Clone)]
 pub struct Db {
     /// Primary connection — every write goes here.
-    client: std::sync::Mutex<DbClient>,
+    client: Arc<std::sync::Mutex<DbClient>>,
 
     /// Optional connection to a read replica.
-    replica: Option<std::sync::Mutex<DbClient>>,
+    replica: Option<Arc<std::sync::Mutex<DbClient>>>,
 
     // Pre-compiled SQL statement handles on the primary connection.
     stmt_getattr: Statement,

@@ -77,6 +77,8 @@ impl HandleBuffer {
 
 pub struct PgFs {
     db: Db,
+    #[allow(dead_code)]
+    backend: Arc<dyn crate::backend::PgfsBackend>,
     /// path -> inode, allocated lazily and never reused.
     ino_by_path: HashMap<String, u64>,
     path_by_ino: HashMap<u64, String>,
@@ -154,12 +156,32 @@ impl PgFs {
     }
 
     pub fn with_attr_ttl(db: Db, dump_requested: Arc<AtomicBool>, attr_ttl: Duration) -> Self {
+        let backend = Arc::new(crate::backend::LocalBackend::new(db.clone()));
+        Self::with_backend_and_ttl(db, backend, dump_requested, attr_ttl)
+    }
+
+    #[allow(dead_code)]
+    pub fn with_backend(
+        db: Db,
+        backend: Arc<dyn crate::backend::PgfsBackend>,
+        dump_requested: Arc<AtomicBool>,
+    ) -> Self {
+        Self::with_backend_and_ttl(db, backend, dump_requested, TTL)
+    }
+
+    pub fn with_backend_and_ttl(
+        db: Db,
+        backend: Arc<dyn crate::backend::PgfsBackend>,
+        dump_requested: Arc<AtomicBool>,
+        attr_ttl: Duration,
+    ) -> Self {
         let mut ino_by_path = HashMap::new();
         let mut path_by_ino = HashMap::new();
         ino_by_path.insert(ROOT_PATH.to_string(), ROOT_INO);
         path_by_ino.insert(ROOT_INO, ROOT_PATH.to_string());
         Self {
             db,
+            backend,
             ino_by_path,
             path_by_ino,
             next_ino: ROOT_INO + 1,
@@ -167,10 +189,14 @@ impl PgFs {
             open_handles: HashMap::new(),
             open_handles_by_ino: HashMap::new(),
             dump_requested,
-
             started: Instant::now(),
             attr_ttl,
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn backend(&self) -> &Arc<dyn crate::backend::PgfsBackend> {
+        &self.backend
     }
 
     fn flush_handle(&mut self, fh: u64) -> crate::error::Result<()> {
