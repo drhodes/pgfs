@@ -21,5 +21,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+async-trait = "0.1"
+thiserror = "2"
 pprof = { version = "0.14", features = ["flamegraph"], optional = true }
 tracing-chrome = { version = "0.7", optional = true }

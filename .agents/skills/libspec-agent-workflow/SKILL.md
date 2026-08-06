@@ -15,5 +15,6 @@ This skill standardizes instructions for prototyping, running, and debugging age
   ```bash
   uv run libspec agent-workflow [subcommand / options]
   ```
+- Use `uv run libspec dependencies` to inspect component dependency graphs and establish a topological implementation ordering before writing tests and code.
 - Use standard `uv` commands (`uv run`, `uv sync`) without invoking raw `python` interpreters directly.
 - Inspect logs, file outputs, or CLI output produced by the workflow runs to verify results.
