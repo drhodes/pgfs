@@ -58,6 +58,7 @@ pub struct DbPool {
 
 #[derive(Debug)]
 struct DbCustomizer {
+    #[allow(dead_code)]
     unlogged: bool,
 }
 
@@ -66,30 +67,7 @@ impl r2d2::CustomizeConnection<postgres::Client, postgres::Error> for DbCustomiz
         &self,
         client: &mut postgres::Client,
     ) -> std::result::Result<(), postgres::Error> {
-        let unlogged_kw = if self.unlogged { "UNLOGGED " } else { "" };
-        let ddl = format!(
-            "BEGIN;
-            SELECT pg_advisory_xact_lock(42424242);
-            CREATE {unlogged_kw}TABLE IF NOT EXISTS entries (
-                parent text NOT NULL,
-                name   text NOT NULL,
-                kind   text NOT NULL DEFAULT 'file',
-                data   bytea NOT NULL DEFAULT '',
-                size   bigint NOT NULL DEFAULT 0,
-                mtime  timestamptz NOT NULL DEFAULT now(),
-                PRIMARY KEY (parent, name)
-            );
-            CREATE {unlogged_kw}TABLE IF NOT EXISTS blocks (
-                parent   text NOT NULL,
-                name     text NOT NULL,
-                block_no integer NOT NULL,
-                data     bytea NOT NULL,
-                PRIMARY KEY (parent, name, block_no)
-            );
-            COMMIT;
-            SET synchronous_commit = off;"
-        );
-        client.batch_execute(&ddl)?;
+        client.batch_execute("SET synchronous_commit = off;")?;
         Ok(())
     }
 }
@@ -101,9 +79,63 @@ impl DbPool {
         unlogged: bool,
         max_size: u32,
     ) -> Result<Self> {
-        let config = conn_str.parse().map_err(|e| {
+        let config: postgres::Config = conn_str.parse().map_err(|e| {
             error::failure(format!("invalid postgres conn string {conn_str:?}: {e}"))
         })?;
+
+        // Initialize schema once per pool creation
+        if let Ok(mut init_client) = config.connect(NoTls) {
+            let unlogged_kw = if unlogged { "UNLOGGED " } else { "" };
+            let ddl = format!(
+                "BEGIN;
+                CREATE {unlogged_kw}TABLE IF NOT EXISTS entries (
+                    ino bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                    parent_ino bigint NOT NULL DEFAULT 1,
+                    parent text NOT NULL DEFAULT '',
+                    name   text NOT NULL,
+                    kind   text NOT NULL DEFAULT 'file',
+                    data   bytea NOT NULL DEFAULT '',
+                    size   bigint NOT NULL DEFAULT 0,
+                    mode   integer NOT NULL DEFAULT 33188,
+                    uid    integer NOT NULL DEFAULT 1000,
+                    gid    integer NOT NULL DEFAULT 1000,
+                    atime  timestamptz NOT NULL DEFAULT now(),
+                    mtime  timestamptz NOT NULL DEFAULT now(),
+                    ctime  timestamptz NOT NULL DEFAULT now(),
+                    CONSTRAINT unique_parent_name UNIQUE (parent, name)
+                );
+                ALTER TABLE entries ADD COLUMN IF NOT EXISTS ino bigint GENERATED ALWAYS AS IDENTITY;
+                ALTER TABLE entries ADD COLUMN IF NOT EXISTS parent_ino bigint NOT NULL DEFAULT 1;
+                ALTER TABLE entries ADD COLUMN IF NOT EXISTS mode integer NOT NULL DEFAULT 33188;
+                ALTER TABLE entries ADD COLUMN IF NOT EXISTS uid integer NOT NULL DEFAULT 1000;
+                ALTER TABLE entries ADD COLUMN IF NOT EXISTS gid integer NOT NULL DEFAULT 1000;
+                ALTER TABLE entries ADD COLUMN IF NOT EXISTS atime timestamptz NOT NULL DEFAULT now();
+                ALTER TABLE entries ADD COLUMN IF NOT EXISTS ctime timestamptz NOT NULL DEFAULT now();
+
+                CREATE INDEX IF NOT EXISTS idx_entries_parent_ino ON entries(parent_ino);
+                CREATE INDEX IF NOT EXISTS idx_entries_parent ON entries(parent);
+
+                CREATE {unlogged_kw}TABLE IF NOT EXISTS blocks (
+                    ino      bigint NOT NULL DEFAULT 1,
+                    parent   text NOT NULL DEFAULT '',
+                    name     text NOT NULL DEFAULT '',
+                    block_no integer NOT NULL,
+                    data     bytea NOT NULL,
+                    PRIMARY KEY (parent, name, block_no)
+                );
+                ALTER TABLE blocks ADD COLUMN IF NOT EXISTS ino bigint NOT NULL DEFAULT 1;
+                CREATE INDEX IF NOT EXISTS idx_blocks_ino ON blocks(ino, block_no);
+
+                INSERT INTO entries (ino, parent_ino, parent, name, kind, size, mode, uid, gid)
+                OVERRIDING SYSTEM VALUE
+                VALUES (1, 1, '', '', 'dir', 0, 16877, 1000, 1000)
+                ON CONFLICT (parent, name) DO NOTHING;
+
+                COMMIT;"
+            );
+            let _ = init_client.batch_execute(&ddl);
+        }
+
         let manager = PostgresConnectionManager::new(config, NoTls);
         let primary = r2d2::Pool::builder()
             .max_size(max_size)
@@ -173,14 +205,39 @@ impl DbPool {
             "prepare stmt_delete_blocks",
         )?;
 
+        let stmt_lookup_ino = error::ctx(
+            client.prepare("SELECT ino, size, kind, mode, uid, gid, atime, mtime, ctime FROM entries WHERE parent_ino = $1 AND name = $2"),
+            "prepare stmt_lookup_ino",
+        )?;
+        let stmt_getattr_ino = error::ctx(
+            client.prepare("SELECT ino, size, kind, mode, uid, gid, atime, mtime, ctime FROM entries WHERE ino = $1"),
+            "prepare stmt_getattr_ino",
+        )?;
+        let stmt_read_block_ino = error::ctx(
+            client.prepare("SELECT data FROM blocks WHERE ino = $1 AND block_no = $2"),
+            "prepare stmt_read_block_ino",
+        )?;
+        let stmt_upsert_block_ino = error::ctx(
+            client.prepare("INSERT INTO blocks (ino, parent, name, block_no, data) VALUES ($1, '', '', $2, $3) ON CONFLICT (parent, name, block_no) DO UPDATE SET data = EXCLUDED.data"),
+            "prepare stmt_upsert_block_ino",
+        )?;
+        let stmt_prune_blocks_ino = error::ctx(
+            client.prepare("DELETE FROM blocks WHERE ino = $1 AND block_no > $2"),
+            "prepare stmt_prune_blocks_ino",
+        )?;
+        let stmt_rename_ino = error::ctx(
+            client.prepare("UPDATE entries SET parent_ino = $3, name = $4, ctime = NOW() WHERE parent_ino = $1 AND name = $2"),
+            "prepare stmt_rename_ino",
+        )?;
+
         let replica = match &self.replica {
             Some(p) => p.get().ok(),
             None => None,
         };
 
         Ok(Db {
-            client: DbClient::Pooled(client),
-            replica: replica.map(DbClient::Pooled),
+            client: std::sync::Mutex::new(DbClient::Pooled(client)),
+            replica: replica.map(|r| std::sync::Mutex::new(DbClient::Pooled(r))),
             stmt_getattr,
             stmt_create,
             stmt_mkdir,
@@ -191,6 +248,12 @@ impl DbPool {
             stmt_upsert_block,
             stmt_prune_blocks,
             stmt_delete_blocks,
+            stmt_lookup_ino,
+            stmt_getattr_ino,
+            stmt_read_block_ino,
+            stmt_upsert_block_ino,
+            stmt_prune_blocks_ino,
+            stmt_rename_ino,
             freshness_cached: false,
             freshness_checked_at: None,
         })
@@ -199,10 +262,10 @@ impl DbPool {
 
 pub struct Db {
     /// Primary connection — every write goes here.
-    client: DbClient,
-    /// Optional physical streaming standby (see spec/replica.py). Reads
-    /// are served from it when it has caught up with the primary's WAL.
-    replica: Option<DbClient>,
+    client: std::sync::Mutex<DbClient>,
+
+    /// Optional connection to a read replica.
+    replica: Option<std::sync::Mutex<DbClient>>,
 
     // Pre-compiled SQL statement handles on the primary connection.
     stmt_getattr: Statement,
@@ -216,6 +279,19 @@ pub struct Db {
     stmt_upsert_block: Statement,
     stmt_prune_blocks: Statement,
     stmt_delete_blocks: Statement,
+
+    #[allow(dead_code)]
+    stmt_lookup_ino: Statement,
+    #[allow(dead_code)]
+    stmt_getattr_ino: Statement,
+    #[allow(dead_code)]
+    stmt_read_block_ino: Statement,
+    #[allow(dead_code)]
+    stmt_upsert_block_ino: Statement,
+    #[allow(dead_code)]
+    stmt_prune_blocks_ino: Statement,
+    #[allow(dead_code)]
+    stmt_rename_ino: Statement,
 
     /// Cached replica freshness verdict and monotonic timestamp of last check (millis).
     pub freshness_cached: bool,
@@ -278,12 +354,20 @@ impl Db {
         pool.get()
     }
 
+    fn client_guard(&self) -> std::sync::MutexGuard<'_, DbClient> {
+        self.client.lock().unwrap()
+    }
+
+    fn replica_guard(&self) -> Option<std::sync::MutexGuard<'_, DbClient>> {
+        self.replica.as_ref().map(|r| r.lock().unwrap())
+    }
+
     /// Is the replica fresh enough to serve reads? True iff a replica is
     /// configured, reachable, and its last replayed WAL position is at or
     /// ahead of the primary's current position. A standby that has never
     /// replayed anything, or any error on either node, means not fresh.
-    fn replica_fresh(&mut self) -> bool {
-        let Some(replica) = self.replica.as_mut() else {
+    fn replica_fresh(&self) -> bool {
+        let Some(mut replica) = self.replica_guard() else {
             return false;
         };
 
@@ -300,15 +384,12 @@ impl Db {
         }
 
         let primary_lsn: Option<i64> = self
-            .client
+            .client_guard()
             .query_opt("SELECT (pg_current_wal_lsn() - '0/0'::pg_lsn)::bigint", &[])
             .ok()
             .flatten()
             .map(|r| r.get(0));
-        let replay_lsn: Option<Option<i64>> = self
-            .replica
-            .as_mut()
-            .expect("replica present")
+        let replay_lsn: Option<Option<i64>> = replica
             .query_opt(
                 "SELECT (pg_last_wal_replay_lsn() - '0/0'::pg_lsn)::bigint",
                 &[],
@@ -361,7 +442,8 @@ impl Db {
         let _span = debug_span!("db::getattr", parent, name).entered();
         let _t0 = Instant::now();
         let row = error::ctx(
-            self.client.query_opt(&self.stmt_getattr, &[&parent, &name]),
+            self.client_guard()
+                .query_opt(&self.stmt_getattr, &[&parent, &name]),
             &format!("get attributes of entry {name:?} in {parent:?}"),
         )?;
         let result = row.as_ref().map(row_to_meta).transpose();
@@ -376,7 +458,7 @@ impl Db {
         let _span = debug_span!("db::list", parent).entered();
         let _t0 = Instant::now();
         let rows = error::ctx(
-            self.client.query(&self.stmt_list, &[&parent]),
+            self.client_guard().query(&self.stmt_list, &[&parent]),
             &format!("list children of directory {parent:?}"),
         )?;
         let result: Result<Vec<FileMeta>> = rows.iter().map(row_to_meta).collect();
@@ -389,7 +471,7 @@ impl Db {
     pub fn list(&mut self, parent: &str) -> Result<Vec<FileMeta>> {
         if self.replica.is_some() && self.replica_fresh_cached() {
             crate::metrics::REPLICA_READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let replica = self.replica.as_mut().expect("replica present");
+            let mut replica = self.replica_guard().expect("replica present");
             let _span = debug_span!("db::list", parent).entered();
             let _t0 = Instant::now();
             let rows = error::ctx(
@@ -411,7 +493,7 @@ impl Db {
     pub fn getattr(&mut self, parent: &str, name: &str) -> Result<Option<FileMeta>> {
         if self.replica.is_some() && self.replica_fresh_cached() {
             crate::metrics::REPLICA_READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let replica = self.replica.as_mut().expect("replica present");
+            let mut replica = self.replica_guard().expect("replica present");
             let _span = debug_span!("db::getattr", parent, name).entered();
             let _t0 = Instant::now();
             let row = error::ctx(
@@ -474,7 +556,7 @@ impl Db {
         let end_block = ((offset + actual_len as u64 - 1) / BLOCK_SIZE as u64) as i32;
 
         let rows = error::ctx(
-            self.client.query(
+            self.client_guard().query(
                 &self.stmt_read_blocks,
                 &[&parent, &name, &start_block, &end_block],
             ),
@@ -552,8 +634,9 @@ impl Db {
         let old_size = meta.as_ref().map(|m| m.size).unwrap_or(0);
         let new_size = old_size.max(offset + data.len() as u64);
 
+        let mut client = self.client_guard();
         let mut txn = error::ctx(
-            self.client.transaction(),
+            client.transaction(),
             &format!("begin write_range transaction for {name:?} in {parent:?}"),
         )?;
 
@@ -623,8 +706,9 @@ impl Db {
             }
         };
 
+        let mut client = self.client_guard();
         let mut txn = error::ctx(
-            self.client.transaction(),
+            client.transaction(),
             &format!("begin truncate transaction for {name:?} in {parent:?}"),
         )?;
 
@@ -702,8 +786,9 @@ impl Db {
             None
         };
 
+        let mut client = self.client_guard();
         let mut txn = error::ctx(
-            self.client.transaction(),
+            client.transaction(),
             &format!("begin write_blocks_batch for {name:?} in {parent:?}"),
         )?;
 
@@ -755,7 +840,8 @@ impl Db {
         let _span = debug_span!("db::create", parent, name).entered();
         let _t0 = Instant::now();
         error::ctx(
-            self.client.execute(&self.stmt_create, &[&parent, &name]),
+            self.client_guard()
+                .execute(&self.stmt_create, &[&parent, &name]),
             &format!("create file {name:?} in {parent:?}"),
         )?;
         crate::metrics::DB_LATENCY.record(_t0.elapsed());
@@ -766,7 +852,8 @@ impl Db {
         let _span = debug_span!("db::mkdir", parent, name).entered();
         let _t0 = Instant::now();
         error::ctx(
-            self.client.execute(&self.stmt_mkdir, &[&parent, &name]),
+            self.client_guard()
+                .execute(&self.stmt_mkdir, &[&parent, &name]),
             &format!("create directory {name:?} in {parent:?}"),
         )?;
         crate::metrics::DB_LATENCY.record(_t0.elapsed());
@@ -777,11 +864,12 @@ impl Db {
         let _span = debug_span!("db::unlink", parent, name).entered();
         let _t0 = Instant::now();
         error::ctx(
-            self.client.execute(&self.stmt_unlink, &[&parent, &name]),
+            self.client_guard()
+                .execute(&self.stmt_unlink, &[&parent, &name]),
             &format!("remove file {name:?} from {parent:?}"),
         )?;
         error::ctx(
-            self.client
+            self.client_guard()
                 .execute(&self.stmt_delete_blocks, &[&parent, &name]),
             &format!("remove blocks of file {name:?} from {parent:?}"),
         )?;
@@ -817,8 +905,9 @@ impl Db {
             .getattr_primary(old_parent, old_name)?
             .ok_or_else(|| error::failure(format!("rename source {old_path:?} does not exist")))?;
 
+        let mut client = self.client_guard();
         let mut txn = error::ctx(
-            self.client.transaction(),
+            client.transaction(),
             &format!("begin rename of {old_path:?} -> {new_path:?}"),
         )?;
 
@@ -922,7 +1011,7 @@ impl Db {
         let _t0 = Instant::now();
         let path = join(parent, name);
         let has_children = error::ctx(
-            self.client
+            self.client_guard()
                 .query_opt("SELECT 1 FROM entries WHERE parent = $1 LIMIT 1", &[&path]),
             &format!("check whether {name:?} in {parent:?} is empty"),
         )?;
@@ -931,7 +1020,8 @@ impl Db {
             return Ok(false);
         }
         let deleted = error::ctx(
-            self.client.execute(&self.stmt_rmdir, &[&parent, &name]),
+            self.client_guard()
+                .execute(&self.stmt_rmdir, &[&parent, &name]),
             &format!("remove directory {name:?} from {parent:?}"),
         )?;
 
@@ -1002,7 +1092,7 @@ mod tests {
     fn connect_disables_synchronous_commit() {
         let mut db = db_connect();
         let row = db
-            .client
+            .client_guard()
             .query_one("SHOW synchronous_commit;", &[])
             .expect("query synchronous_commit");
         let val: String = row.get(0);
@@ -1603,4 +1693,357 @@ fn row_to_meta(row: &postgres::Row) -> Result<FileMeta> {
         size: size as u64,
         mtime,
     })
+}
+
+pub mod backend_impl {
+    use super::*;
+    use crate::backend::{
+        prepare_sparse_block_write, DirEntry, FileAttr, FileKind, PgfsBackend, SetAttrInput,
+        StorageError,
+    };
+
+    #[allow(dead_code)]
+    fn row_to_file_attr(row: &postgres::Row) -> std::result::Result<FileAttr, StorageError> {
+        let ino: i64 = row.get("ino");
+        let size: i64 = row.get("size");
+        let kind_raw: String = row.get("kind");
+        let kind = match kind_raw.as_str() {
+            "file" => FileKind::File,
+            "dir" => FileKind::Directory,
+            "symlink" => FileKind::Symlink,
+            _ => FileKind::File,
+        };
+        let mode: i32 = row
+            .try_get("mode")
+            .unwrap_or(if kind == FileKind::Directory {
+                16877
+            } else {
+                33188
+            });
+        let uid: i32 = row.try_get("uid").unwrap_or(1000);
+        let gid: i32 = row.try_get("gid").unwrap_or(1000);
+        let mtime: SystemTime = row.try_get("mtime").unwrap_or_else(|_| SystemTime::now());
+        let atime: SystemTime = row.try_get("atime").unwrap_or(mtime);
+        let ctime: SystemTime = row.try_get("ctime").unwrap_or(mtime);
+
+        let blocks_count = (size as u64).div_ceil(512);
+
+        Ok(FileAttr {
+            ino: ino as u64,
+            size: size as u64,
+            blocks: blocks_count,
+            atime,
+            mtime,
+            ctime,
+            kind,
+            perm: (mode & 0o777) as u16,
+            nlink: if kind == FileKind::Directory { 2 } else { 1 },
+            uid: uid as u32,
+            gid: gid as u32,
+            rdev: 0,
+            flags: 0,
+        })
+    }
+
+    #[async_trait::async_trait]
+    impl PgfsBackend for Db {
+        async fn lookup(
+            &self,
+            parent_ino: u64,
+            name: &str,
+        ) -> std::result::Result<Option<FileAttr>, StorageError> {
+            let rows = self
+                .client_guard()
+                .query(&self.stmt_lookup_ino, &[&(parent_ino as i64), &name])
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            if rows.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(row_to_file_attr(&rows[0])?))
+            }
+        }
+
+        async fn getattr(&self, ino: u64) -> std::result::Result<FileAttr, StorageError> {
+            let rows = self
+                .client_guard()
+                .query(&self.stmt_getattr_ino, &[&(ino as i64)])
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            if rows.is_empty() {
+                Err(StorageError::NotFound)
+            } else {
+                row_to_file_attr(&rows[0])
+            }
+        }
+
+        async fn setattr(
+            &self,
+            ino: u64,
+            attr: SetAttrInput,
+        ) -> std::result::Result<FileAttr, StorageError> {
+            let current = self.getattr(ino).await?;
+            if let Some(sz) = attr.size {
+                if sz < current.size {
+                    self.truncate_blocks(ino, sz).await?;
+                }
+            }
+            let mode_val = attr.mode.map(|m| m as i32);
+            let uid_val = attr.uid.map(|u| u as i32);
+            let gid_val = attr.gid.map(|g| g as i32);
+            let size_val = attr.size.map(|s| s as i64);
+
+            let row = self
+            .client_guard()
+            .query_one(
+                "UPDATE entries SET mode = COALESCE($2, mode), uid = COALESCE($3, uid), gid = COALESCE($4, gid), size = COALESCE($5, size), mtime = NOW(), ctime = NOW() WHERE ino = $1 RETURNING ino, size, kind, mode, uid, gid, atime, mtime, ctime",
+                &[&(ino as i64), &mode_val, &uid_val, &gid_val, &size_val],
+            )
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+            row_to_file_attr(&row)
+        }
+
+        async fn readdir(
+            &self,
+            ino: u64,
+            offset: i64,
+        ) -> std::result::Result<Vec<DirEntry>, StorageError> {
+            let rows = self
+            .client_guard()
+            .query(
+                "SELECT ino, name, kind FROM entries WHERE parent_ino = $1 ORDER BY name OFFSET $2",
+                &[&(ino as i64), &offset],
+            )
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+            let mut entries = Vec::with_capacity(rows.len());
+            for row in rows {
+                let child_ino: i64 = row.get("ino");
+                let name: String = row.get("name");
+                let kind_raw: String = row.get("kind");
+                let kind = match kind_raw.as_str() {
+                    "dir" => FileKind::Directory,
+                    "symlink" => FileKind::Symlink,
+                    _ => FileKind::File,
+                };
+                entries.push(DirEntry {
+                    ino: child_ino as u64,
+                    name,
+                    kind,
+                });
+            }
+            Ok(entries)
+        }
+
+        async fn mkdir(
+            &self,
+            parent_ino: u64,
+            name: &str,
+            mode: u32,
+            uid: u32,
+            gid: u32,
+        ) -> std::result::Result<FileAttr, StorageError> {
+            let row = self
+            .client_guard()
+            .query_opt(
+                "INSERT INTO entries (parent_ino, name, kind, size, mode, uid, gid) VALUES ($1, $2, 'dir', 0, $3, $4, $5) ON CONFLICT (parent_ino, name) DO NOTHING RETURNING ino, size, kind, mode, uid, gid, atime, mtime, ctime",
+                &[&(parent_ino as i64), &name, &(mode as i32), &(uid as i32), &(gid as i32)],
+            )
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+            match row {
+                Some(r) => row_to_file_attr(&r),
+                None => {
+                    let existing = self.lookup(parent_ino, name).await?;
+                    existing.ok_or(StorageError::AlreadyExists)
+                }
+            }
+        }
+
+        async fn rmdir(
+            &self,
+            parent_ino: u64,
+            name: &str,
+        ) -> std::result::Result<(), StorageError> {
+            let target = self
+                .lookup(parent_ino, name)
+                .await?
+                .ok_or(StorageError::NotFound)?;
+            if target.kind != FileKind::Directory {
+                return Err(StorageError::InvalidArgument("not a directory".into()));
+            }
+            let children = self.readdir(target.ino, 0).await?;
+            if !children.is_empty() {
+                return Err(StorageError::NotEmpty);
+            }
+            let count = self
+                .client_guard()
+                .execute(
+                    "DELETE FROM entries WHERE ino = $1",
+                    &[&(target.ino as i64)],
+                )
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            if count == 0 {
+                Err(StorageError::NotFound)
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn create(
+            &self,
+            parent_ino: u64,
+            name: &str,
+            mode: u32,
+            uid: u32,
+            gid: u32,
+        ) -> std::result::Result<FileAttr, StorageError> {
+            let row = self
+            .client_guard()
+            .query_opt(
+                "INSERT INTO entries (parent_ino, name, kind, size, mode, uid, gid) VALUES ($1, $2, 'file', 0, $3, $4, $5) ON CONFLICT (parent_ino, name) DO NOTHING RETURNING ino, size, kind, mode, uid, gid, atime, mtime, ctime",
+                &[&(parent_ino as i64), &name, &(mode as i32), &(uid as i32), &(gid as i32)],
+            )
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+            match row {
+                Some(r) => row_to_file_attr(&r),
+                None => {
+                    let existing = self.lookup(parent_ino, name).await?;
+                    existing.ok_or(StorageError::AlreadyExists)
+                }
+            }
+        }
+
+        async fn unlink(
+            &self,
+            parent_ino: u64,
+            name: &str,
+        ) -> std::result::Result<(), StorageError> {
+            let count = self
+                .client_guard()
+                .execute(
+                    "DELETE FROM entries WHERE parent_ino = $1 AND name = $2 AND kind != 'dir'",
+                    &[&(parent_ino as i64), &name],
+                )
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            if count == 0 {
+                Err(StorageError::NotFound)
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn rename(
+            &self,
+            old_parent: u64,
+            old_name: &str,
+            new_parent: u64,
+            new_name: &str,
+        ) -> std::result::Result<(), StorageError> {
+            let count = self
+                .client_guard()
+                .execute(
+                    &self.stmt_rename_ino,
+                    &[
+                        &(old_parent as i64),
+                        &old_name,
+                        &(new_parent as i64),
+                        &new_name,
+                    ],
+                )
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            if count == 0 {
+                Err(StorageError::NotFound)
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn read_block(
+            &self,
+            ino: u64,
+            block_no: u32,
+        ) -> std::result::Result<Vec<u8>, StorageError> {
+            let rows = self
+                .client_guard()
+                .query(
+                    &self.stmt_read_block_ino,
+                    &[&(ino as i64), &(block_no as i32)],
+                )
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            if rows.is_empty() {
+                Ok(Vec::new())
+            } else {
+                let data: Vec<u8> = rows[0].get("data");
+                Ok(data)
+            }
+        }
+
+        async fn write_block(
+            &self,
+            ino: u64,
+            block_no: u32,
+            data: &[u8],
+            offset_in_block: u32,
+        ) -> std::result::Result<u32, StorageError> {
+            let existing = self
+                .read_block(ino, block_no)
+                .await
+                .ok()
+                .filter(|b| !b.is_empty());
+            let updated = prepare_sparse_block_write(existing, offset_in_block as usize, data);
+            let bytes_len = updated.len() as u32;
+
+            self.client_guard()
+                .execute(
+                    &self.stmt_upsert_block_ino,
+                    &[&(ino as i64), &(block_no as i32), &updated],
+                )
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+            let new_min_size = (block_no as u64) * 131072 + bytes_len as u64;
+            self.client_guard()
+                .execute(
+                    "UPDATE entries SET size = GREATEST(size, $2), mtime = NOW() WHERE ino = $1",
+                    &[&(ino as i64), &(new_min_size as i64)],
+                )
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+            Ok(data.len() as u32)
+        }
+
+        async fn truncate_blocks(
+            &self,
+            ino: u64,
+            new_size: u64,
+        ) -> std::result::Result<(), StorageError> {
+            let target_block = (new_size / 131072) as i32;
+            self.client_guard()
+                .execute(&self.stmt_prune_blocks_ino, &[&(ino as i64), &target_block])
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+            let partial_offset = (new_size % 131072) as usize;
+            if partial_offset > 0 {
+                if let Ok(mut data) = self.read_block(ino, target_block as u32).await {
+                    if data.len() > partial_offset {
+                        data.truncate(partial_offset);
+                        self.client_guard()
+                            .execute(
+                                &self.stmt_upsert_block_ino,
+                                &[&(ino as i64), &target_block, &data],
+                            )
+                            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+                    }
+                }
+            }
+
+            self.client_guard()
+                .execute(
+                    "UPDATE entries SET size = $2, mtime = NOW() WHERE ino = $1",
+                    &[&(ino as i64), &(new_size as i64)],
+                )
+                .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            Ok(())
+        }
+    }
 }
