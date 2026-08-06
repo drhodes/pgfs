@@ -115,6 +115,7 @@ impl DbPool {
                     ALTER TABLE entries ADD COLUMN IF NOT EXISTS atime timestamptz NOT NULL DEFAULT now();
                     ALTER TABLE entries ADD COLUMN IF NOT EXISTS ctime timestamptz NOT NULL DEFAULT now();
 
+                    DROP INDEX IF EXISTS idx_entries_parent_ino_name;
                     CREATE INDEX IF NOT EXISTS idx_entries_parent_ino ON entries(parent_ino);
                     CREATE INDEX IF NOT EXISTS idx_entries_parent ON entries(parent);
 
@@ -127,6 +128,7 @@ impl DbPool {
                         PRIMARY KEY (parent, name, block_no)
                     );
                     ALTER TABLE blocks ADD COLUMN IF NOT EXISTS ino bigint NOT NULL DEFAULT 1;
+                    DROP INDEX IF EXISTS idx_blocks_ino_block_no;
                     CREATE INDEX IF NOT EXISTS idx_blocks_ino ON blocks(ino, block_no);
 
                     INSERT INTO entries (ino, parent_ino, parent, name, kind, size, mode, uid, gid)
@@ -136,7 +138,9 @@ impl DbPool {
 
                     COMMIT;"
                 );
-                let _ = init_client.batch_execute(&ddl);
+                if let Err(e) = init_client.batch_execute(&ddl) {
+                    eprintln!("DDL INIT ERROR: {e:?}");
+                }
             }
         });
 
@@ -222,7 +226,7 @@ impl DbPool {
             "prepare stmt_read_block_ino",
         )?;
         let stmt_upsert_block_ino = error::ctx(
-            client.prepare("INSERT INTO blocks (ino, parent, name, block_no, data) VALUES ($1, '', '', $2, $3) ON CONFLICT (parent, name, block_no) DO UPDATE SET data = EXCLUDED.data"),
+            client.prepare("INSERT INTO blocks (ino, parent, name, block_no, data) VALUES ($1::bigint, '', $1::text, $2, $3) ON CONFLICT (parent, name, block_no) DO UPDATE SET data = EXCLUDED.data"),
             "prepare stmt_upsert_block_ino",
         )?;
         let stmt_prune_blocks_ino = error::ctx(
@@ -1041,7 +1045,7 @@ mod tests {
     use super::*;
     use std::time::UNIX_EPOCH;
 
-    fn db_connect() -> Db {
+    pub(super) fn db_connect() -> Db {
         let conn_str = format!(
             "host={}/testdata dbname=pgfs",
             std::env::current_dir().unwrap().display()
@@ -1850,7 +1854,7 @@ pub mod backend_impl {
             let row = self
             .client_guard()
             .query_opt(
-                "INSERT INTO entries (parent_ino, name, kind, size, mode, uid, gid) VALUES ($1, $2, 'dir', 0, $3, $4, $5) ON CONFLICT (parent_ino, name) DO NOTHING RETURNING ino, size, kind, mode, uid, gid, atime, mtime, ctime",
+                "INSERT INTO entries (parent_ino, parent, name, kind, size, mode, uid, gid) VALUES ($1, '', $2, 'dir', 0, $3, $4, $5) ON CONFLICT (parent, name) DO NOTHING RETURNING ino, size, kind, mode, uid, gid, atime, mtime, ctime",
                 &[&(parent_ino as i64), &name, &(mode as i32), &(uid as i32), &(gid as i32)],
             )
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
@@ -1905,7 +1909,7 @@ pub mod backend_impl {
             let row = self
             .client_guard()
             .query_opt(
-                "INSERT INTO entries (parent_ino, name, kind, size, mode, uid, gid) VALUES ($1, $2, 'file', 0, $3, $4, $5) ON CONFLICT (parent_ino, name) DO NOTHING RETURNING ino, size, kind, mode, uid, gid, atime, mtime, ctime",
+                "INSERT INTO entries (parent_ino, parent, name, kind, size, mode, uid, gid) VALUES ($1, '', $2, 'file', 0, $3, $4, $5) ON CONFLICT (parent, name) DO NOTHING RETURNING ino, size, kind, mode, uid, gid, atime, mtime, ctime",
                 &[&(parent_ino as i64), &name, &(mode as i32), &(uid as i32), &(gid as i32)],
             )
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
@@ -2050,5 +2054,164 @@ pub mod backend_impl {
                 .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
             Ok(())
         }
+
+        async fn copy_file_range(
+            &self,
+            ino_in: u64,
+            off_in: u64,
+            ino_out: u64,
+            off_out: u64,
+            len: u64,
+        ) -> std::result::Result<u64, StorageError> {
+            if len == 0 {
+                return Ok(0);
+            }
+            let block_size = 131072u64;
+            if off_in.is_multiple_of(block_size)
+                && off_out.is_multiple_of(block_size)
+                && len.is_multiple_of(block_size)
+            {
+                let start_b_in = (off_in / block_size) as i32;
+                let start_b_out = (off_out / block_size) as i32;
+                let num_blocks = (len / block_size) as i32;
+
+                self.client_guard()
+                    .execute(
+                        "INSERT INTO blocks (ino, parent, name, block_no, data)
+                         SELECT DISTINCT ON (block_no) $3::bigint, '', $3::text, $4 + (block_no - $2), data
+                         FROM blocks WHERE ino = $1 AND block_no >= $2 AND block_no < $2 + $5 ORDER BY block_no
+                         ON CONFLICT (parent, name, block_no) DO UPDATE SET data = EXCLUDED.data",
+                        &[
+                            &(ino_in as i64),
+                            &start_b_in,
+                            &(ino_out as i64),
+                            &start_b_out,
+                            &num_blocks,
+                        ],
+                    )
+                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+                let new_min_size = off_out + len;
+                self.client_guard()
+                    .execute(
+                        "UPDATE entries SET size = GREATEST(size, $2), mtime = NOW() WHERE ino = $1",
+                        &[&(ino_out as i64), &(new_min_size as i64)],
+                    )
+                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+                Ok(len)
+            } else {
+                let start_b_in = (off_in / block_size) as u32;
+                let end_b_in = ((off_in + len - 1) / block_size) as u32;
+                let mut copied = 0u64;
+
+                for b_in in start_b_in..=end_b_in {
+                    let b_data = self.read_block(ino_in, b_in).await?;
+                    if b_data.is_empty() {
+                        continue;
+                    }
+                    let b_start_in = (b_in as u64) * block_size;
+                    let slice_start = if off_in > b_start_in {
+                        (off_in - b_start_in) as usize
+                    } else {
+                        0
+                    };
+                    let slice_end = ((off_in + len) - b_start_in).min(b_data.len() as u64) as usize;
+                    if slice_start < slice_end && slice_start < b_data.len() {
+                        let chunk = &b_data[slice_start..slice_end];
+                        let target_off = off_out + (b_start_in + slice_start as u64 - off_in);
+                        let target_b_no = (target_off / block_size) as u32;
+                        let target_b_off = (target_off % block_size) as u32;
+                        self.write_block(ino_out, target_b_no, chunk, target_b_off)
+                            .await?;
+                        copied += chunk.len() as u64;
+                    }
+                }
+                Ok(copied)
+            }
+        }
+
+        async fn fallocate(
+            &self,
+            ino: u64,
+            offset: u64,
+            length: u64,
+            mode: u32,
+        ) -> std::result::Result<(), StorageError> {
+            let block_size = 131072u64;
+            let is_punch_hole = (mode & 0x02) != 0; // FALLOC_FL_PUNCH_HOLE
+            let keep_size = (mode & 0x01) != 0; // FALLOC_FL_KEEP_SIZE
+
+            if is_punch_hole {
+                let start_block = (offset / block_size) as i32;
+                let end_block = ((offset + length - 1) / block_size) as i32;
+                self.client_guard()
+                    .execute(
+                        "DELETE FROM blocks WHERE ino = $1 AND block_no >= $2 AND block_no <= $3",
+                        &[&(ino as i64), &start_block, &end_block],
+                    )
+                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            } else if !keep_size {
+                let new_min_size = offset + length;
+                self.client_guard()
+                    .execute(
+                        "UPDATE entries SET size = GREATEST(size, $2), mtime = NOW() WHERE ino = $1",
+                        &[&(ino as i64), &(new_min_size as i64)],
+                    )
+                    .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_offload {
+    use crate::backend::PgfsBackend;
+
+    fn block_on<F: std::future::Future>(mut fut: F) -> F::Output {
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        fn raw_waker() -> RawWaker {
+            fn noop(_: *const ()) {}
+            fn clone(_: *const ()) -> RawWaker {
+                raw_waker()
+            }
+            static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        let waker = unsafe { Waker::from_raw(raw_waker()) };
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = unsafe { std::pin::Pin::new_unchecked(&mut fut) };
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(res) => res,
+            Poll::Pending => panic!("future pending"),
+        }
+    }
+
+    #[test]
+    fn test_backend_offloaded_copy_file_range_and_fallocate() {
+        let db = super::tests::db_connect();
+
+        // Create src and dst files
+        let src_attr = block_on(db.create(1, "src.bin", 0o644, 1000, 1000)).unwrap();
+        let dst_attr = block_on(db.create(1, "dst.bin", 0o644, 1000, 1000)).unwrap();
+
+        // Write 1 block of data to src
+        let payload = vec![7u8; 131072];
+        block_on(db.write_block(src_attr.ino, 0, &payload, 0)).unwrap();
+
+        // Offloaded copy_file_range
+        let copied = block_on(db.copy_file_range(src_attr.ino, 0, dst_attr.ino, 0, 131072))
+            .expect("copy_file_range failed");
+        assert_eq!(copied, 131072);
+
+        // Verify dst content
+        let read_back = block_on(db.read_block(dst_attr.ino, 0)).unwrap();
+        assert_eq!(read_back, payload);
+
+        // Test fallocate punch hole
+        block_on(db.fallocate(dst_attr.ino, 0, 131072, 0x02)).unwrap(); // FALLOC_FL_PUNCH_HOLE
+        let punched_read = block_on(db.read_block(dst_attr.ino, 0)).unwrap();
+        assert!(punched_read.is_empty());
     }
 }
