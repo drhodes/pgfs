@@ -192,7 +192,7 @@ impl DbPool {
         )?;
         let stmt_list = error::ctx(
             client.prepare(
-                "SELECT name, kind, size, mtime FROM entries WHERE parent = $1 ORDER BY name",
+                "SELECT name, kind, size, mtime FROM entries WHERE parent = $1 AND name != '' ORDER BY name",
             ),
             "prepare stmt_list",
         )?;
@@ -485,7 +485,7 @@ impl Db {
             let _t0 = Instant::now();
             let rows = error::ctx(
                 replica.query(
-                    "SELECT name, kind, size, mtime FROM entries WHERE parent = $1 ORDER BY name",
+                    "SELECT name, kind, size, mtime FROM entries WHERE parent = $1 AND name != '' ORDER BY name",
                     &[&parent],
                 ),
                 &format!("list children of directory {parent:?}"),
@@ -1386,6 +1386,15 @@ mod tests {
     }
 
     #[test]
+    fn list_root_directory_does_not_contain_empty_name() {
+        let mut db = db_connect();
+        let children = db.list("").unwrap();
+        for child in &children {
+            assert!(!child.name.is_empty(), "db.list('') should never return an entry with empty name");
+        }
+    }
+
+    #[test]
     fn getattr_directory() {
         let mut db = db_connect();
         let root = root_dir(&mut db);
@@ -1819,7 +1828,7 @@ pub mod backend_impl {
             let rows = self
             .client_guard()
             .query(
-                "SELECT ino, name, kind FROM entries WHERE parent_ino = $1 ORDER BY name OFFSET $2",
+                "SELECT ino, name, kind FROM entries WHERE parent_ino = $1 AND name != '' ORDER BY name OFFSET $2",
                 &[&(ino as i64), &offset],
             )
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;

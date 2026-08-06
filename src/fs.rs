@@ -916,6 +916,9 @@ impl Filesystem for PgFs {
         match self.db.list(&path) {
             Ok(children) => {
                 for child in children {
+                    if child.name.is_empty() {
+                        continue;
+                    }
                     let child_path = db::join(&path, &child.name);
                     let child_ino = self.ino_for(&child_path);
                     let kind = match child.kind {

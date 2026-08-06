@@ -20,32 +20,37 @@ if [ ! -d "$PGDATA" ]; then
     initdb -D "$PGDATA" --auth=trust --no-locale --encoding=UTF8
 fi
 
-echo "starting postgres (unix socket + TCP on 127.0.0.1 only)"
-# -h 127.0.0.1 exposes loopback TCP so a physical streaming standby
-# (scripts/replica_db.sh) can pg_basebackup and stream WAL. Still never
-# binds a non-loopback interface; pg_hba.conf only trusts 127.0.0.1.
-pg_ctl -D "$PGDATA" -l "$LOGFILE" \
-    -o "-k $SOCKDIR -h 127.0.0.1" \
-    start
+if ! pg_ctl -D "$PGDATA" status >/dev/null 2>&1; then
+    echo "starting postgres (unix socket + TCP on 127.0.0.1 only)"
+    pg_ctl -D "$PGDATA" -l "$LOGFILE" \
+        -o "-k $SOCKDIR -h 127.0.0.1" \
+        start
+fi
+
+USER_NAME="$(id -un)"
+SUPERUSER="$(stat -c '%U' "$PGDATA")"
+
+# Ensure current executing user role exists in postgres
+psql -h "$SOCKDIR" -U "$SUPERUSER" -d postgres -c "DO \$$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '$USER_NAME') THEN CREATE USER \"$USER_NAME\" WITH SUPERUSER; END IF; END \$$;" 2>/dev/null || true
 
 # createdb needs a moment after start; retry briefly.
 for i in $(seq 1 10); do
-    if psql -h "$SOCKDIR" -d postgres -c '\q' 2>/dev/null; then
+    if psql -h "$SOCKDIR" -U "$USER_NAME" -d postgres -c '\q' 2>/dev/null; then
         break
     fi
     sleep 0.5
 done
 
-if ! psql -h "$SOCKDIR" -d postgres -c '\q' 2>/dev/null; then
+if ! psql -h "$SOCKDIR" -U "$USER_NAME" -d postgres -c '\q' 2>/dev/null; then
     echo "error: postgres did not answer on $SOCKDIR within 5s" >&2
     echo "last lines of $LOGFILE:" >&2
     tail -20 "$LOGFILE" >&2
     exit 1
 fi
 
-if ! psql -h "$SOCKDIR" -lqt | cut -d'|' -f1 | grep -qw pgfs; then
+if ! psql -h "$SOCKDIR" -U "$USER_NAME" -lqt | cut -d'|' -f1 | grep -qw pgfs; then
     echo "creating database 'pgfs'"
-    createdb -h "$SOCKDIR" pgfs
+    createdb -h "$SOCKDIR" -U "$USER_NAME" pgfs
 fi
 
 echo

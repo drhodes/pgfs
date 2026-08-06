@@ -1,6 +1,6 @@
 PGFS := ./scripts/pgfs.sh
 
-.PHONY: help up down status run build check clippy fmt init-db db-stop shell clean test test-integration
+.PHONY: help up down status run build check clippy fmt init-db db-stop shell clean test test-integration ensure-db
 
 help:
 	@echo "pgfs — PostgreSQL-backed FUSE filesystem"
@@ -23,7 +23,24 @@ help:
 	@echo "  make shell     nix develop"
 	@echo "  make clean     cargo clean"
 
-up:
+check-nix:
+	@if [ -z "$$PGFS_ROOT" ]; then \
+		echo "Error: Nix environment is not active."; \
+		if ! nix-instantiate --eval --expr '1' >/dev/null 2>&1; then \
+			if ! groups | grep -q '\bnix-users\b'; then \
+				echo "Reason: Your user is not in the 'nix-users' group."; \
+				echo "Fix: Run 'sudo usermod -aG nix-users $$USER' and log out/in (or run 'exec sg nix-users bash')."; \
+			else \
+				echo "Reason: Cannot access Nix daemon socket (/nix/var/nix/daemon-socket/socket)."; \
+				echo "Fix: Ensure your active login shell session has the 'nix-users' group applied (e.g. run 'exec sg nix-users bash')."; \
+			fi; \
+		else \
+			echo "Fix: Please enter the Nix dev shell using 'nix develop' or 'make shell'."; \
+		fi; \
+		exit 1; \
+	fi
+
+up: check-nix
 	$(PGFS) up
 
 down:
@@ -32,35 +49,38 @@ down:
 status:
 	$(PGFS) status
 
-run:
+run: check-nix
 	$(PGFS) run
 
-build:
+build: check-nix
 	cargo build
 
-check:
+check: check-nix
 	cargo check
 
-clippy:
+clippy: check-nix
 	cargo clippy
 
-fmt:
+fmt: check-nix
 	cargo fmt
 
-test:
+ensure-db: check-nix
+	@./scripts/ensure_db.sh
+
+test: check-nix ensure-db
 	cargo test
 
-test-integration:
+test-integration: check-nix
 	./scripts/run_tests.sh
 
-init-db:
+init-db: check-nix
 	./scripts/init_db.sh
 
 db-stop:
 	pg_ctl -D testdata/pgdata stop
 
 shell:
-	nix develop
+	nix --extra-experimental-features 'nix-command flakes' develop
 
 clean:
 	cargo clean
