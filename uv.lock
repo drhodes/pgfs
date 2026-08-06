@@ -6,12 +6,6 @@ resolution-markers = [
     "python_full_version < '3.14'",
 ]
 
-[manifest]
-members = [
-    "mnt",
-    "pgfs",
-]
-
 [[package]]
 name = "aiofiles"
 version = "25.1.0"
@@ -423,11 +417,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/bb/56/9b8e1c152f61f6c6b
 wheels = [
     { url = "https://files.pythonhosted.org/packages/f5/4c/c78d78c3d52b0ac594ad7cc8ef5972adfe070e3597a8a4c6ce0cd39196ea/mcp_types-2.0.0-py3-none-any.whl", hash = "sha256:6b2de797ca2797f568b79529e1b25948e34de511bcc0bd82fef1039a6d1b8eb0", size = 69649, upload-time = "2026-07-28T13:45:30.713Z" },
 ]
-
-[[package]]
-name = "mnt"
-version = "0.1.0"
-source = { virtual = "testdata/mnt" }
 
 [[package]]
 name = "opentelemetry-api"

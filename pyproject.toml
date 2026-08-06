@@ -12,6 +12,4 @@ dependencies = [
 libspec = { path = "../libspec" }
 
 [tool.uv.workspace]
-members = [
-    "testdata/mnt",
-]
+members = []
