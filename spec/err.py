@@ -12,6 +12,7 @@ be held.
 """
 
 from libspec import Ctx, Feature, Requirement
+from libspec.diataxis import Diataxis
 
 
 # ── Error handling foundation ────────────────────────────────────────
@@ -218,9 +219,10 @@ class Robustness(DefensiveProgramming):
 
 # ── Base classes for Feature / Requirement specs ─────────────────────
 
-class Feat(Err, Refactor, Robustness, Feature):
-    """Feature specification: inherits all error-handling and code-quality
-    contexts. Every Feature in the codebase must conform to these rules."""
+class Feat(Err, Refactor, Robustness, Diataxis):
+    __is_base_spec__ = True
+    """Feature specification: inherits all error-handling, code-quality, and
+    Diátaxis documentation contexts. Every Feature in the codebase must conform to these rules."""
     pass
 
 

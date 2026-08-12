@@ -23,4 +23,6 @@ members = []
 dev = [
     "libspec-conventional-commits>=0.1.0",
     "libspec-diataxis>=0.1.0",
+    "mkdocs>=1.6.1",
+    "mkdocs-material>=9.7.7",
 ]

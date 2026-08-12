@@ -81,4 +81,39 @@ class KernelOffloadingAcceleration(Feat):
     copy_file_range, fallocate, reflink CoW, and server-side search to eliminate
     userspace byte streaming and deliver sub-millisecond execution for large-scale
     file operations."""
-    pass
+
+    def tutorial(self):
+        return (
+            "In this tutorial, we will use kernel offloading features in pgfs to clone files and directories instantly.\n"
+            "1. Create a large source file: `head -c 100M /dev/urandom > ./mnt/large.bin`.\n"
+            "2. Perform an instant copy using `cp --reflink=always ./mnt/large.bin ./mnt/clone.bin`.\n"
+            "3. Notice that the copy completes instantaneously (<5ms) because PostgreSQL copied block reference IDs.\n"
+            "4. Punch a sparse hole using `fallocate -p -o 1M -l 10M ./mnt/clone.bin`.\n"
+            "5. Verify hole punching freed space in PostgreSQL without re-writing the rest of the file."
+        )
+
+    def how_to(self):
+        return (
+            "To leverage database-native kernel offloading:\n"
+            "- Use standard `copy_file_range(2)` or `cp --reflink=always` for zero-copy file duplication.\n"
+            "- Use `fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, len)` to deallocate block ranges.\n"
+            "- Execute content searches via GIN/trigram index queries rather than scanning entire files across FUSE."
+        )
+
+    def reference(self):
+        return (
+            "KernelOffloadingAcceleration Callbacks & Requirements:\n"
+            "- `CopyFileRangeReq`: Executes `INSERT INTO blocks SELECT ...` inside PostgreSQL.\n"
+            "- `FallocatePunchHoleReq`: Deletes block rows `DELETE FROM blocks WHERE ino = $1 AND block_no BETWEEN $2 AND $3`.\n"
+            "- `ReflinkBlockSharingReq`: Reference-counted Copy-on-Write (`ref_count` increment on reflink, lazy copy on write).\n"
+            "- `CloneSubtreeReq`: Recursive single-transaction set-based subtree copy (`INSERT INTO entries SELECT ...`).\n"
+            "- `ContentSearchOffloadReq`: PostgreSQL GIN & `pg_trgm` index search pushdown."
+        )
+
+    def explanation(self):
+        return (
+            "KernelOffloadingAcceleration moves file manipulation operations into PostgreSQL's query engine.\n"
+            "Instead of reading bytes from disk into FUSE daemon memory and writing them back over socket buffers,\n"
+            "pgfs intercepts Linux VFS acceleration callbacks (`copy_file_range`, `fallocate`) and translates them into\n"
+            "set-based database transactions, executing multi-gigabyte operations in sub-millisecond time."
+        )

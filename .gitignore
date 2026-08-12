@@ -27,4 +27,8 @@ __pycache__/
 .libspec/cache/*.bin
 !.libspec/cache/live.bin
 
+# MkDocs build directory
+/site/
+
+
 

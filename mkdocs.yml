@@ -1,0 +1,81 @@
+site_name: pgfs — PostgreSQL-Backed FUSE Filesystem
+site_url: https://drhodes.github.io/pgfs/
+repo_name: drhodes/pgfs
+repo_url: https://github.com/drhodes/pgfs
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed
+  - pymdownx.highlight
+
+nav:
+  - Overview: index.md
+  - Tutorials:
+      - "POSIX Flat Filesystem": tutorials/flat_filesystem.md
+      - "Hierarchical Directory Trees": tutorials/hierarchicaldirectories.md
+      - "Atomic Renames": tutorials/atomicrename.md
+      - "Reliable Mount": tutorials/reliablemount.md
+      - "Kernel Offloading Acceleration": tutorials/kerneloffloadingacceleration.md
+      - "Dual-Interface Architecture": tutorials/dualinterfacearchitecture.md
+      - "Optimization Roadmap": tutorials/optimizationroadmap.md
+      - "Replicated Storage": tutorials/replicated_filesystem.md
+  - How-To Guides:
+      - "POSIX Flat Filesystem": how-to/flat_filesystem.md
+      - "Hierarchical Directory Trees": how-to/hierarchicaldirectories.md
+      - "Atomic Renames": how-to/atomicrename.md
+      - "Reliable Mount": how-to/reliablemount.md
+      - "Kernel Offloading Acceleration": how-to/kerneloffloadingacceleration.md
+      - "Dual-Interface Architecture": how-to/dualinterfacearchitecture.md
+      - "Optimization Roadmap": how-to/optimizationroadmap.md
+      - "Replicated Storage": how-to/replicated_filesystem.md
+  - Reference:
+      - "POSIX Flat Filesystem": reference/flat_filesystem.md
+      - "Hierarchical Directory Trees": reference/hierarchicaldirectories.md
+      - "Atomic Renames": reference/atomicrename.md
+      - "Reliable Mount": reference/reliablemount.md
+      - "Kernel Offloading Acceleration": reference/kerneloffloadingacceleration.md
+      - "Dual-Interface Architecture": reference/dualinterfacearchitecture.md
+      - "Optimization Roadmap": reference/optimizationroadmap.md
+      - "Replicated Storage": reference/replicated_filesystem.md
+  - Explanation:
+      - "POSIX Flat Filesystem": explanation/flat_filesystem.md
+      - "Hierarchical Directory Trees": explanation/hierarchicaldirectories.md
+      - "Atomic Renames": explanation/atomicrename.md
+      - "Reliable Mount": explanation/reliablemount.md
+      - "Kernel Offloading Acceleration": explanation/kerneloffloadingacceleration.md
+      - "Dual-Interface Architecture": explanation/dualinterfacearchitecture.md
+      - "Optimization Roadmap": explanation/optimizationroadmap.md
+      - "Replicated Storage": explanation/replicated_filesystem.md

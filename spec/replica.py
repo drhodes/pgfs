@@ -107,3 +107,38 @@ class ReplicatedFilesystem(Feat):
     eventually consistent with the standby's lag continuously bounded by
     the freshness check, and a standby failure never causes data loss or
     a kernel-visible error."""
+
+    def tutorial(self):
+        return (
+            "In this tutorial, we will set up and verify a replicated pgfs mount with primary/standby PostgreSQL.\n"
+            "1. Start the Docker streaming standby container: `./scripts/replica_db.sh up`.\n"
+            "2. Launch pgfs with primary and standby parameters: `./target/release/pgfs --conn postgres://127.0.0.1:5432/pgfs --replica postgres://127.0.0.1:5433/pgfs`.\n"
+            "3. Perform write operations (`touch ./mnt/data.txt`) and observe writes directed to primary.\n"
+            "4. Perform read operations (`cat ./mnt/data.txt`) and observe reads served from the standby node.\n"
+            "5. Stop the standby container (`./scripts/replica_db.sh down`) and verify reads seamlessly fall back to primary without errors."
+        )
+
+    def how_to(self):
+        return (
+            "To deploy and operate replicated pgfs:\n"
+            "- Pass `--replica <connstring>` to specify the standby PostgreSQL database connection.\n"
+            "- Ensure the primary PostgreSQL daemon listens on TCP loopback (`-h 127.0.0.1`) and accepts replication connections in `pg_hba.conf`.\n"
+            "- Inspect daemon log lines or `REPLICA_READ_COUNT` and `REPLICA_FALLBACK_COUNT` metrics to verify read-routing health."
+        )
+
+    def reference(self):
+        return (
+            "ReplicatedFilesystem Specifications & Requirements:\n"
+            "- Provisioning: `StartsDockerStandby` (`scripts/replica_db.sh`), `RequiresPrimaryTcpListener`.\n"
+            "- Connection & Routing: `AcceptsReplicaConnection` (`--replica`), `ServesReadsFromReplica` (getattr, readdir, read), `WritesStayOnPrimary` (mutations on primary).\n"
+            "- Consistency: `DetectsReplicationLag` (checks LSN replay lag `pg_last_wal_replay_lsn`), `FallsBackToPrimary` (transparent fallback on lag/error).\n"
+            "- Observability: `ReplicaObservability` (`REPLICA_READ_COUNT`, `REPLICA_FALLBACK_COUNT`, SIGUSR1 status dump)."
+        )
+
+    def explanation(self):
+        return (
+            "ReplicatedFilesystem offloads read traffic to physical streaming standby replicas while preserving strict POSIX consistency.\n"
+            "All mutating file operations execute synchronously on the primary database node. Read operations query the standby\n"
+            "only when its WAL replay LSN confirms it is synchronized with the primary. If replication lag exceeds tolerance or the replica fails,\n"
+            "reads immediately and silently fall back to the primary, guaranteeing data consistency and zero application downtime."
+        )

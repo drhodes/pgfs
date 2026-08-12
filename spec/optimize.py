@@ -222,11 +222,79 @@ class DualInterfaceArchitecture(Feat):
     """pgfs features a Dual-Interface Storage Architecture providing a sub-100µs
     Local In-Process Engine (`pgrx` + zero SQL parsing + `io_uring` zero copy)
     and a scalable Remote Async Network Engine (`tokio-postgres` + pipelining)."""
-    pass
+
+    def tutorial(self):
+        return (
+            "In this tutorial, we will explore selecting between local in-process and remote network backends.\n"
+            "1. Launch pgfs with the remote async engine: `./target/release/pgfs --backend remote --conn postgres://...`.\n"
+            "2. Benchmark read/write latency using `make test-integration` or custom `fio` workloads.\n"
+            "3. Build the local `pgrx` extension and start PostgreSQL postmaster with the `pgrx` worker enabled.\n"
+            "4. Launch pgfs with the local engine: `./target/release/pgfs --backend local --shm /dev/shm/pgfs`.\n"
+            "5. Compare latency metrics to observe sub-100µs file operation latencies."
+        )
+
+    def how_to(self):
+        return (
+            "To configure storage backends in pgfs:\n"
+            "- For single-node maximum performance, use `--backend local` to connect via shared-memory ring buffers (`shm_mq`) to the `pgrx` background worker.\n"
+            "- For networked or distributed setups, use `--backend remote` to connect via `tokio-postgres` TCP connection pools (`bb8`).\n"
+            "- To configure connection pool concurrency for remote backend, pass `--max-pool-size <N>`."
+        )
+
+    def reference(self):
+        return (
+            "DualInterfaceArchitecture Component Reference:\n"
+            "- `PgfsBackendTraitReq`: Unified async trait specifying storage engine methods (`lookup`, `read_block`, `write_block`, etc.).\n"
+            "- `LocalPgrxEngineReq`: Runs inside PostgreSQL via `pgrx` postmaster background worker (`pg_bgworker`), pre-compiling SPI plans (`SPIPlanPtr`) and processing binary `Datum` values.\n"
+            "- `IoUringBufferRingReq`: Uses Linux 6.9+ `fuse-io_uring` SQ/CQ rings with pre-registered buffer rings for zero-copy VFS payloads.\n"
+            "- `RemoteAsyncBackendReq`: Uses `fuse3` async FUSE bindings with `tokio-postgres` connection pools (`bb8`) over TCP/Unix sockets."
+        )
+
+    def explanation(self):
+        return (
+            "DualInterfaceArchitecture decouples FUSE filesystem request dispatching from storage engine execution.\n"
+            "The Local Engine embeds processing directly inside PostgreSQL as a background worker, bypassing SQL parsing\n"
+            "and socket serialization for sub-100µs latency. The Remote Engine provides standard out-of-process networking\n"
+            "using async Rust (`tokio-postgres`), allowing pgfs to scale seamlessly across network hosts."
+        )
 
 
 class OptimizationRoadmap(Feat):
     """pgfs incorporates a structured performance optimization pipeline
     targeting database access latency, connection concurrency, userspace
     buffering, and FUSE kernel-transport tuning."""
-    pass
+
+    def tutorial(self):
+        return (
+            "In this tutorial, we will apply and benchmark key pgfs performance tuning options.\n"
+            "1. Start pgfs with kernel attribute caching enabled: `./target/release/pgfs --attr-ttl 5.0`.\n"
+            "2. Enable writeback caching in kernel VFS: `./target/release/pgfs --writeback-cache`.\n"
+            "3. Run `scripts/bench_profile.sh` to measure throughput across small-block write and read phases.\n"
+            "4. Observe latency histogram metrics printed in daemon logs to evaluate p50, p95, and p99 performance."
+        )
+
+    def how_to(self):
+        return (
+            "To tune pgfs performance for high IOPS workloads:\n"
+            "- Enable 64KB/128KB chunked block storage (`blocks(ino, block_no, data)`) to prevent full-file blob rewrites.\n"
+            "- Use prepared SQL statements (`PreparedStatementReq`) to eliminate query parsing overhead on hot paths.\n"
+            "- Enable synchronous commit tuning (`SET synchronous_commit = off`) to reduce WAL fsync wait times.\n"
+            "- Set `--attr-ttl <seconds>` to cache inode attributes in Linux VFS and avoid repetitive `getattr` round-trips."
+        )
+
+    def reference(self):
+        return (
+            "OptimizationRoadmap Requirements & Parameters:\n"
+            "- Schema: Chunked block storage (`ChunkedBlockStorageReq`) + integer inode primary keys (`InoBasedRekeyingReq`).\n"
+            "- Database Tuning: `PreparedStatementReq`, `TransactionBatchingReq`, `SynchronousCommitTuningReq`, `UnloggedTableOptReq`.\n"
+            "- Transport Tuning: `KernelAttrCacheTtlReq` (`--attr-ttl`), `KernelWritebackCacheReq` (`FUSE_WRITEBACK_CACHE`), `BufferedWriteFlushReq`.\n"
+            "- Sparse Data Safety: `SparseWritePaddingReq` (pre-zero padding on uninstantiated block writes)."
+        )
+
+    def explanation(self):
+        return (
+            "OptimizationRoadmap addresses bottlenecks across all layers of the filesystem stack:\n"
+            "database schema design (integer inode keys, chunked block storage), transaction latency (batching, WAL tuning),\n"
+            "memory management (page-aligned dirty write buffering), and kernel VFS interaction (attribute TTL caching,\n"
+            "writeback cache coalescing). Together, these optimizations deliver near-native filesystem throughput."
+        )

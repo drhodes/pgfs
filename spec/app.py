@@ -191,24 +191,158 @@ class SupportsGitInit(Req):
 class FlatFilesystem(Feat):
     """Users can create, read, write, and delete files through standard
     POSIX file operations on the mounted directory."""
-    pass
+
+    def tutorial(self):
+        return (
+            "In this tutorial, we will mount a pgfs filesystem and perform basic POSIX file operations.\n"
+            "1. Start the pgfs daemon mounted at `./mnt`.\n"
+            "2. Create a file using `echo 'Hello pgfs' > ./mnt/demo.txt`.\n"
+            "3. Read the file back with `cat ./mnt/demo.txt` and verify the content.\n"
+            "4. Append data using `echo 'More content' >> ./mnt/demo.txt`.\n"
+            "5. Delete the file using `rm ./mnt/demo.txt` and confirm it no longer appears in `ls ./mnt`."
+        )
+
+    def how_to(self):
+        return (
+            "To manage regular files on a mounted pgfs volume:\n"
+            "- To create an empty file or open with creation flags, use `touch <path>` or standard `open(path, O_CREAT)`.\n"
+            "- To write arbitrary byte sequences, invoke standard POSIX `write()` or redirect output stream to the file path.\n"
+            "- To read file contents, open the path with `O_RDONLY` and issue `read()` calls.\n"
+            "- To remove a file, call `unlink(path)` or use `rm <path>`."
+        )
+
+    def reference(self):
+        return (
+            "FlatFilesystem Interface & Callbacks:\n"
+            "- `create(parent_ino, name, mode, flags) -> (ino, attr)`: Inserts entry with kind='file', size=0.\n"
+            "- `read(ino, offset, size) -> bytes`: Returns byte slice clamped to stored blob length.\n"
+            "- `write(ino, offset, data) -> bytes_written`: Updates or extends byte blob in PostgreSQL.\n"
+            "- `unlink(parent_ino, name) -> status`: Removes row from database and inode map.\n"
+            "- Error codes: ENOENT (file missing), EEXIST (creation conflict), EIO (database failure)."
+        )
+
+    def explanation(self):
+        return (
+            "FlatFilesystem translates POSIX file I/O operations into relational database operations on PostgreSQL.\n"
+            "File metadata and byte payloads are mapped to database records. Reads and writes interact with\n"
+            "stored byte arrays while presenting a standard POSIX filesystem interface to applications through FUSE."
+        )
 
 
 class HierarchicalDirectories(Feat):
     """Users can create nested directories, list their contents, and
     remove empty directories through standard POSIX directory
     operations."""
-    pass
+
+    def tutorial(self):
+        return (
+            "In this tutorial, we will work with directory trees in pgfs.\n"
+            "1. Create a nested directory structure: `mkdir -p ./mnt/docs/project/src`.\n"
+            "2. List directory contents with `ls -la ./mnt/docs/project` to see '.' and '..' entries.\n"
+            "3. Create files inside nested subdirectories: `touch ./mnt/docs/project/src/main.rs`.\n"
+            "4. Try removing a non-empty directory with `rmdir ./mnt/docs/project` and observe the `ENOTEMPTY` error.\n"
+            "5. Delete sub-files first, then remove empty directories using `rmdir ./mnt/docs/project/src`."
+        )
+
+    def how_to(self):
+        return (
+            "To work with hierarchical directories in pgfs:\n"
+            "- To create nested directories, run `mkdir -p <dir_path>`.\n"
+            "- To list directory contents, call `readdir` via `ls` or standard directory stream APIs.\n"
+            "- To remove a directory, ensure all children are deleted first, then invoke `rmdir <dir_path>`."
+        )
+
+    def reference(self):
+        return (
+            "HierarchicalDirectories Callbacks & Rules:\n"
+            "- `mkdir(parent_ino, name, mode) -> (ino, attr)`: Inserts dir entry with nlink=2, permissions 0755.\n"
+            "- `rmdir(parent_ino, name) -> status`: Deletes dir row if child count == 0; else replies ENOTEMPTY.\n"
+            "- `readdir(ino, offset) -> entries`: Synthesizes '.' and '..' then yields child inodes.\n"
+            "- Root directory fixed inode: `ino = 1`."
+        )
+
+    def explanation(self):
+        return (
+            "HierarchicalDirectories models a directory tree within PostgreSQL using parent inode pointers\n"
+            "`(parent_ino, name)` indexed by B-Tree structures. Directory traversals check parent relationships,\n"
+            "enabling efficient hierarchy navigation while enforcing strict POSIX directory semantics."
+        )
 
 
 class AtomicRename(Feat):
     """Users can rename (move) files and directories with standard
     `mv` semantics, including overwriting existing files and empty
     directories."""
-    pass
+
+    def tutorial(self):
+        return (
+            "In this tutorial, we will perform atomic file and directory renames.\n"
+            "1. Create a source file: `echo 'v1' > ./mnt/a.txt` and target file `echo 'v2' > ./mnt/b.txt`.\n"
+            "2. Execute `mv ./mnt/a.txt ./mnt/b.txt` to atomically replace `b.txt` with `a.txt`.\n"
+            "3. Verify `./mnt/b.txt` contains 'v1' and `./mnt/a.txt` no longer exists.\n"
+            "4. Test directory subtree rename: `mkdir ./mnt/old_dir` and move it with `mv ./mnt/old_dir ./mnt/new_dir`."
+        )
+
+    def how_to(self):
+        return (
+            "To rename entries safely on pgfs:\n"
+            "- Use standard `mv <src> <dst>` or `rename(oldpath, newpath)` syscall.\n"
+            "- If replacing an existing target, ensure target is a file or empty directory.\n"
+            "- Lock-and-rename atomic patterns (such as those used by `git init` and compilers) are supported out-of-the-box."
+        )
+
+    def reference(self):
+        return (
+            "AtomicRename Semantics & Error Matrix:\n"
+            "- `rename(old_parent, old_name, new_parent, new_name)`: Atomic move in single SQL transaction.\n"
+            "- Target exists file -> atomically replaced.\n"
+            "- Target exists empty directory -> atomically replaced.\n"
+            "- Target exists non-empty directory -> ENOTEMPTY.\n"
+            "- Source file & target directory -> EISDIR; Source directory & target file -> ENOTDIR.\n"
+            "- Renaming directory updates parent pointers of all descendants in transaction."
+        )
+
+    def explanation(self):
+        return (
+            "AtomicRename guarantees POSIX compliance by wrapping entry updates and subtree path re-keying\n"
+            "within a single PostgreSQL transaction (`BEGIN ... COMMIT`). This ensures no intermediate state\n"
+            "is exposed to concurrent readers, preventing file corruption during rename-overwrite operations."
+        )
 
 
 class ReliableMount(Feat):
     """The filesystem mounts and unmounts cleanly. Crashing or killing
     the daemon never leaves a ghost mount behind."""
-    pass
+
+    def tutorial(self):
+        return (
+            "In this tutorial, we will verify clean daemon mount and shutdown behavior.\n"
+            "1. Mount pgfs using `scripts/pgfs.sh up`.\n"
+            "2. Verify mount point status via `scripts/pgfs.sh status` and check PID file at `/tmp/pgfs-*.pid`.\n"
+            "3. Send SIGINT to the daemon process or run `scripts/pgfs.sh down`.\n"
+            "4. Verify the mountpoint is cleanly unmounted and no stale daemon processes remain."
+        )
+
+    def how_to(self):
+        return (
+            "To ensure reliable mounting and clean shutdown:\n"
+            "- Mount with `AutoUnmount` flag enabled in FUSE session options.\n"
+            "- Use SIGINT, SIGTERM, or SIGHUP to trigger explicit graceful unmount.\n"
+            "- Poll `/tmp/pgfs-*.ready` to check daemon readiness before performing file I/O."
+        )
+
+    def reference(self):
+        return (
+            "ReliableMount Lifecycle Specification:\n"
+            "- Mount flags: `AutoUnmount` enabled.\n"
+            "- Signal management: Dedicated `sigwait` thread handles SIGINT, SIGTERM, SIGHUP.\n"
+            "- Control files: `/tmp/pgfs-{hash}.pid` (daemon PID), `/tmp/pgfs-{hash}.ready` (readiness marker).\n"
+            "- Panic recovery: `panic = \"abort\"` in release builds ensures instant exit and kernel mount cleanup."
+        )
+
+    def explanation(self):
+        return (
+            "ReliableMount combines FUSE `AutoUnmount` kernel flags with dedicated signal handling threads\n"
+            "to guarantee that process exits, panics, or external termination signals always trigger a clean\n"
+            "kernel unmount, preventing dangling mount points and stale state."
+        )
