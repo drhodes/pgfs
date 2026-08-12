@@ -285,7 +285,7 @@ wheels = [
 
 [[package]]
 name = "libspec"
-version = "10.3.1"
+version = "10.5.4"
 source = { directory = "../libspec" }
 dependencies = [
     { name = "aiofiles" },
@@ -327,6 +327,34 @@ dev = [
     { name = "radon", specifier = ">=6.0.1" },
     { name = "ruff", specifier = ">=0.15.12" },
 ]
+
+[[package]]
+name = "libspec-conventional-commits"
+version = "0.1.1"
+source = { directory = "../libspec-conventional-commits" }
+dependencies = [
+    { name = "libspec" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "libspec", specifier = ">=10.5.4" }]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=9.0.2" },
+    { name = "ruff", specifier = ">=0.15.12" },
+]
+
+[[package]]
+name = "libspec-diataxis"
+version = "0.1.1"
+source = { directory = "../libspec-diataxis" }
+dependencies = [
+    { name = "libspec" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "libspec", specifier = ">=10.5.4" }]
 
 [[package]]
 name = "markupsafe"
@@ -436,10 +464,28 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "libspec" },
+    { name = "libspec-conventional-commits" },
+    { name = "libspec-diataxis" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "libspec-conventional-commits" },
+    { name = "libspec-diataxis" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "libspec", directory = "../libspec" }]
+requires-dist = [
+    { name = "libspec", directory = "../libspec" },
+    { name = "libspec-conventional-commits", directory = "../libspec-conventional-commits" },
+    { name = "libspec-diataxis", directory = "../libspec-diataxis" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "libspec-conventional-commits", directory = "../libspec-conventional-commits" },
+    { name = "libspec-diataxis", directory = "../libspec-diataxis" },
+]
 
 [[package]]
 name = "prompt-toolkit"

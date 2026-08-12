@@ -1390,7 +1390,10 @@ mod tests {
         let mut db = db_connect();
         let children = db.list("").unwrap();
         for child in &children {
-            assert!(!child.name.is_empty(), "db.list('') should never return an entry with empty name");
+            assert!(
+                !child.name.is_empty(),
+                "db.list('') should never return an entry with empty name"
+            );
         }
     }
 

@@ -6,10 +6,21 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "libspec",
+    "libspec-conventional-commits>=0.1.0",
+    "libspec-diataxis>=0.1.0",
 ]
 
 [tool.uv.sources]
 libspec = { path = "../libspec" }
+libspec-diataxis = { path = "../libspec-diataxis" }
+libspec-conventional-commits = { path = "../libspec-conventional-commits" }
+
 
 [tool.uv.workspace]
 members = []
+
+[dependency-groups]
+dev = [
+    "libspec-conventional-commits>=0.1.0",
+    "libspec-diataxis>=0.1.0",
+]
