@@ -11,8 +11,16 @@ FUSE kernel. These specs describe the standard to which all new code must
 be held.
 """
 
-from libspec import Ctx, Feature, Requirement
+import textwrap
+
+from libspec import Ctx, Feature, Requirement, UnimplementedMethodError
 from libspec.diataxis import Diataxis
+
+
+def md(text):
+    """Dedent a triple-quoted Markdown block so Diátaxis quadrant methods
+    can be written at natural indentation inside the class body."""
+    return textwrap.dedent(text).strip("\n")
 
 
 # ── Error handling foundation ────────────────────────────────────────
@@ -219,11 +227,34 @@ class Robustness(DefensiveProgramming):
 
 # ── Base classes for Feature / Requirement specs ─────────────────────
 
+STABLE = "stable"
+PARTIAL = "partial"
+PLANNED = "planned"
+
+
 class Feat(Err, Refactor, Robustness, Diataxis):
-    __is_base_spec__ = True
     """Feature specification: inherits all error-handling, code-quality, and
-    Diátaxis documentation contexts. Every Feature in the codebase must conform to these rules."""
-    pass
+    Diátaxis documentation contexts. Every Feature in the codebase must conform to these rules.
+
+    Besides the four Diátaxis quadrants, every Feature declares `title()`
+    and `status()`, and lists the Requirements it is built from in `deps`
+    so the generated Reference page can enumerate them."""
+    __is_base_spec__ = True
+
+    def title(self):
+        """Human-readable feature title used for documentation headings."""
+        raise UnimplementedMethodError()
+
+    def status(self):
+        """Implementation status: one of STABLE (implemented and tested),
+        PARTIAL (some requirements implemented), or PLANNED (specified,
+        not yet implemented). Paired with `status_note()`."""
+        raise UnimplementedMethodError()
+
+    def status_note(self):
+        """One or two sentences qualifying `status()`: what works today and
+        what does not. Rendered as an admonition on every generated page."""
+        raise UnimplementedMethodError()
 
 
 class Req(Err, Refactor, Robustness, Requirement):

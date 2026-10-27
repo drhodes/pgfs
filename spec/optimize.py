@@ -9,7 +9,7 @@ existing baseline performance mechanisms in src/db.rs and the dual-interface
 (Local pgrx + Remote Network) architecture specification.
 """
 
-from .err import Feat, Req
+from .err import PARTIAL, PLANNED, Feat, Req, md
 
 
 # ── Tier 1 — Database Path & Schema Optimizations ──────────────────────
@@ -223,40 +223,257 @@ class DualInterfaceArchitecture(Feat):
     Local In-Process Engine (`pgrx` + zero SQL parsing + `io_uring` zero copy)
     and a scalable Remote Async Network Engine (`tokio-postgres` + pipelining)."""
 
-    def tutorial(self):
+    deps = [
+        PgfsBackendTraitReq,
+        LocalPgrxEngineReq,
+        IoUringBufferRingReq,
+        RemoteAsyncBackendReq,
+    ]
+
+    def title(self):
+        return "Dual-Interface Architecture"
+
+    def status(self):
+        return PLANNED
+
+    def status_note(self):
         return (
-            "In this tutorial, we will explore selecting between local in-process and remote network backends.\n"
-            "1. Launch pgfs with the remote async engine: `./target/release/pgfs --backend remote --conn postgres://...`.\n"
-            "2. Benchmark read/write latency using `make test-integration` or custom `fio` workloads.\n"
-            "3. Build the local `pgrx` extension and start PostgreSQL postmaster with the `pgrx` worker enabled.\n"
-            "4. Launch pgfs with the local engine: `./target/release/pgfs --backend local --shm /dev/shm/pgfs`.\n"
-            "5. Compare latency metrics to observe sub-100µs file operation latencies."
+            "The `PgfsBackend` trait, its error mapping and an inode-keyed "
+            "implementation on `Db` exist and are unit-tested, but the FUSE "
+            "layer does not route through them yet. `RemoteBackend` is a "
+            "stub, the `pgrx` engine and the `io_uring` transport are at the "
+            "design stage, and there is no `--backend` option."
         )
+
+    def tutorial(self):
+        return md(r"""
+            The dual-interface architecture is not wired into the daemon
+            yet, so this tutorial explores the part that exists: the
+            storage seam that both future engines will plug into. We will
+            run its tests, read the trait, and see where the FUSE layer
+            will connect to it. All we need is the repository and the
+            project-local cluster.
+
+            ## Step 1: run the backend tests
+
+            ```bash
+            ./scripts/ensure_db.sh
+            cargo test backend
+            ```
+
+            ```text
+            test backend::tests::test_storage_error_to_libc_errno ... ok
+            test backend::tests::test_remote_backend_unimplemented_stubs ... ok
+            test backend::tests::test_file_kind_conversion ... ok
+            test backend::tests::test_prepare_sparse_block_write_overwrite_existing ... ok
+            test backend::tests::test_prepare_sparse_block_write_zero_padding ... ok
+            test db::tests_offload::test_backend_offloaded_copy_file_range_and_fallocate ... ok
+            test result: ok. 6 passed; 0 failed; ...
+            ```
+
+            ## Step 2: read the trait
+
+            ```bash
+            grep -n 'async fn' src/backend.rs | head -16
+            ```
+
+            Every method takes inode numbers rather than paths. That is the
+            most important difference from the code that runs today, which
+            keys everything by `(parent path, name)`.
+
+            ## Step 3: see how errors become errnos
+
+            ```bash
+            grep -n -A12 'impl From<StorageError> for libc::c_int' src/backend.rs
+            ```
+
+            A backend reports what went wrong (`NotFound`, `NotEmpty`,
+            `DatabaseError`, ...), and one function turns that into the
+            errno the kernel receives.
+
+            ## Step 4: find the seam in the FUSE layer
+
+            ```bash
+            grep -n 'backend' src/fs.rs | head
+            ```
+
+            `PgFs` already holds a `backend` field, constructed as a
+            `LocalBackend` around the same `Db`, but the callbacks still
+            call `self.db` directly. Switching each callback from `self.db`
+            to `self.backend` is the next step of this feature.
+
+            ## What we did
+
+            We exercised and read the storage abstraction that will let
+            pgfs choose between an in-process engine and a network engine.
+            The [explanation](../explanation/dualinterfacearchitecture.md)
+            describes where it is heading.
+        """)
 
     def how_to(self):
-        return (
-            "To configure storage backends in pgfs:\n"
-            "- For single-node maximum performance, use `--backend local` to connect via shared-memory ring buffers (`shm_mq`) to the `pgrx` background worker.\n"
-            "- For networked or distributed setups, use `--backend remote` to connect via `tokio-postgres` TCP connection pools (`bb8`).\n"
-            "- To configure connection pool concurrency for remote backend, pass `--max-pool-size <N>`."
-        )
+        return md(r"""
+            ## Choose a backend at startup
+
+            Not available yet. There is no `--backend` option; the daemon
+            always uses the in-process `Db` client over libpq.
+
+            ## Add an operation to the storage interface
+
+            1. Add an `async fn` to `PgfsBackend` in `src/backend.rs`. If
+               not every backend can support it, give it a default body
+               that returns `StorageError::InvalidArgument`, as
+               `copy_file_range` and `fallocate` do.
+            2. Implement it for `Db` in `db::backend_impl` (`src/db.rs`).
+            3. Forward it in `impl PgfsBackend for LocalBackend`.
+            4. Add a stub to `RemoteBackend`.
+            5. Add a test next to `tests_offload` in `src/db.rs`.
+
+            ## Report a storage failure with the right errno
+
+            Return the matching `StorageError` variant and convert it with
+            `libc::c_int::from(err)` when replying to the kernel. Use
+            `DatabaseError` (→ `EIO`) only for failures that are not a
+            normal answer, and log those with their full context.
+
+            ## Run only the backend tests
+
+            ```bash
+            cargo test backend
+            ```
+
+            ## Follow the design
+
+            The full design, including the shared-memory protocol and the
+            `io_uring` data path, is in
+            `design/dual_interface_architecture.md`.
+        """)
 
     def reference(self):
-        return (
-            "DualInterfaceArchitecture Component Reference:\n"
-            "- `PgfsBackendTraitReq`: Unified async trait specifying storage engine methods (`lookup`, `read_block`, `write_block`, etc.).\n"
-            "- `LocalPgrxEngineReq`: Runs inside PostgreSQL via `pgrx` postmaster background worker (`pg_bgworker`), pre-compiling SPI plans (`SPIPlanPtr`) and processing binary `Datum` values.\n"
-            "- `IoUringBufferRingReq`: Uses Linux 6.9+ `fuse-io_uring` SQ/CQ rings with pre-registered buffer rings for zero-copy VFS payloads.\n"
-            "- `RemoteAsyncBackendReq`: Uses `fuse3` async FUSE bindings with `tokio-postgres` connection pools (`bb8`) over TCP/Unix sockets."
-        )
+        return md(r"""
+            ## Component status
+
+            | Component | Status | Location |
+            |---|---|---|
+            | `PgfsBackend` trait | implemented, not used by the FUSE layer | `src/backend.rs` |
+            | `StorageError` → errno mapping | implemented | `src/backend.rs` |
+            | inode-keyed implementation on `Db` | implemented; exercised by unit tests only | `src/db.rs`, `backend_impl` |
+            | `LocalBackend` | wrapper that forwards to `Db`; not the planned `pgrx` engine | `src/backend.rs` |
+            | `RemoteBackend` | stub; every method returns an error | `src/backend.rs` |
+            | `pgrx` background-worker engine (`LocalPgrxEngineReq`) | planned | design only |
+            | `io_uring` buffer rings (`IoUringBufferRingReq`) | planned | design only |
+            | `tokio-postgres` network engine (`RemoteAsyncBackendReq`) | planned | design only |
+            | `--backend` command-line option | planned | |
+
+            ## `PgfsBackend` methods
+
+            | Method | Signature (all `async`, all return `Result<_, StorageError>`) |
+            |---|---|
+            | `lookup` | `(parent_ino: u64, name: &str) -> Option<FileAttr>` |
+            | `getattr` | `(ino: u64) -> FileAttr` |
+            | `setattr` | `(ino: u64, attr: SetAttrInput) -> FileAttr` |
+            | `readdir` | `(ino: u64, offset: i64) -> Vec<DirEntry>` |
+            | `mkdir` | `(parent_ino: u64, name: &str, mode: u32, uid: u32, gid: u32) -> FileAttr` |
+            | `rmdir` | `(parent_ino: u64, name: &str) -> ()` |
+            | `create` | `(parent_ino: u64, name: &str, mode: u32, uid: u32, gid: u32) -> FileAttr` |
+            | `unlink` | `(parent_ino: u64, name: &str) -> ()` |
+            | `rename` | `(old_parent: u64, old_name: &str, new_parent: u64, new_name: &str) -> ()` |
+            | `read_block` | `(ino: u64, block_no: u32) -> Vec<u8>` |
+            | `write_block` | `(ino: u64, block_no: u32, data: &[u8], offset_in_block: u32) -> u32` |
+            | `truncate_blocks` | `(ino: u64, new_size: u64) -> ()` |
+            | `copy_file_range` | `(ino_in, off_in, ino_out, off_out, len: u64) -> u64`; default: `InvalidArgument` |
+            | `fallocate` | `(ino: u64, offset: u64, length: u64, mode: u32) -> ()`; default: `InvalidArgument` |
+
+            ## `StorageError`
+
+            | Variant | errno |
+            |---|---|
+            | `NotFound` | `ENOENT` |
+            | `AlreadyExists` | `EEXIST` |
+            | `NotEmpty` | `ENOTEMPTY` |
+            | `InvalidArgument(String)` | `EINVAL` |
+            | `DatabaseError(String)` | `EIO` |
+            | `IoError(kind)` | `ENOENT`, `EEXIST`, `EACCES` or `EINVAL` for the matching kinds; otherwise `EIO` |
+
+            ## Data types
+
+            | Type | Fields |
+            |---|---|
+            | `FileKind` | `File`, `Directory`, `Symlink` |
+            | `FileAttr` | `ino`, `size`, `blocks`, `atime`, `mtime`, `ctime`, `kind`, `perm`, `nlink`, `uid`, `gid`, `rdev`, `flags` |
+            | `DirEntry` | `ino`, `name`, `kind` |
+            | `SetAttrInput` | optional `mode`, `uid`, `gid`, `size`, `atime`, `mtime` |
+
+            ## Compatibility with the running FUSE path
+
+            | Property | FUSE path (`Db` path methods) | Backend path (`Db` as `PgfsBackend`) |
+            |---|---|---|
+            | Key | `(parent, name)` text | `ino`, `parent_ino` integers |
+            | Block size | 65 536 bytes | 131 072 bytes |
+            | `entries.parent_ino` written | always 1 | the real parent |
+            | `blocks.ino` written | always 1 | the real inode |
+
+            Rows written by one path are not correctly visible through the
+            other, so the two cannot yet serve the same database.
+        """)
 
     def explanation(self):
-        return (
-            "DualInterfaceArchitecture decouples FUSE filesystem request dispatching from storage engine execution.\n"
-            "The Local Engine embeds processing directly inside PostgreSQL as a background worker, bypassing SQL parsing\n"
-            "and socket serialization for sub-100µs latency. The Remote Engine provides standard out-of-process networking\n"
-            "using async Rust (`tokio-postgres`), allowing pgfs to scale seamlessly across network hosts."
-        )
+        return md(r"""
+            ## Two very different places to run
+
+            pgfs is used in two settings with opposite constraints. On a
+            single machine, the database is local and the dominant costs
+            are the overheads around each query: building SQL text,
+            parsing and planning it, and copying bytes between the kernel,
+            the daemon and PostgreSQL. Over a network, a round-trip costs
+            far more than any of that, and what matters is sending fewer
+            of them: pipelining, batching and replicas.
+
+            One engine cannot be optimal for both. The dual-interface
+            design gives each its own engine behind one interface.
+
+            ## The local engine: no SQL on the hot path
+
+            The planned local engine runs inside PostgreSQL itself, as a
+            background worker written with `pgrx`. The FUSE daemon passes
+            it compact binary requests over a shared-memory queue, and the
+            worker executes pre-planned statements with binary parameters,
+            so no SQL text is formatted, parsed or planned per operation.
+            With `io_uring` buffer rings, file data could travel from the
+            kernel into memory the worker reads directly, without
+            intermediate copies. The target is operation latency under
+            100 µs.
+
+            ## The remote engine: fewer round-trips
+
+            The planned remote engine is an ordinary out-of-process client
+            built on `tokio-postgres`. It pipelines queries over each
+            connection, uses a connection pool, and reuses the replica
+            freshness cache from [Replicated
+            Storage](replicated_filesystem.md). It suits mounts where the
+            database is on another host.
+
+            ## Why a trait comes first
+
+            Both engines need the FUSE layer to stop speaking SQL-shaped
+            paths and start speaking inode-shaped operations. The
+            `PgfsBackend` trait is that contract. It also forces the error
+            model into the open: a backend reports `NotFound` or
+            `DatabaseError`, and one place decides which errno the kernel
+            sees. Building the trait and an inode-keyed implementation
+            first, with tests, makes the eventual switch-over a mechanical
+            change in `fs.rs` rather than a rewrite.
+
+            ## What stands in the way
+
+            The running FUSE path stores data keyed by path, with 64 KiB
+            blocks, and leaves the inode columns at their defaults. The
+            backend implementation expects real inode links and uses
+            128 KiB blocks. Moving the FUSE layer onto the trait therefore
+            also means migrating the schema
+            (`InoBasedRekeyingReq` in [Performance
+            Optimizations](optimizationroadmap.md)) and settling on one
+            block size.
+        """)
 
 
 class OptimizationRoadmap(Feat):
@@ -264,37 +481,285 @@ class OptimizationRoadmap(Feat):
     targeting database access latency, connection concurrency, userspace
     buffering, and FUSE kernel-transport tuning."""
 
-    def tutorial(self):
+    deps = [
+        ChunkedBlockStorageReq,
+        InoBasedRekeyingReq,
+        SparseWritePaddingReq,
+        ReplicaFreshnessCacheReq,
+        PreparedStatementReq,
+        SynchronousCommitTuningReq,
+        UnloggedTableOptReq,
+        TransactionBatchingReq,
+        MultiThreadedConnectionPoolReq,
+        BufferedWriteFlushReq,
+        KernelAttrCacheTtlReq,
+        KernelWritebackCacheReq,
+    ]
+
+    def title(self):
+        return "Performance Optimizations"
+
+    def status(self):
+        return PARTIAL
+
+    def status_note(self):
         return (
-            "In this tutorial, we will apply and benchmark key pgfs performance tuning options.\n"
-            "1. Start pgfs with kernel attribute caching enabled: `./target/release/pgfs --attr-ttl 5.0`.\n"
-            "2. Enable writeback caching in kernel VFS: `./target/release/pgfs --writeback-cache`.\n"
-            "3. Run `scripts/bench_profile.sh` to measure throughput across small-block write and read phases.\n"
-            "4. Observe latency histogram metrics printed in daemon logs to evaluate p50, p95, and p99 performance."
+            "Chunked blocks, prepared statements, asynchronous commit, "
+            "unlogged tables, per-handle write buffering, transaction "
+            "batching and the attribute-cache TTL are implemented. "
+            "Inode-keyed storage, the multi-threaded connection pool and "
+            "the kernel writeback cache are not. The Reference page has the "
+            "per-requirement status."
         )
+
+    def tutorial(self):
+        return md(r"""
+            In this tutorial we will mount pgfs on a scratch database with
+            two tuning options, `--unlogged` and `--attr-ttl`, and measure
+            how many requests the kernel sends with and without attribute
+            caching. We need the project-local cluster running
+            (`./scripts/ensure_db.sh`).
+
+            ## Step 1: create a scratch database and mount it
+
+            ```bash
+            createdb -h "$PWD/testdata" pgfs_tuning
+            mkdir -p /tmp/pgfs-tuning
+            ./target/debug/pgfs --conn "host=$PWD/testdata dbname=pgfs_tuning" \
+                --unlogged --attr-ttl 0 /tmp/pgfs-tuning 2> /tmp/pgfs-tuning.log &
+            sleep 1
+            ```
+
+            Because the database is new, `--unlogged` creates both tables
+            without write-ahead logging:
+
+            ```bash
+            psql -h "$PWD/testdata" -d pgfs_tuning -Atc \
+              "SELECT relname, relpersistence FROM pg_class WHERE relname IN ('entries', 'blocks')"
+            ```
+
+            ```text
+            entries|u
+            blocks|u
+            ```
+
+            ## Step 2: create some files
+
+            ```bash
+            mkdir -p /tmp/pgfs-tuning/tree/{a,b,c,d,e}
+            for d in a b c d e; do for i in $(seq 1 20); do echo x > /tmp/pgfs-tuning/tree/$d/f$i; done; done
+            ```
+
+            ## Step 3: count requests with no attribute cache
+
+            We use the state dump's `fuse total`, the number of FUSE
+            requests served so far. Take one reading, walk the tree three
+            times, and take another:
+
+            ```bash
+            PID=$(pgrep -f 'pgfs --conn.*pgfs_tuning')
+            dump() { kill -USR1 $PID; ls /tmp/pgfs-tuning > /dev/null; sleep 0.3;
+                     grep -o 'fuse_latency=fuse total=[0-9]*' /tmp/pgfs-tuning.log | tail -1; }
+            dump
+            for k in 1 2 3; do ls -lR /tmp/pgfs-tuning/tree > /dev/null; done
+            dump
+            ```
+
+            With `--attr-ttl 0` the second total is about 4,200 higher: the
+            kernel asked pgfs about every entry, every time.
+
+            ## Step 4: repeat with a 30-second cache
+
+            ```bash
+            kill -TERM $PID; sleep 1
+            ./target/debug/pgfs --conn "host=$PWD/testdata dbname=pgfs_tuning" \
+                --attr-ttl 30 /tmp/pgfs-tuning 2> /tmp/pgfs-tuning.log &
+            sleep 1
+            PID=$(pgrep -f 'pgfs --conn.*pgfs_tuning')
+            dump
+            for k in 1 2 3; do ls -lR /tmp/pgfs-tuning/tree > /dev/null; done
+            dump
+            ```
+
+            This time the difference is about 160. The first walk asked
+            pgfs; the next two were answered from the kernel's cache.
+
+            ## Step 5: clean up
+
+            ```bash
+            kill -TERM $PID; sleep 1
+            dropdb -h "$PWD/testdata" pgfs_tuning
+            rm -f /tmp/pgfs-tuning.log
+            ```
+
+            ## What we did
+
+            We created unlogged storage for a throwaway mount and cut the
+            requests for a metadata-heavy workload by more than 95% with
+            one flag. The [explanation](../explanation/optimizationroadmap.md)
+            covers what each option costs.
+        """)
 
     def how_to(self):
-        return (
-            "To tune pgfs performance for high IOPS workloads:\n"
-            "- Enable 64KB/128KB chunked block storage (`blocks(ino, block_no, data)`) to prevent full-file blob rewrites.\n"
-            "- Use prepared SQL statements (`PreparedStatementReq`) to eliminate query parsing overhead on hot paths.\n"
-            "- Enable synchronous commit tuning (`SET synchronous_commit = off`) to reduce WAL fsync wait times.\n"
-            "- Set `--attr-ttl <seconds>` to cache inode attributes in Linux VFS and avoid repetitive `getattr` round-trips."
-        )
+        return md(r"""
+            ## Cut metadata round-trips
+
+            Raise the kernel's attribute and entry cache lifetime:
+
+            ```bash
+            pgfs --attr-ttl 10 <mountpoint>
+            ```
+
+            Changes made through this mount are always visible to it.
+            Changes made by other writers (SQL, or another pgfs daemon on
+            the same database) can take up to the TTL to appear. Use `0`
+            when several writers share a database and must see each other
+            immediately.
+
+            ## Make a throwaway mount faster
+
+            Point pgfs at a new database and pass `--unlogged`:
+
+            ```bash
+            createdb -h "$PWD/testdata" scratch
+            pgfs --conn "host=$PWD/testdata dbname=scratch" --unlogged <mountpoint>
+            ```
+
+            `--unlogged` applies only when pgfs creates the tables. To
+            convert existing tables, unmount and run:
+
+            ```sql
+            ALTER TABLE entries SET UNLOGGED;
+            ALTER TABLE blocks SET UNLOGGED;
+            ```
+
+            Unlogged tables are emptied after a PostgreSQL crash and are
+            not replicated: do not combine them with `--replica`, whose
+            standby would see empty tables.
+
+            ## Write large files efficiently
+
+            Write through one open file and close it once. Every write on
+            an open handle is buffered, and closing commits all of it in
+            one transaction. Opening, writing and closing in a loop pays
+            for one transaction per iteration.
+
+            ## Get full commit durability
+
+            Not configurable. pgfs sets `synchronous_commit = off` on every
+            connection it opens, which overrides the server's default.
+
+            ## Measure the effect of a change
+
+            Compare `fuse total` from two SIGUSR1 state dumps around a
+            workload (see the tutorial), or the `metrics|latency` lines,
+            or run `./scripts/bench_profile.sh` (see [On-Demand
+            Profiling](ondemandprofiling.md)).
+        """)
 
     def reference(self):
-        return (
-            "OptimizationRoadmap Requirements & Parameters:\n"
-            "- Schema: Chunked block storage (`ChunkedBlockStorageReq`) + integer inode primary keys (`InoBasedRekeyingReq`).\n"
-            "- Database Tuning: `PreparedStatementReq`, `TransactionBatchingReq`, `SynchronousCommitTuningReq`, `UnloggedTableOptReq`.\n"
-            "- Transport Tuning: `KernelAttrCacheTtlReq` (`--attr-ttl`), `KernelWritebackCacheReq` (`FUSE_WRITEBACK_CACHE`), `BufferedWriteFlushReq`.\n"
-            "- Sparse Data Safety: `SparseWritePaddingReq` (pre-zero padding on uninstantiated block writes)."
-        )
+        return md(r"""
+            ## Command-line options
+
+            | Option | Default | Effect |
+            |---|---|---|
+            | `--attr-ttl <seconds>` | `1.0` | TTL attached to every attribute and entry reply; fractional values allowed |
+            | `--unlogged` | off | create `entries` and `blocks` as `UNLOGGED` tables; no effect on existing tables |
+
+            ## Built-in settings
+
+            | Setting | Value |
+            |---|---|
+            | Block size (FUSE path) | 65 536 bytes |
+            | `synchronous_commit` | `off`, set on every pooled connection |
+            | Connection pool | `r2d2`, max 10 per pool; the daemon holds 1 primary connection (plus 1 standby connection) for its lifetime |
+            | FUSE dispatch | single-threaded |
+            | Kernel capabilities requested | `FUSE_BIG_WRITES` |
+            | Replica freshness cache | 500 ms |
+            | Prepared on connect | `getattr`, `create`, `mkdir`, `unlink`, `rmdir`, `list`, `read_blocks`, `upsert_block`, `prune_blocks`, `delete_blocks`, and six inode-keyed statements |
+
+            Replica queries, `rename`, size updates and `rmdir`'s emptiness
+            check use unprepared SQL.
+
+            ## Requirement status
+
+            | Requirement | Status | Notes |
+            |---|---|---|
+            | `ChunkedBlockStorageReq` | implemented | 64 KiB blocks in `blocks(parent, name, block_no)` |
+            | `InoBasedRekeyingReq` | partial | `ino`/`parent_ino` columns and prepared statements exist; the FUSE path is still keyed by path and leaves them at their defaults |
+            | `SparseWritePaddingReq` | partial | unbuffered writes merge with the stored block; writes buffered on an open handle do not, see `BufferedWriteFlushReq` |
+            | `ReplicaFreshnessCacheReq` | implemented | 500 ms monotonic TTL |
+            | `PreparedStatementReq` | implemented | hot-path primary statements; see list above |
+            | `SynchronousCommitTuningReq` | implemented | always on; not configurable |
+            | `UnloggedTableOptReq` | implemented | `--unlogged` |
+            | `TransactionBatchingReq` | implemented | `write_range`, `truncate`, the buffered flush and `rename` are single transactions; `unlink` and `rmdir` are separate statements |
+            | `MultiThreadedConnectionPoolReq` | partial | the pool exists but one connection is used and dispatch is single-threaded; no `--max-pool-size` |
+            | `BufferedWriteFlushReq` | implemented | per open handle; flushed on `flush`, `fsync`, `release` and before a `read` of the same file; buffered blocks start empty rather than from the stored block |
+            | `KernelAttrCacheTtlReq` | implemented | `--attr-ttl` |
+            | `KernelWritebackCacheReq` | not implemented | only `FUSE_BIG_WRITES` is negotiated; no `--writeback-cache` |
+        """)
 
     def explanation(self):
-        return (
-            "OptimizationRoadmap addresses bottlenecks across all layers of the filesystem stack:\n"
-            "database schema design (integer inode keys, chunked block storage), transaction latency (batching, WAL tuning),\n"
-            "memory management (page-aligned dirty write buffering), and kernel VFS interaction (attribute TTL caching,\n"
-            "writeback cache coalescing). Together, these optimizations deliver near-native filesystem throughput."
-        )
+        return md(r"""
+            ## Where the time goes
+
+            Every filesystem call on a pgfs mount crosses two boundaries.
+            The kernel hands the request to the daemon through `/dev/fuse`,
+            and the daemon turns it into one or more PostgreSQL queries
+            over a socket. Each query pays for a round-trip, for parsing
+            and planning (unless prepared), and at commit time for flushing
+            the write-ahead log to disk. Optimising pgfs mostly means
+            removing round-trips, removing parsing, and deciding how much
+            durability each commit buys.
+
+            ## Storage layout
+
+            Storing files as 64 KiB blocks rather than one value per file
+            bounds the cost of a small write to one block, not the whole
+            file; see [Regular Files](../explanation/flat_filesystem.md).
+            Keying rows by path keeps them readable but makes directory
+            renames proportional to subtree size. The planned inode-keyed
+            layout trades that readability for constant-time renames.
+
+            ## Fewer, cheaper queries
+
+            Prepared statements move parsing and planning to connection
+            time. Wrapping multi-statement operations in one transaction
+            replaces several commits, each with its own WAL flush, by one.
+            Per-handle write buffering turns a stream of small writes into
+            one transaction at close.
+
+            ## Durability as a dial
+
+            A commit normally waits until its WAL record is on disk, which
+            on most storage is the slowest step of a small write. pgfs
+            turns that wait off (`synchronous_commit = off`). Transactions
+            stay atomic and the database stays consistent, but a
+            PostgreSQL crash can lose the last fraction of a second of
+            acknowledged commits. `--unlogged` goes further and skips WAL
+            entirely. It is fastest, but a crash empties the tables, and
+            unlogged tables do not replicate. Both are reasonable for
+            development and caches. Neither is right for data that exists
+            nowhere else.
+
+            ## Letting the kernel answer
+
+            Tools like `ls -l`, `find` and build systems ask for file
+            attributes far more often than files change. With an attribute
+            TTL, the kernel answers repeated questions from its own cache
+            for that long, and pgfs never sees them. The price is
+            staleness for changes made outside this mount, which is why
+            the TTL is a flag rather than a constant.
+
+            ## What is not done yet, and why
+
+            The connection pool exists, but FUSE dispatch in pgfs is
+            single-threaded and the filesystem object is mutated through
+            `&mut self`, so only one request is ever in flight. More
+            connections would not help until dispatch is concurrent. The
+            kernel's writeback cache would let the page cache merge small
+            writes before they reach pgfs, but it changes when and how
+            writes arrive (including writes from the kernel itself for
+            pages it caches), so it has to wait for the write path to
+            handle that correctly.
+        """)
