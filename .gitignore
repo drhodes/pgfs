@@ -30,5 +30,5 @@ __pycache__/
 # MkDocs build directory
 /site/
 
-
-
+# Papers whose copyright does not permit redistribution (see the README there)
+/design/papers/closed-papers/*.pdf
