@@ -11,10 +11,10 @@
         <link rel="canonical" href="https://drhodes.github.io/pgfs/tutorials/optimizationroadmap/">
       
       
-        <link rel="prev" href="../dualinterfacearchitecture/">
+        <link rel="prev" href="../replicated_filesystem/">
       
       
-        <link rel="next" href="../replicated_filesystem/">
+        <link rel="next" href="../kerneloffloadingacceleration/">
       
       
         
@@ -25,7 +25,7 @@
     
     
       
-        <title>Optimization Roadmap - pgfs — PostgreSQL-Backed FUSE Filesystem</title>
+        <title>Performance Optimizations - pgfs — PostgreSQL-Backed FUSE Filesystem</title>
       
     
     
@@ -76,7 +76,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#tutorial-performance-optimization-pipeline" class="md-skip">
+        <a href="#tutorial-performance-optimizations" class="md-skip">
           Skip to content
         </a>
       
@@ -110,7 +110,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              Optimization Roadmap
+              Performance Optimizations
             
           </span>
         </div>
@@ -246,7 +246,7 @@
     
     
       <li class="md-tabs__item md-tabs__item--active">
-        <a href="../flat_filesystem/" class="md-tabs__link">
+        <a href="../projectlocalenvironment/" class="md-tabs__link">
           
   
   
@@ -266,7 +266,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../how-to/flat_filesystem/" class="md-tabs__link">
+        <a href="../../how-to/projectlocalenvironment/" class="md-tabs__link">
           
   
   
@@ -286,7 +286,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../reference/flat_filesystem/" class="md-tabs__link">
+        <a href="../../reference/projectlocalenvironment/" class="md-tabs__link">
           
   
   
@@ -306,7 +306,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../explanation/flat_filesystem/" class="md-tabs__link">
+        <a href="../../explanation/projectlocalenvironment/" class="md-tabs__link">
           
   
   
@@ -454,6 +454,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../projectlocalenvironment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Project-Local Development Environment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../flat_filesystem/" class="md-nav__link">
         
   
@@ -461,7 +489,7 @@
   <span class="md-ellipsis">
     
   
-    POSIX Flat Filesystem
+    Regular Files
   
 
     
@@ -489,7 +517,7 @@
   <span class="md-ellipsis">
     
   
-    Hierarchical Directory Trees
+    Directory Trees
   
 
     
@@ -517,7 +545,7 @@
   <span class="md-ellipsis">
     
   
-    Atomic Renames
+    Atomic Rename
   
 
     
@@ -545,7 +573,7 @@
   <span class="md-ellipsis">
     
   
-    Reliable Mount
+    Reliable Mount & Shutdown
   
 
     
@@ -566,6 +594,231 @@
   
   
     <li class="md-nav__item">
+      <a href="../observabledaemon/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability & Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../ondemandprofiling/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    On-Demand Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../replicated_filesystem/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Replicated Storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Optimizations
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Optimizations
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#step-1-create-a-scratch-database-and-mount-it" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 1: create a scratch database and mount it
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-2-create-some-files" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 2: create some files
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-3-count-requests-with-no-attribute-cache" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 3: count requests with no attribute cache
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-4-repeat-with-a-30-second-cache" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 4: repeat with a 30-second cache
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-5-clean-up" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 5: clean up
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#what-we-did" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What we did
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../kerneloffloadingacceleration/" class="md-nav__link">
         
   
@@ -573,7 +826,7 @@
   <span class="md-ellipsis">
     
   
-    Kernel Offloading Acceleration
+    Kernel Offloading
   
 
     
@@ -619,55 +872,17 @@
                 
   
   
-    
-  
-  
-  
-    <li class="md-nav__item md-nav__item--active">
-      
-      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
-      
-      
-        
-      
-      
-      <a href="./" class="md-nav__link md-nav__link--active">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Optimization Roadmap
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-      
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
   
   
     <li class="md-nav__item">
-      <a href="../replicated_filesystem/" class="md-nav__link">
+      <a href="../sharded_filesystem/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Replicated Storage
+    Sharded Filesystem
   
 
     
@@ -747,6 +962,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../how-to/projectlocalenvironment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Project-Local Development Environment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../how-to/flat_filesystem/" class="md-nav__link">
         
   
@@ -754,7 +997,7 @@
   <span class="md-ellipsis">
     
   
-    POSIX Flat Filesystem
+    Regular Files
   
 
     
@@ -782,7 +1025,7 @@
   <span class="md-ellipsis">
     
   
-    Hierarchical Directory Trees
+    Directory Trees
   
 
     
@@ -810,7 +1053,7 @@
   <span class="md-ellipsis">
     
   
-    Atomic Renames
+    Atomic Rename
   
 
     
@@ -838,7 +1081,119 @@
   <span class="md-ellipsis">
     
   
-    Reliable Mount
+    Reliable Mount & Shutdown
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/observabledaemon/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability & Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/ondemandprofiling/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    On-Demand Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/replicated_filesystem/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Replicated Storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/optimizationroadmap/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Optimizations
   
 
     
@@ -866,7 +1221,7 @@
   <span class="md-ellipsis">
     
   
-    Kernel Offloading Acceleration
+    Kernel Offloading
   
 
     
@@ -915,42 +1270,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../../how-to/optimizationroadmap/" class="md-nav__link">
+      <a href="../../how-to/sharded_filesystem/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Optimization Roadmap
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../how-to/replicated_filesystem/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Replicated Storage
+    Sharded Filesystem
   
 
     
@@ -1030,6 +1357,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../reference/projectlocalenvironment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Project-Local Development Environment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../reference/flat_filesystem/" class="md-nav__link">
         
   
@@ -1037,7 +1392,7 @@
   <span class="md-ellipsis">
     
   
-    POSIX Flat Filesystem
+    Regular Files
   
 
     
@@ -1065,7 +1420,7 @@
   <span class="md-ellipsis">
     
   
-    Hierarchical Directory Trees
+    Directory Trees
   
 
     
@@ -1093,7 +1448,7 @@
   <span class="md-ellipsis">
     
   
-    Atomic Renames
+    Atomic Rename
   
 
     
@@ -1121,7 +1476,119 @@
   <span class="md-ellipsis">
     
   
-    Reliable Mount
+    Reliable Mount & Shutdown
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/observabledaemon/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability & Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/ondemandprofiling/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    On-Demand Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/replicated_filesystem/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Replicated Storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/optimizationroadmap/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Optimizations
   
 
     
@@ -1149,7 +1616,7 @@
   <span class="md-ellipsis">
     
   
-    Kernel Offloading Acceleration
+    Kernel Offloading
   
 
     
@@ -1198,42 +1665,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../../reference/optimizationroadmap/" class="md-nav__link">
+      <a href="../../reference/sharded_filesystem/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Optimization Roadmap
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../reference/replicated_filesystem/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Replicated Storage
+    Sharded Filesystem
   
 
     
@@ -1313,6 +1752,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../explanation/projectlocalenvironment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Project-Local Development Environment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../explanation/flat_filesystem/" class="md-nav__link">
         
   
@@ -1320,7 +1787,7 @@
   <span class="md-ellipsis">
     
   
-    POSIX Flat Filesystem
+    Regular Files
   
 
     
@@ -1348,7 +1815,7 @@
   <span class="md-ellipsis">
     
   
-    Hierarchical Directory Trees
+    Directory Trees
   
 
     
@@ -1376,7 +1843,7 @@
   <span class="md-ellipsis">
     
   
-    Atomic Renames
+    Atomic Rename
   
 
     
@@ -1404,7 +1871,119 @@
   <span class="md-ellipsis">
     
   
-    Reliable Mount
+    Reliable Mount & Shutdown
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/observabledaemon/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability & Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/ondemandprofiling/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    On-Demand Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/replicated_filesystem/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Replicated Storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/optimizationroadmap/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Optimizations
   
 
     
@@ -1432,7 +2011,7 @@
   <span class="md-ellipsis">
     
   
-    Kernel Offloading Acceleration
+    Kernel Offloading
   
 
     
@@ -1481,42 +2060,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../../explanation/optimizationroadmap/" class="md-nav__link">
+      <a href="../../explanation/sharded_filesystem/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Optimization Roadmap
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../explanation/replicated_filesystem/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Replicated Storage
+    Sharded Filesystem
   
 
     
@@ -1557,6 +2108,80 @@
     
   
   
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#step-1-create-a-scratch-database-and-mount-it" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 1: create a scratch database and mount it
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-2-create-some-files" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 2: create some files
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-3-count-requests-with-no-attribute-cache" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 3: count requests with no attribute cache
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-4-repeat-with-a-30-second-cache" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 4: repeat with a 30-second cache
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-5-clean-up" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 5: clean up
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#what-we-did" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What we did
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
 </nav>
                   </div>
                 </div>
@@ -1575,19 +2200,77 @@
   
 
 
-<h1 id="tutorial-performance-optimization-pipeline">Tutorial: Performance Optimization Pipeline</h1>
-<p><strong>Feature</strong>: <code>spec.optimize.OptimizationRoadmap</code></p>
+<h1 id="tutorial-performance-optimizations">Tutorial: Performance Optimizations<a class="headerlink" href="#tutorial-performance-optimizations" title="Permanent link">&para;</a></h1>
+<div class="admonition warning">
+<p class="admonition-title">Status: Partially implemented</p>
+<p>Chunked blocks, prepared statements, asynchronous commit, unlogged tables, per-handle write buffering, transaction batching and the attribute-cache TTL are implemented. Inode-keyed storage, the multi-threaded connection pool and the kernel writeback cache are not. The Reference page has the per-requirement status.</p>
+</div>
 <blockquote>
-<p>pgfs incorporates a structured performance optimization pipeline
-targeting database access latency, connection concurrency, userspace
-buffering, and FUSE kernel-transport tuning.</p>
+<p>pgfs incorporates a structured performance optimization pipeline targeting database access latency, connection concurrency, userspace buffering, and FUSE kernel-transport tuning.</p>
 </blockquote>
+<p><strong>Tutorial</strong> · <a href="../../how-to/optimizationroadmap/">How-to</a> · <a href="../../reference/optimizationroadmap/">Reference</a> · <a href="../../explanation/optimizationroadmap/">Explanation</a></p>
 <hr />
-<p>In this tutorial, we will apply and benchmark key pgfs performance tuning options.
-1. Start pgfs with kernel attribute caching enabled: <code>./target/release/pgfs --attr-ttl 5.0</code>.
-2. Enable writeback caching in kernel VFS: <code>./target/release/pgfs --writeback-cache</code>.
-3. Run <code>scripts/bench_profile.sh</code> to measure throughput across small-block write and read phases.
-4. Observe latency histogram metrics printed in daemon logs to evaluate p50, p95, and p99 performance.</p>
+<p>In this tutorial we will mount pgfs on a scratch database with
+two tuning options, <code>--unlogged</code> and <code>--attr-ttl</code>, and measure
+how many requests the kernel sends with and without attribute
+caching. We need the project-local cluster running
+(<code>./scripts/ensure_db.sh</code>).</p>
+<h2 id="step-1-create-a-scratch-database-and-mount-it">Step 1: create a scratch database and mount it<a class="headerlink" href="#step-1-create-a-scratch-database-and-mount-it" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code>createdb<span class="w"> </span>-h<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PWD</span><span class="s2">/testdata&quot;</span><span class="w"> </span>pgfs_tuning
+mkdir<span class="w"> </span>-p<span class="w"> </span>/tmp/pgfs-tuning
+./target/debug/pgfs<span class="w"> </span>--conn<span class="w"> </span><span class="s2">&quot;host=</span><span class="nv">$PWD</span><span class="s2">/testdata dbname=pgfs_tuning&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--unlogged<span class="w"> </span>--attr-ttl<span class="w"> </span><span class="m">0</span><span class="w"> </span>/tmp/pgfs-tuning<span class="w"> </span><span class="m">2</span>&gt;<span class="w"> </span>/tmp/pgfs-tuning.log<span class="w"> </span><span class="p">&amp;</span>
+sleep<span class="w"> </span><span class="m">1</span>
+</code></pre></div>
+<p>Because the database is new, <code>--unlogged</code> creates both tables
+without write-ahead logging:</p>
+<div class="highlight"><pre><span></span><code>psql<span class="w"> </span>-h<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PWD</span><span class="s2">/testdata&quot;</span><span class="w"> </span>-d<span class="w"> </span>pgfs_tuning<span class="w"> </span>-Atc<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">&quot;SELECT relname, relpersistence FROM pg_class WHERE relname IN (&#39;entries&#39;, &#39;blocks&#39;)&quot;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>entries|u
+blocks|u
+</code></pre></div>
+<h2 id="step-2-create-some-files">Step 2: create some files<a class="headerlink" href="#step-2-create-some-files" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code>mkdir<span class="w"> </span>-p<span class="w"> </span>/tmp/pgfs-tuning/tree/<span class="o">{</span>a,b,c,d,e<span class="o">}</span>
+<span class="k">for</span><span class="w"> </span>d<span class="w"> </span><span class="k">in</span><span class="w"> </span>a<span class="w"> </span>b<span class="w"> </span>c<span class="w"> </span>d<span class="w"> </span>e<span class="p">;</span><span class="w"> </span><span class="k">do</span><span class="w"> </span><span class="k">for</span><span class="w"> </span>i<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="k">$(</span>seq<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="m">20</span><span class="k">)</span><span class="p">;</span><span class="w"> </span><span class="k">do</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span>x<span class="w"> </span>&gt;<span class="w"> </span>/tmp/pgfs-tuning/tree/<span class="nv">$d</span>/f<span class="nv">$i</span><span class="p">;</span><span class="w"> </span><span class="k">done</span><span class="p">;</span><span class="w"> </span><span class="k">done</span>
+</code></pre></div>
+<h2 id="step-3-count-requests-with-no-attribute-cache">Step 3: count requests with no attribute cache<a class="headerlink" href="#step-3-count-requests-with-no-attribute-cache" title="Permanent link">&para;</a></h2>
+<p>We use the state dump's <code>fuse total</code>, the number of FUSE
+requests served so far. Take one reading, walk the tree three
+times, and take another:</p>
+<div class="highlight"><pre><span></span><code><span class="nv">PID</span><span class="o">=</span><span class="k">$(</span>pgrep<span class="w"> </span>-f<span class="w"> </span><span class="s1">&#39;pgfs --conn.*pgfs_tuning&#39;</span><span class="k">)</span>
+dump<span class="o">()</span><span class="w"> </span><span class="o">{</span><span class="w"> </span><span class="nb">kill</span><span class="w"> </span>-USR1<span class="w"> </span><span class="nv">$PID</span><span class="p">;</span><span class="w"> </span>ls<span class="w"> </span>/tmp/pgfs-tuning<span class="w"> </span>&gt;<span class="w"> </span>/dev/null<span class="p">;</span><span class="w"> </span>sleep<span class="w"> </span><span class="m">0</span>.3<span class="p">;</span>
+<span class="w">         </span>grep<span class="w"> </span>-o<span class="w"> </span><span class="s1">&#39;fuse_latency=fuse total=[0-9]*&#39;</span><span class="w"> </span>/tmp/pgfs-tuning.log<span class="w"> </span><span class="p">|</span><span class="w"> </span>tail<span class="w"> </span>-1<span class="p">;</span><span class="w"> </span><span class="o">}</span>
+dump
+<span class="k">for</span><span class="w"> </span>k<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="m">2</span><span class="w"> </span><span class="m">3</span><span class="p">;</span><span class="w"> </span><span class="k">do</span><span class="w"> </span>ls<span class="w"> </span>-lR<span class="w"> </span>/tmp/pgfs-tuning/tree<span class="w"> </span>&gt;<span class="w"> </span>/dev/null<span class="p">;</span><span class="w"> </span><span class="k">done</span>
+dump
+</code></pre></div>
+<p>With <code>--attr-ttl 0</code> the second total is about 4,200 higher: the
+kernel asked pgfs about every entry, every time.</p>
+<h2 id="step-4-repeat-with-a-30-second-cache">Step 4: repeat with a 30-second cache<a class="headerlink" href="#step-4-repeat-with-a-30-second-cache" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><span class="nb">kill</span><span class="w"> </span>-TERM<span class="w"> </span><span class="nv">$PID</span><span class="p">;</span><span class="w"> </span>sleep<span class="w"> </span><span class="m">1</span>
+./target/debug/pgfs<span class="w"> </span>--conn<span class="w"> </span><span class="s2">&quot;host=</span><span class="nv">$PWD</span><span class="s2">/testdata dbname=pgfs_tuning&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--attr-ttl<span class="w"> </span><span class="m">30</span><span class="w"> </span>/tmp/pgfs-tuning<span class="w"> </span><span class="m">2</span>&gt;<span class="w"> </span>/tmp/pgfs-tuning.log<span class="w"> </span><span class="p">&amp;</span>
+sleep<span class="w"> </span><span class="m">1</span>
+<span class="nv">PID</span><span class="o">=</span><span class="k">$(</span>pgrep<span class="w"> </span>-f<span class="w"> </span><span class="s1">&#39;pgfs --conn.*pgfs_tuning&#39;</span><span class="k">)</span>
+dump
+<span class="k">for</span><span class="w"> </span>k<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="m">2</span><span class="w"> </span><span class="m">3</span><span class="p">;</span><span class="w"> </span><span class="k">do</span><span class="w"> </span>ls<span class="w"> </span>-lR<span class="w"> </span>/tmp/pgfs-tuning/tree<span class="w"> </span>&gt;<span class="w"> </span>/dev/null<span class="p">;</span><span class="w"> </span><span class="k">done</span>
+dump
+</code></pre></div>
+<p>This time the difference is about 160. The first walk asked
+pgfs; the next two were answered from the kernel's cache.</p>
+<h2 id="step-5-clean-up">Step 5: clean up<a class="headerlink" href="#step-5-clean-up" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><span class="nb">kill</span><span class="w"> </span>-TERM<span class="w"> </span><span class="nv">$PID</span><span class="p">;</span><span class="w"> </span>sleep<span class="w"> </span><span class="m">1</span>
+dropdb<span class="w"> </span>-h<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PWD</span><span class="s2">/testdata&quot;</span><span class="w"> </span>pgfs_tuning
+rm<span class="w"> </span>-f<span class="w"> </span>/tmp/pgfs-tuning.log
+</code></pre></div>
+<h2 id="what-we-did">What we did<a class="headerlink" href="#what-we-did" title="Permanent link">&para;</a></h2>
+<p>We created unlogged storage for a throwaway mount and cut the
+requests for a metadata-heavy workload by more than 95% with
+one flag. The <a href="../../explanation/optimizationroadmap/">explanation</a>
+covers what each option costs.</p>
+<hr />
+<p><small>Generated from <code>spec.optimize.OptimizationRoadmap</code> by <code>scripts/build_docs.py</code>. Edit the specification, not this page.</small></p>
 
 
 

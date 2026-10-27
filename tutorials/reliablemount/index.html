@@ -14,7 +14,7 @@
         <link rel="prev" href="../atomicrename/">
       
       
-        <link rel="next" href="../kerneloffloadingacceleration/">
+        <link rel="next" href="../observabledaemon/">
       
       
         
@@ -25,7 +25,7 @@
     
     
       
-        <title>Reliable Mount - pgfs — PostgreSQL-Backed FUSE Filesystem</title>
+        <title>Reliable Mount & Shutdown - pgfs — PostgreSQL-Backed FUSE Filesystem</title>
       
     
     
@@ -76,7 +76,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#tutorial-reliable-mount-lifecycle-management" class="md-skip">
+        <a href="#tutorial-reliable-mount-shutdown" class="md-skip">
           Skip to content
         </a>
       
@@ -110,7 +110,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              Reliable Mount
+              Reliable Mount & Shutdown
             
           </span>
         </div>
@@ -246,7 +246,7 @@
     
     
       <li class="md-tabs__item md-tabs__item--active">
-        <a href="../flat_filesystem/" class="md-tabs__link">
+        <a href="../projectlocalenvironment/" class="md-tabs__link">
           
   
   
@@ -266,7 +266,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../how-to/flat_filesystem/" class="md-tabs__link">
+        <a href="../../how-to/projectlocalenvironment/" class="md-tabs__link">
           
   
   
@@ -286,7 +286,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../reference/flat_filesystem/" class="md-tabs__link">
+        <a href="../../reference/projectlocalenvironment/" class="md-tabs__link">
           
   
   
@@ -306,7 +306,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../explanation/flat_filesystem/" class="md-tabs__link">
+        <a href="../../explanation/projectlocalenvironment/" class="md-tabs__link">
           
   
   
@@ -454,6 +454,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../projectlocalenvironment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Project-Local Development Environment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../flat_filesystem/" class="md-nav__link">
         
   
@@ -461,7 +489,7 @@
   <span class="md-ellipsis">
     
   
-    POSIX Flat Filesystem
+    Regular Files
   
 
     
@@ -489,7 +517,7 @@
   <span class="md-ellipsis">
     
   
-    Hierarchical Directory Trees
+    Directory Trees
   
 
     
@@ -517,7 +545,7 @@
   <span class="md-ellipsis">
     
   
-    Atomic Renames
+    Atomic Rename
   
 
     
@@ -547,6 +575,24 @@
         
       
       
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Reliable Mount & Shutdown
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
       <a href="./" class="md-nav__link md-nav__link--active">
         
   
@@ -554,7 +600,7 @@
   <span class="md-ellipsis">
     
   
-    Reliable Mount
+    Reliable Mount & Shutdown
   
 
     
@@ -564,6 +610,192 @@
 
       </a>
       
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#step-1-start-the-daemon-and-find-its-health-files" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 1: start the daemon and find its health files
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-2-stop-it-politely" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 2: stop it politely
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-3-kill-it-without-warning" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 3: kill it without warning
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-4-confirm-the-state-is-clean" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 4: confirm the state is clean
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#what-we-did" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What we did
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../observabledaemon/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability & Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../ondemandprofiling/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    On-Demand Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../replicated_filesystem/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Replicated Storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../optimizationroadmap/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Optimizations
+  
+
+    
+  </span>
+  
+  
+
+      </a>
     </li>
   
 
@@ -583,7 +815,7 @@
   <span class="md-ellipsis">
     
   
-    Kernel Offloading Acceleration
+    Kernel Offloading
   
 
     
@@ -632,42 +864,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../optimizationroadmap/" class="md-nav__link">
+      <a href="../sharded_filesystem/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Optimization Roadmap
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../replicated_filesystem/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Replicated Storage
+    Sharded Filesystem
   
 
     
@@ -747,6 +951,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../how-to/projectlocalenvironment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Project-Local Development Environment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../how-to/flat_filesystem/" class="md-nav__link">
         
   
@@ -754,7 +986,7 @@
   <span class="md-ellipsis">
     
   
-    POSIX Flat Filesystem
+    Regular Files
   
 
     
@@ -782,7 +1014,7 @@
   <span class="md-ellipsis">
     
   
-    Hierarchical Directory Trees
+    Directory Trees
   
 
     
@@ -810,7 +1042,7 @@
   <span class="md-ellipsis">
     
   
-    Atomic Renames
+    Atomic Rename
   
 
     
@@ -838,7 +1070,119 @@
   <span class="md-ellipsis">
     
   
-    Reliable Mount
+    Reliable Mount & Shutdown
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/observabledaemon/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability & Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/ondemandprofiling/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    On-Demand Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/replicated_filesystem/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Replicated Storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/optimizationroadmap/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Optimizations
   
 
     
@@ -866,7 +1210,7 @@
   <span class="md-ellipsis">
     
   
-    Kernel Offloading Acceleration
+    Kernel Offloading
   
 
     
@@ -915,42 +1259,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../../how-to/optimizationroadmap/" class="md-nav__link">
+      <a href="../../how-to/sharded_filesystem/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Optimization Roadmap
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../how-to/replicated_filesystem/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Replicated Storage
+    Sharded Filesystem
   
 
     
@@ -1030,6 +1346,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../reference/projectlocalenvironment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Project-Local Development Environment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../reference/flat_filesystem/" class="md-nav__link">
         
   
@@ -1037,7 +1381,7 @@
   <span class="md-ellipsis">
     
   
-    POSIX Flat Filesystem
+    Regular Files
   
 
     
@@ -1065,7 +1409,7 @@
   <span class="md-ellipsis">
     
   
-    Hierarchical Directory Trees
+    Directory Trees
   
 
     
@@ -1093,7 +1437,7 @@
   <span class="md-ellipsis">
     
   
-    Atomic Renames
+    Atomic Rename
   
 
     
@@ -1121,7 +1465,119 @@
   <span class="md-ellipsis">
     
   
-    Reliable Mount
+    Reliable Mount & Shutdown
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/observabledaemon/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability & Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/ondemandprofiling/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    On-Demand Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/replicated_filesystem/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Replicated Storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/optimizationroadmap/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Optimizations
   
 
     
@@ -1149,7 +1605,7 @@
   <span class="md-ellipsis">
     
   
-    Kernel Offloading Acceleration
+    Kernel Offloading
   
 
     
@@ -1198,42 +1654,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../../reference/optimizationroadmap/" class="md-nav__link">
+      <a href="../../reference/sharded_filesystem/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Optimization Roadmap
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../reference/replicated_filesystem/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Replicated Storage
+    Sharded Filesystem
   
 
     
@@ -1313,6 +1741,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../explanation/projectlocalenvironment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Project-Local Development Environment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../explanation/flat_filesystem/" class="md-nav__link">
         
   
@@ -1320,7 +1776,7 @@
   <span class="md-ellipsis">
     
   
-    POSIX Flat Filesystem
+    Regular Files
   
 
     
@@ -1348,7 +1804,7 @@
   <span class="md-ellipsis">
     
   
-    Hierarchical Directory Trees
+    Directory Trees
   
 
     
@@ -1376,7 +1832,7 @@
   <span class="md-ellipsis">
     
   
-    Atomic Renames
+    Atomic Rename
   
 
     
@@ -1404,7 +1860,119 @@
   <span class="md-ellipsis">
     
   
-    Reliable Mount
+    Reliable Mount & Shutdown
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/observabledaemon/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability & Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/ondemandprofiling/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    On-Demand Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/replicated_filesystem/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Replicated Storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/optimizationroadmap/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Optimizations
   
 
     
@@ -1432,7 +2000,7 @@
   <span class="md-ellipsis">
     
   
-    Kernel Offloading Acceleration
+    Kernel Offloading
   
 
     
@@ -1481,42 +2049,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../../explanation/optimizationroadmap/" class="md-nav__link">
+      <a href="../../explanation/sharded_filesystem/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Optimization Roadmap
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../explanation/replicated_filesystem/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Replicated Storage
+    Sharded Filesystem
   
 
     
@@ -1557,6 +2097,69 @@
     
   
   
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#step-1-start-the-daemon-and-find-its-health-files" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 1: start the daemon and find its health files
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-2-stop-it-politely" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 2: stop it politely
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-3-kill-it-without-warning" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 3: kill it without warning
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-4-confirm-the-state-is-clean" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 4: confirm the state is clean
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#what-we-did" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What we did
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
 </nav>
                   </div>
                 </div>
@@ -1575,18 +2178,71 @@
   
 
 
-<h1 id="tutorial-reliable-mount-lifecycle-management">Tutorial: Reliable Mount &amp; Lifecycle Management</h1>
-<p><strong>Feature</strong>: <code>spec.app.ReliableMount</code></p>
+<h1 id="tutorial-reliable-mount-shutdown">Tutorial: Reliable Mount &amp; Shutdown<a class="headerlink" href="#tutorial-reliable-mount-shutdown" title="Permanent link">&para;</a></h1>
+<div class="admonition success">
+<p class="admonition-title">Status: Stable</p>
+<p>AutoUnmount, signal-driven clean unmount, the deadlock watchdog, health files and the <code>pgfs.sh</code> escalation path are all implemented.</p>
+</div>
 <blockquote>
-<p>The filesystem mounts and unmounts cleanly. Crashing or killing
-the daemon never leaves a ghost mount behind.</p>
+<p>The filesystem mounts and unmounts cleanly. Crashing or killing the daemon never leaves a ghost mount behind.</p>
 </blockquote>
+<p><strong>Tutorial</strong> · <a href="../../how-to/reliablemount/">How-to</a> · <a href="../../reference/reliablemount/">Reference</a> · <a href="../../explanation/reliablemount/">Explanation</a></p>
 <hr />
-<p>In this tutorial, we will verify clean daemon mount and shutdown behavior.
-1. Mount pgfs using <code>scripts/pgfs.sh up</code>.
-2. Verify mount point status via <code>scripts/pgfs.sh status</code> and check PID file at <code>/tmp/pgfs-*.pid</code>.
-3. Send SIGINT to the daemon process or run <code>scripts/pgfs.sh down</code>.
-4. Verify the mountpoint is cleanly unmounted and no stale daemon processes remain.</p>
+<p>In this tutorial we will start pgfs, find its health files,
+stop it politely, then kill it without warning and see that
+the mount still disappears. Along the way we will see the three
+layers that keep a mount from becoming a ghost.</p>
+<h2 id="step-1-start-the-daemon-and-find-its-health-files">Step 1: start the daemon and find its health files<a class="headerlink" href="#step-1-start-the-daemon-and-find-its-health-files" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code>./scripts/pgfs.sh<span class="w"> </span>up
+grep<span class="w"> </span><span class="s1">&#39;health pid file&#39;</span><span class="w"> </span>testdata/pgfs.log<span class="w"> </span><span class="p">|</span><span class="w"> </span>tail<span class="w"> </span>-1
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>health pid file: /tmp/pgfs-5049eced64c2821d.pid
+</code></pre></div>
+<p>The hash in the name is derived from the mount point. Next to
+the PID file is a readiness file:</p>
+<div class="highlight"><pre><span></span><code>ls<span class="w"> </span>/tmp/pgfs-*.pid<span class="w"> </span>/tmp/pgfs-*.ready
+cat<span class="w"> </span>/tmp/pgfs-*.pid
+</code></pre></div>
+<p>The PID it contains matches <code>./scripts/pgfs.sh status</code>.</p>
+<h2 id="step-2-stop-it-politely">Step 2: stop it politely<a class="headerlink" href="#step-2-stop-it-politely" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code>./scripts/pgfs.sh<span class="w"> </span>down
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>pgfs:      stopping (pid 1519591)
+unmounted:  /path/to/pgfs/testdata/mnt
+</code></pre></div>
+<p>The script sent SIGTERM. The daemon unmounted itself, removed
+its health files and exited:</p>
+<div class="highlight"><pre><span></span><code>grep<span class="w"> </span><span class="s1">&#39;received signal&#39;</span><span class="w"> </span>testdata/pgfs.log<span class="w"> </span><span class="p">|</span><span class="w"> </span>tail<span class="w"> </span>-1
+ls<span class="w"> </span>/tmp/pgfs-*.pid<span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;no health files&quot;</span>
+</code></pre></div>
+<h2 id="step-3-kill-it-without-warning">Step 3: kill it without warning<a class="headerlink" href="#step-3-kill-it-without-warning" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code>./scripts/pgfs.sh<span class="w"> </span>up
+<span class="nb">kill</span><span class="w"> </span>-9<span class="w"> </span><span class="s2">&quot;</span><span class="k">$(</span>cat<span class="w"> </span>testdata/pgfs.pid<span class="k">)</span><span class="s2">&quot;</span>
+sleep<span class="w"> </span><span class="m">1</span>
+grep<span class="w"> </span>testdata/mnt<span class="w"> </span>/proc/mounts<span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;mount is gone&quot;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>mount is gone
+</code></pre></div>
+<p>SIGKILL cannot be caught, so the daemon got no chance to clean
+up. The kernel removed the mount anyway, because pgfs asked for
+AutoUnmount when it mounted.</p>
+<h2 id="step-4-confirm-the-state-is-clean">Step 4: confirm the state is clean<a class="headerlink" href="#step-4-confirm-the-state-is-clean" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code>./scripts/pgfs.sh<span class="w"> </span>status
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>mount:     none
+daemon:    not running
+postgres:  running
+</code></pre></div>
+<p>Because the daemon was killed, its <code>/tmp</code> health files are
+still there. They are harmless and are overwritten on the next
+start.</p>
+<h2 id="what-we-did">What we did<a class="headerlink" href="#what-we-did" title="Permanent link">&para;</a></h2>
+<p>We saw a clean, signal-driven shutdown and an uncatchable kill,
+and both ended with no mount left behind. The
+<a href="../../explanation/reliablemount/">explanation</a> describes why
+each layer exists.</p>
+<hr />
+<p><small>Generated from <code>spec.app.ReliableMount</code> by <code>scripts/build_docs.py</code>. Edit the specification, not this page.</small></p>
 
 
 

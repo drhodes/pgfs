@@ -11,10 +11,10 @@
         <link rel="canonical" href="https://drhodes.github.io/pgfs/reference/optimizationroadmap/">
       
       
-        <link rel="prev" href="../dualinterfacearchitecture/">
+        <link rel="prev" href="../replicated_filesystem/">
       
       
-        <link rel="next" href="../replicated_filesystem/">
+        <link rel="next" href="../kerneloffloadingacceleration/">
       
       
         
@@ -25,7 +25,7 @@
     
     
       
-        <title>Optimization Roadmap - pgfs — PostgreSQL-Backed FUSE Filesystem</title>
+        <title>Performance Optimizations - pgfs — PostgreSQL-Backed FUSE Filesystem</title>
       
     
     
@@ -76,7 +76,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#reference-performance-optimization-pipeline" class="md-skip">
+        <a href="#reference-performance-optimizations" class="md-skip">
           Skip to content
         </a>
       
@@ -110,7 +110,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              Optimization Roadmap
+              Performance Optimizations
             
           </span>
         </div>
@@ -244,7 +244,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../tutorials/flat_filesystem/" class="md-tabs__link">
+        <a href="../../tutorials/projectlocalenvironment/" class="md-tabs__link">
           
   
   
@@ -264,7 +264,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../how-to/flat_filesystem/" class="md-tabs__link">
+        <a href="../../how-to/projectlocalenvironment/" class="md-tabs__link">
           
   
   
@@ -286,7 +286,7 @@
     
     
       <li class="md-tabs__item md-tabs__item--active">
-        <a href="../flat_filesystem/" class="md-tabs__link">
+        <a href="../projectlocalenvironment/" class="md-tabs__link">
           
   
   
@@ -306,7 +306,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../explanation/flat_filesystem/" class="md-tabs__link">
+        <a href="../../explanation/projectlocalenvironment/" class="md-tabs__link">
           
   
   
@@ -449,6 +449,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../tutorials/projectlocalenvironment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Project-Local Development Environment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../tutorials/flat_filesystem/" class="md-nav__link">
         
   
@@ -456,7 +484,7 @@
   <span class="md-ellipsis">
     
   
-    POSIX Flat Filesystem
+    Regular Files
   
 
     
@@ -484,7 +512,7 @@
   <span class="md-ellipsis">
     
   
-    Hierarchical Directory Trees
+    Directory Trees
   
 
     
@@ -512,7 +540,7 @@
   <span class="md-ellipsis">
     
   
-    Atomic Renames
+    Atomic Rename
   
 
     
@@ -540,7 +568,119 @@
   <span class="md-ellipsis">
     
   
-    Reliable Mount
+    Reliable Mount & Shutdown
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../tutorials/observabledaemon/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability & Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../tutorials/ondemandprofiling/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    On-Demand Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../tutorials/replicated_filesystem/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Replicated Storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../tutorials/optimizationroadmap/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Optimizations
   
 
     
@@ -568,7 +708,7 @@
   <span class="md-ellipsis">
     
   
-    Kernel Offloading Acceleration
+    Kernel Offloading
   
 
     
@@ -617,42 +757,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../../tutorials/optimizationroadmap/" class="md-nav__link">
+      <a href="../../tutorials/sharded_filesystem/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Optimization Roadmap
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../tutorials/replicated_filesystem/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Replicated Storage
+    Sharded Filesystem
   
 
     
@@ -732,6 +844,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../how-to/projectlocalenvironment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Project-Local Development Environment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../how-to/flat_filesystem/" class="md-nav__link">
         
   
@@ -739,7 +879,7 @@
   <span class="md-ellipsis">
     
   
-    POSIX Flat Filesystem
+    Regular Files
   
 
     
@@ -767,7 +907,7 @@
   <span class="md-ellipsis">
     
   
-    Hierarchical Directory Trees
+    Directory Trees
   
 
     
@@ -795,7 +935,7 @@
   <span class="md-ellipsis">
     
   
-    Atomic Renames
+    Atomic Rename
   
 
     
@@ -823,7 +963,119 @@
   <span class="md-ellipsis">
     
   
-    Reliable Mount
+    Reliable Mount & Shutdown
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/observabledaemon/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability & Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/ondemandprofiling/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    On-Demand Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/replicated_filesystem/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Replicated Storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/optimizationroadmap/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Optimizations
   
 
     
@@ -851,7 +1103,7 @@
   <span class="md-ellipsis">
     
   
-    Kernel Offloading Acceleration
+    Kernel Offloading
   
 
     
@@ -900,42 +1152,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../../how-to/optimizationroadmap/" class="md-nav__link">
+      <a href="../../how-to/sharded_filesystem/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Optimization Roadmap
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../how-to/replicated_filesystem/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Replicated Storage
+    Sharded Filesystem
   
 
     
@@ -1020,6 +1244,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../projectlocalenvironment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Project-Local Development Environment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../flat_filesystem/" class="md-nav__link">
         
   
@@ -1027,7 +1279,7 @@
   <span class="md-ellipsis">
     
   
-    POSIX Flat Filesystem
+    Regular Files
   
 
     
@@ -1055,7 +1307,7 @@
   <span class="md-ellipsis">
     
   
-    Hierarchical Directory Trees
+    Directory Trees
   
 
     
@@ -1083,7 +1335,7 @@
   <span class="md-ellipsis">
     
   
-    Atomic Renames
+    Atomic Rename
   
 
     
@@ -1111,7 +1363,7 @@
   <span class="md-ellipsis">
     
   
-    Reliable Mount
+    Reliable Mount & Shutdown
   
 
     
@@ -1132,6 +1384,209 @@
   
   
     <li class="md-nav__item">
+      <a href="../observabledaemon/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability & Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../ondemandprofiling/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    On-Demand Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../replicated_filesystem/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Replicated Storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Optimizations
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Optimizations
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#command-line-options" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Command-line options
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#built-in-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Built-in settings
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#requirement-status" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Requirement status
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#specification-requirements" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Specification requirements
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../kerneloffloadingacceleration/" class="md-nav__link">
         
   
@@ -1139,7 +1594,7 @@
   <span class="md-ellipsis">
     
   
-    Kernel Offloading Acceleration
+    Kernel Offloading
   
 
     
@@ -1185,55 +1640,17 @@
                 
   
   
-    
-  
-  
-  
-    <li class="md-nav__item md-nav__item--active">
-      
-      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
-      
-      
-        
-      
-      
-      <a href="./" class="md-nav__link md-nav__link--active">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Optimization Roadmap
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-      
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
   
   
     <li class="md-nav__item">
-      <a href="../replicated_filesystem/" class="md-nav__link">
+      <a href="../sharded_filesystem/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Replicated Storage
+    Sharded Filesystem
   
 
     
@@ -1313,6 +1730,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../explanation/projectlocalenvironment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Project-Local Development Environment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../explanation/flat_filesystem/" class="md-nav__link">
         
   
@@ -1320,7 +1765,7 @@
   <span class="md-ellipsis">
     
   
-    POSIX Flat Filesystem
+    Regular Files
   
 
     
@@ -1348,7 +1793,7 @@
   <span class="md-ellipsis">
     
   
-    Hierarchical Directory Trees
+    Directory Trees
   
 
     
@@ -1376,7 +1821,7 @@
   <span class="md-ellipsis">
     
   
-    Atomic Renames
+    Atomic Rename
   
 
     
@@ -1404,7 +1849,119 @@
   <span class="md-ellipsis">
     
   
-    Reliable Mount
+    Reliable Mount & Shutdown
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/observabledaemon/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability & Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/ondemandprofiling/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    On-Demand Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/replicated_filesystem/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Replicated Storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/optimizationroadmap/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Optimizations
   
 
     
@@ -1432,7 +1989,7 @@
   <span class="md-ellipsis">
     
   
-    Kernel Offloading Acceleration
+    Kernel Offloading
   
 
     
@@ -1481,42 +2038,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../../explanation/optimizationroadmap/" class="md-nav__link">
+      <a href="../../explanation/sharded_filesystem/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Optimization Roadmap
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../explanation/replicated_filesystem/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Replicated Storage
+    Sharded Filesystem
   
 
     
@@ -1557,6 +2086,58 @@
     
   
   
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#command-line-options" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Command-line options
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#built-in-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Built-in settings
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#requirement-status" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Requirement status
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#specification-requirements" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Specification requirements
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
 </nav>
                   </div>
                 </div>
@@ -1575,19 +2156,313 @@
   
 
 
-<h1 id="reference-performance-optimization-pipeline">Reference: Performance Optimization Pipeline</h1>
-<p><strong>Feature</strong>: <code>spec.optimize.OptimizationRoadmap</code></p>
+<h1 id="reference-performance-optimizations">Reference: Performance Optimizations<a class="headerlink" href="#reference-performance-optimizations" title="Permanent link">&para;</a></h1>
+<div class="admonition warning">
+<p class="admonition-title">Status: Partially implemented</p>
+<p>Chunked blocks, prepared statements, asynchronous commit, unlogged tables, per-handle write buffering, transaction batching and the attribute-cache TTL are implemented. Inode-keyed storage, the multi-threaded connection pool and the kernel writeback cache are not. The Reference page has the per-requirement status.</p>
+</div>
 <blockquote>
-<p>pgfs incorporates a structured performance optimization pipeline
-targeting database access latency, connection concurrency, userspace
-buffering, and FUSE kernel-transport tuning.</p>
+<p>pgfs incorporates a structured performance optimization pipeline targeting database access latency, connection concurrency, userspace buffering, and FUSE kernel-transport tuning.</p>
 </blockquote>
+<p><a href="../../tutorials/optimizationroadmap/">Tutorial</a> · <a href="../../how-to/optimizationroadmap/">How-to</a> · <strong>Reference</strong> · <a href="../../explanation/optimizationroadmap/">Explanation</a></p>
 <hr />
-<p>OptimizationRoadmap Requirements &amp; Parameters:
-- Schema: Chunked block storage (<code>ChunkedBlockStorageReq</code>) + integer inode primary keys (<code>InoBasedRekeyingReq</code>).
-- Database Tuning: <code>PreparedStatementReq</code>, <code>TransactionBatchingReq</code>, <code>SynchronousCommitTuningReq</code>, <code>UnloggedTableOptReq</code>.
-- Transport Tuning: <code>KernelAttrCacheTtlReq</code> (<code>--attr-ttl</code>), <code>KernelWritebackCacheReq</code> (<code>FUSE_WRITEBACK_CACHE</code>), <code>BufferedWriteFlushReq</code>.
-- Sparse Data Safety: <code>SparseWritePaddingReq</code> (pre-zero padding on uninstantiated block writes).</p>
+<h2 id="command-line-options">Command-line options<a class="headerlink" href="#command-line-options" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Default</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--attr-ttl &lt;seconds&gt;</code></td>
+<td><code>1.0</code></td>
+<td>TTL attached to every attribute and entry reply; fractional values allowed</td>
+</tr>
+<tr>
+<td><code>--unlogged</code></td>
+<td>off</td>
+<td>create <code>entries</code> and <code>blocks</code> as <code>UNLOGGED</code> tables; no effect on existing tables</td>
+</tr>
+</tbody>
+</table>
+<h2 id="built-in-settings">Built-in settings<a class="headerlink" href="#built-in-settings" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Block size (FUSE path)</td>
+<td>65 536 bytes</td>
+</tr>
+<tr>
+<td><code>synchronous_commit</code></td>
+<td><code>off</code>, set on every pooled connection</td>
+</tr>
+<tr>
+<td>Connection pool</td>
+<td><code>r2d2</code>, max 10 per pool; the daemon holds 1 primary connection (plus 1 standby connection) for its lifetime</td>
+</tr>
+<tr>
+<td>FUSE dispatch</td>
+<td>single-threaded</td>
+</tr>
+<tr>
+<td>Kernel capabilities requested</td>
+<td><code>FUSE_BIG_WRITES</code></td>
+</tr>
+<tr>
+<td>Replica freshness cache</td>
+<td>500 ms</td>
+</tr>
+<tr>
+<td>Prepared on connect</td>
+<td><code>getattr</code>, <code>create</code>, <code>mkdir</code>, <code>unlink</code>, <code>rmdir</code>, <code>list</code>, <code>read_blocks</code>, <code>upsert_block</code>, <code>prune_blocks</code>, <code>delete_blocks</code>, and six inode-keyed statements</td>
+</tr>
+</tbody>
+</table>
+<p>Replica queries, <code>rename</code>, size updates and <code>rmdir</code>'s emptiness
+check use unprepared SQL.</p>
+<h2 id="requirement-status">Requirement status<a class="headerlink" href="#requirement-status" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Requirement</th>
+<th>Status</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ChunkedBlockStorageReq</code></td>
+<td>implemented</td>
+<td>64 KiB blocks in <code>blocks(parent, name, block_no)</code></td>
+</tr>
+<tr>
+<td><code>InoBasedRekeyingReq</code></td>
+<td>partial</td>
+<td><code>ino</code>/<code>parent_ino</code> columns and prepared statements exist; the FUSE path is still keyed by path and leaves them at their defaults</td>
+</tr>
+<tr>
+<td><code>SparseWritePaddingReq</code></td>
+<td>partial</td>
+<td>unbuffered writes merge with the stored block; writes buffered on an open handle do not, see <code>BufferedWriteFlushReq</code></td>
+</tr>
+<tr>
+<td><code>ReplicaFreshnessCacheReq</code></td>
+<td>implemented</td>
+<td>500 ms monotonic TTL</td>
+</tr>
+<tr>
+<td><code>PreparedStatementReq</code></td>
+<td>implemented</td>
+<td>hot-path primary statements; see list above</td>
+</tr>
+<tr>
+<td><code>SynchronousCommitTuningReq</code></td>
+<td>implemented</td>
+<td>always on; not configurable</td>
+</tr>
+<tr>
+<td><code>UnloggedTableOptReq</code></td>
+<td>implemented</td>
+<td><code>--unlogged</code></td>
+</tr>
+<tr>
+<td><code>TransactionBatchingReq</code></td>
+<td>implemented</td>
+<td><code>write_range</code>, <code>truncate</code>, the buffered flush and <code>rename</code> are single transactions; <code>unlink</code> and <code>rmdir</code> are separate statements</td>
+</tr>
+<tr>
+<td><code>MultiThreadedConnectionPoolReq</code></td>
+<td>partial</td>
+<td>the pool exists but one connection is used and dispatch is single-threaded; no <code>--max-pool-size</code></td>
+</tr>
+<tr>
+<td><code>BufferedWriteFlushReq</code></td>
+<td>implemented</td>
+<td>per open handle; flushed on <code>flush</code>, <code>fsync</code>, <code>release</code> and before a <code>read</code> of the same file; buffered blocks start empty rather than from the stored block</td>
+</tr>
+<tr>
+<td><code>KernelAttrCacheTtlReq</code></td>
+<td>implemented</td>
+<td><code>--attr-ttl</code></td>
+</tr>
+<tr>
+<td><code>KernelWritebackCacheReq</code></td>
+<td>not implemented</td>
+<td>only <code>FUSE_BIG_WRITES</code> is negotiated; no <code>--writeback-cache</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="specification-requirements">Specification requirements<a class="headerlink" href="#specification-requirements" title="Permanent link">&para;</a></h2>
+<p><code>OptimizationRoadmap</code> is built from these requirement classes. Each is declared in <code>spec/</code> and listed in the feature's <code>deps</code>.</p>
+<details class="abstract">
+<summary>ChunkedBlockStorageReq</summary>
+<p><code>spec.optimize.ChunkedBlockStorageReq</code></p>
+<p>File contents are stored in fixed-size block chunks (64KB or 128KB) in a
+<code>blocks(ino, block_no, data)</code> table rather than monolithic byte blobs in
+<code>entries.data</code>.</p>
+<p>Technical Details:</p>
+<ul>
+<li>Read operations calculate block ranges <code>[start_block..end_block]</code> based on
+  <code>offset</code> and <code>size</code>, fetching only touched blocks from PostgreSQL.</li>
+<li>Write operations update or upsert only touched block records rather than
+  rewriting the entire file payload.</li>
+<li>Truncation via <code>setattr</code> deletes block records where <code>block_no &gt; new_size / block_size</code>
+  and trims trailing block bytes.</li>
+<li>Metadata (<code>size</code>, <code>mtime</code>, <code>ctime</code>) remains in <code>entries</code> as the source of truth.</li>
+</ul>
+</details>
+<details class="abstract">
+<summary>InoBasedRekeyingReq</summary>
+<p><code>spec.optimize.InoBasedRekeyingReq</code></p>
+<p>Rekey <code>entries</code> and <code>blocks</code> tables from <code>(parent, name)</code> text keys to
+64-bit integer <code>ino BIGSERIAL</code> primary keys (<code>entries(ino)</code> and
+<code>blocks(ino, block_no)</code>).</p>
+<p>Technical Details:</p>
+<ul>
+<li><code>entries</code> table uses <code>ino BIGSERIAL PRIMARY KEY</code> and <code>parent_ino BIGINT REFERENCES entries(ino)</code>.</li>
+<li>Directory <code>rename(old_parent, old_name, new_parent, new_name)</code> updates <code>parent_ino = new_parent</code>
+  and <code>name = new_name</code> on a single row in $O(1)$ time, eliminating $O(N)$ cascading string updates.</li>
+<li>Path lookup is accelerated via B-Tree index on <code>(parent_ino, name)</code>.</li>
+<li>Inode numbers are guaranteed stable for open file handles and kernel VFS stat callbacks.</li>
+</ul>
+</details>
+<details class="abstract">
+<summary>SparseWritePaddingReq</summary>
+<p><code>spec.optimize.SparseWritePaddingReq</code></p>
+<p>Unaligned or sparse block writes (where <code>offset_in_block &gt; 0</code> on an
+uninstantiated block record) zero-pad preceding bytes at the application layer
+before upserting to prevent byte-0 data corruption.</p>
+<p>Technical Details:</p>
+<ul>
+<li>When <code>write_block(ino, block_no, data, offset_in_block)</code> is called for a block
+  that does not yet exist in <code>blocks</code>, the engine checks if <code>offset_in_block &gt; 0</code>.</li>
+<li>If <code>offset_in_block &gt; 0</code>, the engine constructs a zero-filled byte array of length
+  <code>offset_in_block</code> and prepends it to <code>data</code> before upserting.</li>
+<li>Subsequent reads of <code>[0..offset_in_block]</code> correctly return zero-filled bytes
+  conforming to POSIX sparse file behavior.</li>
+</ul>
+</details>
+<details class="abstract">
+<summary>ReplicaFreshnessCacheReq</summary>
+<p><code>spec.optimize.ReplicaFreshnessCacheReq</code></p>
+<p>When running with <code>--replica</code>, the replica freshness check
+(<code>replica_fresh</code>) caches its health and WAL LSN verdict using an atomic TTL cache
+to eliminate per-read validation overhead.</p>
+<p>Technical Details:</p>
+<ul>
+<li>Uses <code>AtomicBool</code> for freshness state and <code>AtomicU64</code> for timestamp tracking.</li>
+<li>Re-evaluates Postgres physical streaming standby lag (<code>pg_is_in_recovery</code>,
+  <code>pg_current_wal_lsn</code>, <code>pg_last_wal_replay_lsn</code>) only when <code>now - last_checked &gt; 500ms</code>.</li>
+<li>Consecutive read operations reuse the cached verdict, reducing query overhead by 75%
+  while ensuring automatic fallback to primary if lag exceeds tolerance.</li>
+</ul>
+</details>
+<details class="abstract">
+<summary>PreparedStatementReq</summary>
+<p><code>spec.optimize.PreparedStatementReq</code></p>
+<p>All static SQL queries (getattr, read, write, create, mkdir, unlink,
+rmdir, list, rename) are pre-compiled as prepared statements upon
+database connection initialization.</p>
+<p>Technical Details:</p>
+<ul>
+<li>Pre-compiles statement handles (<code>stmt_getattr</code>, <code>stmt_read_blocks</code>, <code>stmt_upsert_block</code>, etc.)
+  during <code>DbPool::get()</code> or worker initialization.</li>
+<li>Eliminates SQL lexical parsing, semantic analysis, and query planning overhead from
+  the FUSE operation hot path.</li>
+</ul>
+</details>
+<details class="abstract">
+<summary>SynchronousCommitTuningReq</summary>
+<p><code>spec.optimize.SynchronousCommitTuningReq</code></p>
+<p>The database layer supports connection-level tuning of
+<code>synchronous_commit</code> (<code>SET synchronous_commit = off</code>) to optimize per-operation
+fsync latency.</p>
+<p>Technical Details:</p>
+<ul>
+<li>Executed during connection acquisition (<code>on_acquire</code> hook in connection pool manager).</li>
+<li>Allows transactions to return immediately after writing to Postgres WAL buffers,
+  trading a sub-second crash durability window for up to 10x higher metadata IOPS.</li>
+</ul>
+</details>
+<details class="abstract">
+<summary>UnloggedTableOptReq</summary>
+<p><code>spec.optimize.UnloggedTableOptReq</code></p>
+<p>The database schema supports creating <code>entries</code> and <code>blocks</code> as
+<code>UNLOGGED</code> tables for high-performance development, caching, and testing workloads.</p>
+<p>Technical Details:</p>
+<ul>
+<li>DDL specifies <code>CREATE UNLOGGED TABLE entries</code> and <code>CREATE UNLOGGED TABLE blocks</code>.</li>
+<li>Bypasses WAL logging entirely, maximizing raw write throughput for ephemeral mounts.</li>
+</ul>
+</details>
+<details class="abstract">
+<summary>TransactionBatchingReq</summary>
+<p><code>spec.optimize.TransactionBatchingReq</code></p>
+<p>FUSE operations that execute multiple sequential database queries
+wrap them in a single explicit database transaction.</p>
+<p>Technical Details:</p>
+<ul>
+<li>Groups multi-query operations (e.g. truncate + write, directory deletion checks)
+  within <code>BEGIN</code> ... <code>COMMIT</code> blocks.</li>
+<li>Reduces network round-trips and WAL commit fsync overhead from $N$ commits to 1 commit.</li>
+</ul>
+</details>
+<details class="abstract">
+<summary>MultiThreadedConnectionPoolReq</summary>
+<p><code>spec.optimize.MultiThreadedConnectionPoolReq</code></p>
+<p>The database client uses a thread-safe connection pool (<code>r2d2</code> or <code>bb8</code>),
+combined with multi-worker FUSE session dispatch to process parallel operations concurrently.</p>
+<p>Technical Details:</p>
+<ul>
+<li>Configures pool size via CLI <code>--max-pool-size</code>.</li>
+<li>Replaces single-threaded <code>&amp;mut self</code> Db handles with pooled connection acquisition per thread.</li>
+</ul>
+</details>
+<details class="abstract">
+<summary>BufferedWriteFlushReq</summary>
+<p><code>spec.optimize.BufferedWriteFlushReq</code></p>
+<p>Small or non-aligned FUSE <code>write</code> calls buffer dirty byte ranges
+or blocks in memory per open file handle, flushing pending writes
+to PostgreSQL on <code>flush</code>, <code>release</code>, or explicit <code>fsync</code>.</p>
+<p>Technical Details:</p>
+<ul>
+<li>Maintains a per-fd dirty block buffer in daemon memory.</li>
+<li>Aggregates page-sized kernel writes into full 128KB block writes before issuing database upserts.</li>
+</ul>
+</details>
+<details class="abstract">
+<summary>KernelAttrCacheTtlReq</summary>
+<p><code>spec.optimize.KernelAttrCacheTtlReq</code></p>
+<p>The kernel attribute and entry cache TTL is configurable via a CLI
+option (<code>--attr-ttl</code>), reducing repetitive <code>lookup</code> and <code>getattr</code> FUSE callbacks.</p>
+<p>Technical Details:</p>
+<ul>
+<li>Sets <code>TTL</code> duration in <code>fuser::ReplyAttr</code> and <code>fuser::ReplyEntry</code> responses.</li>
+<li>Bypasses daemon and database queries for stat/lookup ops on unchanged paths during TTL window.</li>
+</ul>
+</details>
+<details class="abstract">
+<summary>KernelWritebackCacheReq</summary>
+<p><code>spec.optimize.KernelWritebackCacheReq</code></p>
+<p>FUSE callback initialization negotiates kernel capabilities including
+<code>FUSE_WRITEBACK_CACHE</code> and splice read/write.</p>
+<p>Technical Details:</p>
+<ul>
+<li>Enables <code>CAP_WRITEBACK_CACHE</code> in <code>KernelConfig</code> during FUSE <code>init</code>.</li>
+<li>Allows Linux VFS page cache to coalesce small sequential write syscalls into 128KB block buffers.</li>
+</ul>
+</details>
+<hr />
+<p><small>Generated from <code>spec.optimize.OptimizationRoadmap</code> by <code>scripts/build_docs.py</code>. Edit the specification, not this page.</small></p>
 
 
 

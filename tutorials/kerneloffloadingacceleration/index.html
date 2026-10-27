@@ -11,7 +11,7 @@
         <link rel="canonical" href="https://drhodes.github.io/pgfs/tutorials/kerneloffloadingacceleration/">
       
       
-        <link rel="prev" href="../reliablemount/">
+        <link rel="prev" href="../optimizationroadmap/">
       
       
         <link rel="next" href="../dualinterfacearchitecture/">
@@ -25,7 +25,7 @@
     
     
       
-        <title>Kernel Offloading Acceleration - pgfs — PostgreSQL-Backed FUSE Filesystem</title>
+        <title>Kernel Offloading - pgfs — PostgreSQL-Backed FUSE Filesystem</title>
       
     
     
@@ -76,7 +76,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#tutorial-database-native-kernel-acceleration" class="md-skip">
+        <a href="#tutorial-kernel-offloading" class="md-skip">
           Skip to content
         </a>
       
@@ -110,7 +110,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              Kernel Offloading Acceleration
+              Kernel Offloading
             
           </span>
         </div>
@@ -246,7 +246,7 @@
     
     
       <li class="md-tabs__item md-tabs__item--active">
-        <a href="../flat_filesystem/" class="md-tabs__link">
+        <a href="../projectlocalenvironment/" class="md-tabs__link">
           
   
   
@@ -266,7 +266,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../how-to/flat_filesystem/" class="md-tabs__link">
+        <a href="../../how-to/projectlocalenvironment/" class="md-tabs__link">
           
   
   
@@ -286,7 +286,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../reference/flat_filesystem/" class="md-tabs__link">
+        <a href="../../reference/projectlocalenvironment/" class="md-tabs__link">
           
   
   
@@ -306,7 +306,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../explanation/flat_filesystem/" class="md-tabs__link">
+        <a href="../../explanation/projectlocalenvironment/" class="md-tabs__link">
           
   
   
@@ -454,6 +454,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../projectlocalenvironment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Project-Local Development Environment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../flat_filesystem/" class="md-nav__link">
         
   
@@ -461,7 +489,7 @@
   <span class="md-ellipsis">
     
   
-    POSIX Flat Filesystem
+    Regular Files
   
 
     
@@ -489,7 +517,7 @@
   <span class="md-ellipsis">
     
   
-    Hierarchical Directory Trees
+    Directory Trees
   
 
     
@@ -517,7 +545,7 @@
   <span class="md-ellipsis">
     
   
-    Atomic Renames
+    Atomic Rename
   
 
     
@@ -545,7 +573,119 @@
   <span class="md-ellipsis">
     
   
-    Reliable Mount
+    Reliable Mount & Shutdown
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../observabledaemon/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability & Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../ondemandprofiling/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    On-Demand Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../replicated_filesystem/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Replicated Storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../optimizationroadmap/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Optimizations
   
 
     
@@ -575,6 +715,24 @@
         
       
       
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Kernel Offloading
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
       <a href="./" class="md-nav__link md-nav__link--active">
         
   
@@ -582,7 +740,7 @@
   <span class="md-ellipsis">
     
   
-    Kernel Offloading Acceleration
+    Kernel Offloading
   
 
     
@@ -591,6 +749,91 @@
   
 
       </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#step-1-create-a-file-through-the-mount" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 1: create a file through the mount
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-2-copy-it-inside-the-database" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 2: copy it inside the database
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-3-see-the-copy-appear-on-the-mount" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 3: see the copy appear on the mount
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-4-run-the-real-implementations-test" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 4: run the real implementation's test
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-5-clean-up" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 5: clean up
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#what-we-did" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What we did
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
       
     </li>
   
@@ -632,42 +875,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../optimizationroadmap/" class="md-nav__link">
+      <a href="../sharded_filesystem/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Optimization Roadmap
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../replicated_filesystem/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Replicated Storage
+    Sharded Filesystem
   
 
     
@@ -747,6 +962,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../how-to/projectlocalenvironment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Project-Local Development Environment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../how-to/flat_filesystem/" class="md-nav__link">
         
   
@@ -754,7 +997,7 @@
   <span class="md-ellipsis">
     
   
-    POSIX Flat Filesystem
+    Regular Files
   
 
     
@@ -782,7 +1025,7 @@
   <span class="md-ellipsis">
     
   
-    Hierarchical Directory Trees
+    Directory Trees
   
 
     
@@ -810,7 +1053,7 @@
   <span class="md-ellipsis">
     
   
-    Atomic Renames
+    Atomic Rename
   
 
     
@@ -838,7 +1081,119 @@
   <span class="md-ellipsis">
     
   
-    Reliable Mount
+    Reliable Mount & Shutdown
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/observabledaemon/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability & Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/ondemandprofiling/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    On-Demand Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/replicated_filesystem/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Replicated Storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/optimizationroadmap/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Optimizations
   
 
     
@@ -866,7 +1221,7 @@
   <span class="md-ellipsis">
     
   
-    Kernel Offloading Acceleration
+    Kernel Offloading
   
 
     
@@ -915,42 +1270,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../../how-to/optimizationroadmap/" class="md-nav__link">
+      <a href="../../how-to/sharded_filesystem/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Optimization Roadmap
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../how-to/replicated_filesystem/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Replicated Storage
+    Sharded Filesystem
   
 
     
@@ -1030,6 +1357,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../reference/projectlocalenvironment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Project-Local Development Environment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../reference/flat_filesystem/" class="md-nav__link">
         
   
@@ -1037,7 +1392,7 @@
   <span class="md-ellipsis">
     
   
-    POSIX Flat Filesystem
+    Regular Files
   
 
     
@@ -1065,7 +1420,7 @@
   <span class="md-ellipsis">
     
   
-    Hierarchical Directory Trees
+    Directory Trees
   
 
     
@@ -1093,7 +1448,7 @@
   <span class="md-ellipsis">
     
   
-    Atomic Renames
+    Atomic Rename
   
 
     
@@ -1121,7 +1476,119 @@
   <span class="md-ellipsis">
     
   
-    Reliable Mount
+    Reliable Mount & Shutdown
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/observabledaemon/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability & Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/ondemandprofiling/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    On-Demand Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/replicated_filesystem/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Replicated Storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/optimizationroadmap/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Optimizations
   
 
     
@@ -1149,7 +1616,7 @@
   <span class="md-ellipsis">
     
   
-    Kernel Offloading Acceleration
+    Kernel Offloading
   
 
     
@@ -1198,42 +1665,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../../reference/optimizationroadmap/" class="md-nav__link">
+      <a href="../../reference/sharded_filesystem/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Optimization Roadmap
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../reference/replicated_filesystem/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Replicated Storage
+    Sharded Filesystem
   
 
     
@@ -1313,6 +1752,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../explanation/projectlocalenvironment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Project-Local Development Environment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../explanation/flat_filesystem/" class="md-nav__link">
         
   
@@ -1320,7 +1787,7 @@
   <span class="md-ellipsis">
     
   
-    POSIX Flat Filesystem
+    Regular Files
   
 
     
@@ -1348,7 +1815,7 @@
   <span class="md-ellipsis">
     
   
-    Hierarchical Directory Trees
+    Directory Trees
   
 
     
@@ -1376,7 +1843,7 @@
   <span class="md-ellipsis">
     
   
-    Atomic Renames
+    Atomic Rename
   
 
     
@@ -1404,7 +1871,119 @@
   <span class="md-ellipsis">
     
   
-    Reliable Mount
+    Reliable Mount & Shutdown
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/observabledaemon/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability & Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/ondemandprofiling/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    On-Demand Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/replicated_filesystem/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Replicated Storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/optimizationroadmap/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Optimizations
   
 
     
@@ -1432,7 +2011,7 @@
   <span class="md-ellipsis">
     
   
-    Kernel Offloading Acceleration
+    Kernel Offloading
   
 
     
@@ -1481,42 +2060,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../../explanation/optimizationroadmap/" class="md-nav__link">
+      <a href="../../explanation/sharded_filesystem/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Optimization Roadmap
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../explanation/replicated_filesystem/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Replicated Storage
+    Sharded Filesystem
   
 
     
@@ -1557,6 +2108,80 @@
     
   
   
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#step-1-create-a-file-through-the-mount" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 1: create a file through the mount
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-2-copy-it-inside-the-database" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 2: copy it inside the database
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-3-see-the-copy-appear-on-the-mount" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 3: see the copy appear on the mount
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-4-run-the-real-implementations-test" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 4: run the real implementation's test
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-5-clean-up" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 5: clean up
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#what-we-did" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What we did
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
 </nav>
                   </div>
                 </div>
@@ -1575,21 +2200,70 @@
   
 
 
-<h1 id="tutorial-database-native-kernel-acceleration">Tutorial: Database-Native Kernel Acceleration</h1>
-<p><strong>Feature</strong>: <code>spec.offload.KernelOffloadingAcceleration</code></p>
+<h1 id="tutorial-kernel-offloading">Tutorial: Kernel Offloading<a class="headerlink" href="#tutorial-kernel-offloading" title="Permanent link">&para;</a></h1>
+<div class="admonition warning">
+<p class="admonition-title">Status: Partially implemented</p>
+<p>Server-side <code>copy_file_range</code> and <code>fallocate</code> are implemented in the storage backend and unit-tested, but the FUSE layer does not call them yet. On a mount, copies stream through the daemon and <code>fallocate</code> fails with <code>EOPNOTSUPP</code>. Reflink, subtree clone and content search are planned.</p>
+</div>
 <blockquote>
-<p>pgfs incorporates Database-Native Kernel Offloading capabilities, utilizing
-copy_file_range, fallocate, reflink CoW, and server-side search to eliminate
-userspace byte streaming and deliver sub-millisecond execution for large-scale
-file operations.</p>
+<p>pgfs incorporates Database-Native Kernel Offloading capabilities, utilizing copy_file_range, fallocate, reflink CoW, and server-side search to eliminate userspace byte streaming and deliver sub-millisecond execution for large-scale file operations.</p>
 </blockquote>
+<p><strong>Tutorial</strong> · <a href="../../how-to/kerneloffloadingacceleration/">How-to</a> · <a href="../../reference/kerneloffloadingacceleration/">Reference</a> · <a href="../../explanation/kerneloffloadingacceleration/">Explanation</a></p>
 <hr />
-<p>In this tutorial, we will use kernel offloading features in pgfs to clone files and directories instantly.
-1. Create a large source file: <code>head -c 100M /dev/urandom &gt; ./mnt/large.bin</code>.
-2. Perform an instant copy using <code>cp --reflink=always ./mnt/large.bin ./mnt/clone.bin</code>.
-3. Notice that the copy completes instantaneously (&lt;5ms) because PostgreSQL copied block reference IDs.
-4. Punch a sparse hole using <code>fallocate -p -o 1M -l 10M ./mnt/clone.bin</code>.
-5. Verify hole punching freed space in PostgreSQL without re-writing the rest of the file.</p>
+<p>The offloading callbacks are not connected to the mount yet,
+but the idea behind them can be tried today with plain SQL. In
+this tutorial we will copy a file without its bytes ever
+leaving PostgreSQL, then run the unit test that exercises the
+real implementation. We need a running mount (see <a href="../projectlocalenvironment/">Your first
+pgfs mount</a>).</p>
+<h2 id="step-1-create-a-file-through-the-mount">Step 1: create a file through the mount<a class="headerlink" href="#step-1-create-a-file-through-the-mount" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code>mkdir<span class="w"> </span>testdata/mnt/offload
+head<span class="w"> </span>-c<span class="w"> </span><span class="m">300000</span><span class="w"> </span>/dev/urandom<span class="w"> </span>&gt;<span class="w"> </span>testdata/mnt/offload/big.bin
+</code></pre></div>
+<h2 id="step-2-copy-it-inside-the-database">Step 2: copy it inside the database<a class="headerlink" href="#step-2-copy-it-inside-the-database" title="Permanent link">&para;</a></h2>
+<p>One transaction copies the file's metadata row and its five
+block rows. No data passes through pgfs or through <code>psql</code>:</p>
+<div class="highlight"><pre><span></span><code>psql<span class="w"> </span>-h<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PWD</span><span class="s2">/testdata&quot;</span><span class="w"> </span>-d<span class="w"> </span>pgfs<span class="w"> </span>-v<span class="w"> </span><span class="nv">ON_ERROR_STOP</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="s">&lt;&lt;&#39;SQL&#39;</span>
+<span class="s">BEGIN;</span>
+<span class="s">INSERT INTO entries (parent, name, kind, size)</span>
+<span class="s">  SELECT parent, &#39;clone.bin&#39;, kind, size FROM entries</span>
+<span class="s">  WHERE parent = &#39;offload&#39; AND name = &#39;big.bin&#39;;</span>
+<span class="s">INSERT INTO blocks (parent, name, block_no, data)</span>
+<span class="s">  SELECT parent, &#39;clone.bin&#39;, block_no, data FROM blocks</span>
+<span class="s">  WHERE parent = &#39;offload&#39; AND name = &#39;big.bin&#39;;</span>
+<span class="s">COMMIT;</span>
+<span class="s">SQL</span>
+</code></pre></div>
+<h2 id="step-3-see-the-copy-appear-on-the-mount">Step 3: see the copy appear on the mount<a class="headerlink" href="#step-3-see-the-copy-appear-on-the-mount" title="Permanent link">&para;</a></h2>
+<p>Wait a second for the kernel's attribute cache to expire, then:</p>
+<div class="highlight"><pre><span></span><code>ls<span class="w"> </span>-l<span class="w"> </span>testdata/mnt/offload
+cmp<span class="w"> </span>testdata/mnt/offload/big.bin<span class="w"> </span>testdata/mnt/offload/clone.bin<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span>identical
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>-rw-r--r-- 1 alice alice 300000 Oct 26 17:13 big.bin
+-rw-r--r-- 1 alice alice 300000 Oct 26 17:13 clone.bin
+identical
+</code></pre></div>
+<p>This is what <code>copy_file_range</code> offloading does on the
+inode-keyed schema: one set-based <code>INSERT … SELECT</code> instead of
+reading and rewriting every byte.</p>
+<h2 id="step-4-run-the-real-implementations-test">Step 4: run the real implementation's test<a class="headerlink" href="#step-4-run-the-real-implementations-test" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code>cargo<span class="w"> </span><span class="nb">test</span><span class="w"> </span>tests_offload
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>test db::tests_offload::test_backend_offloaded_copy_file_range_and_fallocate ... ok
+</code></pre></div>
+<p>The test copies 128 KiB between two files with
+<code>copy_file_range</code>, then punches it back out with <code>fallocate</code>.</p>
+<h2 id="step-5-clean-up">Step 5: clean up<a class="headerlink" href="#step-5-clean-up" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code>rm<span class="w"> </span>-r<span class="w"> </span>testdata/mnt/offload
+</code></pre></div>
+<h2 id="what-we-did">What we did<a class="headerlink" href="#what-we-did" title="Permanent link">&para;</a></h2>
+<p>We copied a file entirely inside PostgreSQL and saw it through
+the mount, then ran the backend code that will do the same for
+<code>cp</code> once it is wired to FUSE. The
+<a href="../../explanation/kerneloffloadingacceleration/">explanation</a>
+covers the rest of the plan.</p>
+<hr />
+<p><small>Generated from <code>spec.offload.KernelOffloadingAcceleration</code> by <code>scripts/build_docs.py</code>. Edit the specification, not this page.</small></p>
 
 
 

@@ -25,7 +25,19 @@
          <lastmod>1980-01-01</lastmod>
     </url>
     <url>
+         <loc>https://drhodes.github.io/pgfs/explanation/observabledaemon/</loc>
+         <lastmod>1980-01-01</lastmod>
+    </url>
+    <url>
+         <loc>https://drhodes.github.io/pgfs/explanation/ondemandprofiling/</loc>
+         <lastmod>1980-01-01</lastmod>
+    </url>
+    <url>
          <loc>https://drhodes.github.io/pgfs/explanation/optimizationroadmap/</loc>
+         <lastmod>1980-01-01</lastmod>
+    </url>
+    <url>
+         <loc>https://drhodes.github.io/pgfs/explanation/projectlocalenvironment/</loc>
          <lastmod>1980-01-01</lastmod>
     </url>
     <url>
@@ -34,6 +46,10 @@
     </url>
     <url>
          <loc>https://drhodes.github.io/pgfs/explanation/replicated_filesystem/</loc>
+         <lastmod>1980-01-01</lastmod>
+    </url>
+    <url>
+         <loc>https://drhodes.github.io/pgfs/explanation/sharded_filesystem/</loc>
          <lastmod>1980-01-01</lastmod>
     </url>
     <url>
@@ -57,7 +73,19 @@
          <lastmod>1980-01-01</lastmod>
     </url>
     <url>
+         <loc>https://drhodes.github.io/pgfs/how-to/observabledaemon/</loc>
+         <lastmod>1980-01-01</lastmod>
+    </url>
+    <url>
+         <loc>https://drhodes.github.io/pgfs/how-to/ondemandprofiling/</loc>
+         <lastmod>1980-01-01</lastmod>
+    </url>
+    <url>
          <loc>https://drhodes.github.io/pgfs/how-to/optimizationroadmap/</loc>
+         <lastmod>1980-01-01</lastmod>
+    </url>
+    <url>
+         <loc>https://drhodes.github.io/pgfs/how-to/projectlocalenvironment/</loc>
          <lastmod>1980-01-01</lastmod>
     </url>
     <url>
@@ -66,6 +94,10 @@
     </url>
     <url>
          <loc>https://drhodes.github.io/pgfs/how-to/replicated_filesystem/</loc>
+         <lastmod>1980-01-01</lastmod>
+    </url>
+    <url>
+         <loc>https://drhodes.github.io/pgfs/how-to/sharded_filesystem/</loc>
          <lastmod>1980-01-01</lastmod>
     </url>
     <url>
@@ -89,7 +121,19 @@
          <lastmod>1980-01-01</lastmod>
     </url>
     <url>
+         <loc>https://drhodes.github.io/pgfs/reference/observabledaemon/</loc>
+         <lastmod>1980-01-01</lastmod>
+    </url>
+    <url>
+         <loc>https://drhodes.github.io/pgfs/reference/ondemandprofiling/</loc>
+         <lastmod>1980-01-01</lastmod>
+    </url>
+    <url>
          <loc>https://drhodes.github.io/pgfs/reference/optimizationroadmap/</loc>
+         <lastmod>1980-01-01</lastmod>
+    </url>
+    <url>
+         <loc>https://drhodes.github.io/pgfs/reference/projectlocalenvironment/</loc>
          <lastmod>1980-01-01</lastmod>
     </url>
     <url>
@@ -98,6 +142,10 @@
     </url>
     <url>
          <loc>https://drhodes.github.io/pgfs/reference/replicated_filesystem/</loc>
+         <lastmod>1980-01-01</lastmod>
+    </url>
+    <url>
+         <loc>https://drhodes.github.io/pgfs/reference/sharded_filesystem/</loc>
          <lastmod>1980-01-01</lastmod>
     </url>
     <url>
@@ -121,7 +169,19 @@
          <lastmod>1980-01-01</lastmod>
     </url>
     <url>
+         <loc>https://drhodes.github.io/pgfs/tutorials/observabledaemon/</loc>
+         <lastmod>1980-01-01</lastmod>
+    </url>
+    <url>
+         <loc>https://drhodes.github.io/pgfs/tutorials/ondemandprofiling/</loc>
+         <lastmod>1980-01-01</lastmod>
+    </url>
+    <url>
          <loc>https://drhodes.github.io/pgfs/tutorials/optimizationroadmap/</loc>
+         <lastmod>1980-01-01</lastmod>
+    </url>
+    <url>
+         <loc>https://drhodes.github.io/pgfs/tutorials/projectlocalenvironment/</loc>
          <lastmod>1980-01-01</lastmod>
     </url>
     <url>
@@ -130,6 +190,10 @@
     </url>
     <url>
          <loc>https://drhodes.github.io/pgfs/tutorials/replicated_filesystem/</loc>
+         <lastmod>1980-01-01</lastmod>
+    </url>
+    <url>
+         <loc>https://drhodes.github.io/pgfs/tutorials/sharded_filesystem/</loc>
          <lastmod>1980-01-01</lastmod>
     </url>
 </urlset>

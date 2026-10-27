@@ -11,10 +11,10 @@
         <link rel="canonical" href="https://drhodes.github.io/pgfs/tutorials/replicated_filesystem/">
       
       
-        <link rel="prev" href="../optimizationroadmap/">
+        <link rel="prev" href="../ondemandprofiling/">
       
       
-        <link rel="next" href="../../how-to/flat_filesystem/">
+        <link rel="next" href="../optimizationroadmap/">
       
       
         
@@ -76,7 +76,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#tutorial-replicated-physical-standby-storage" class="md-skip">
+        <a href="#tutorial-replicated-storage" class="md-skip">
           Skip to content
         </a>
       
@@ -246,7 +246,7 @@
     
     
       <li class="md-tabs__item md-tabs__item--active">
-        <a href="../flat_filesystem/" class="md-tabs__link">
+        <a href="../projectlocalenvironment/" class="md-tabs__link">
           
   
   
@@ -266,7 +266,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../how-to/flat_filesystem/" class="md-tabs__link">
+        <a href="../../how-to/projectlocalenvironment/" class="md-tabs__link">
           
   
   
@@ -286,7 +286,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../reference/flat_filesystem/" class="md-tabs__link">
+        <a href="../../reference/projectlocalenvironment/" class="md-tabs__link">
           
   
   
@@ -306,7 +306,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../explanation/flat_filesystem/" class="md-tabs__link">
+        <a href="../../explanation/projectlocalenvironment/" class="md-tabs__link">
           
   
   
@@ -454,6 +454,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../projectlocalenvironment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Project-Local Development Environment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../flat_filesystem/" class="md-nav__link">
         
   
@@ -461,7 +489,7 @@
   <span class="md-ellipsis">
     
   
-    POSIX Flat Filesystem
+    Regular Files
   
 
     
@@ -489,7 +517,7 @@
   <span class="md-ellipsis">
     
   
-    Hierarchical Directory Trees
+    Directory Trees
   
 
     
@@ -517,7 +545,7 @@
   <span class="md-ellipsis">
     
   
-    Atomic Renames
+    Atomic Rename
   
 
     
@@ -545,7 +573,232 @@
   <span class="md-ellipsis">
     
   
-    Reliable Mount
+    Reliable Mount & Shutdown
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../observabledaemon/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability & Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../ondemandprofiling/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    On-Demand Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Replicated Storage
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Replicated Storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#step-1-start-the-standby" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 1: start the standby
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-2-mount-with-the-replica" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 2: mount with the replica
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-3-write-wait-read" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 3: write, wait, read
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-4-take-the-standby-away" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 4: take the standby away
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-5-clean-up" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 5: clean up
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#what-we-did" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What we did
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../optimizationroadmap/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Optimizations
   
 
     
@@ -573,7 +826,7 @@
   <span class="md-ellipsis">
     
   
-    Kernel Offloading Acceleration
+    Kernel Offloading
   
 
     
@@ -622,14 +875,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../optimizationroadmap/" class="md-nav__link">
+      <a href="../sharded_filesystem/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Optimization Roadmap
+    Sharded Filesystem
   
 
     
@@ -638,44 +891,6 @@
   
 
       </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-    
-  
-  
-  
-    <li class="md-nav__item md-nav__item--active">
-      
-      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
-      
-      
-        
-      
-      
-      <a href="./" class="md-nav__link md-nav__link--active">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Replicated Storage
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-      
     </li>
   
 
@@ -747,6 +962,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../how-to/projectlocalenvironment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Project-Local Development Environment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../how-to/flat_filesystem/" class="md-nav__link">
         
   
@@ -754,7 +997,7 @@
   <span class="md-ellipsis">
     
   
-    POSIX Flat Filesystem
+    Regular Files
   
 
     
@@ -782,7 +1025,7 @@
   <span class="md-ellipsis">
     
   
-    Hierarchical Directory Trees
+    Directory Trees
   
 
     
@@ -810,7 +1053,7 @@
   <span class="md-ellipsis">
     
   
-    Atomic Renames
+    Atomic Rename
   
 
     
@@ -838,7 +1081,119 @@
   <span class="md-ellipsis">
     
   
-    Reliable Mount
+    Reliable Mount & Shutdown
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/observabledaemon/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability & Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/ondemandprofiling/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    On-Demand Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/replicated_filesystem/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Replicated Storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/optimizationroadmap/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Optimizations
   
 
     
@@ -866,7 +1221,7 @@
   <span class="md-ellipsis">
     
   
-    Kernel Offloading Acceleration
+    Kernel Offloading
   
 
     
@@ -915,42 +1270,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../../how-to/optimizationroadmap/" class="md-nav__link">
+      <a href="../../how-to/sharded_filesystem/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Optimization Roadmap
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../how-to/replicated_filesystem/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Replicated Storage
+    Sharded Filesystem
   
 
     
@@ -1030,6 +1357,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../reference/projectlocalenvironment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Project-Local Development Environment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../reference/flat_filesystem/" class="md-nav__link">
         
   
@@ -1037,7 +1392,7 @@
   <span class="md-ellipsis">
     
   
-    POSIX Flat Filesystem
+    Regular Files
   
 
     
@@ -1065,7 +1420,7 @@
   <span class="md-ellipsis">
     
   
-    Hierarchical Directory Trees
+    Directory Trees
   
 
     
@@ -1093,7 +1448,7 @@
   <span class="md-ellipsis">
     
   
-    Atomic Renames
+    Atomic Rename
   
 
     
@@ -1121,7 +1476,119 @@
   <span class="md-ellipsis">
     
   
-    Reliable Mount
+    Reliable Mount & Shutdown
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/observabledaemon/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability & Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/ondemandprofiling/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    On-Demand Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/replicated_filesystem/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Replicated Storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/optimizationroadmap/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Optimizations
   
 
     
@@ -1149,7 +1616,7 @@
   <span class="md-ellipsis">
     
   
-    Kernel Offloading Acceleration
+    Kernel Offloading
   
 
     
@@ -1198,42 +1665,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../../reference/optimizationroadmap/" class="md-nav__link">
+      <a href="../../reference/sharded_filesystem/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Optimization Roadmap
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../reference/replicated_filesystem/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Replicated Storage
+    Sharded Filesystem
   
 
     
@@ -1313,6 +1752,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../explanation/projectlocalenvironment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Project-Local Development Environment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../explanation/flat_filesystem/" class="md-nav__link">
         
   
@@ -1320,7 +1787,7 @@
   <span class="md-ellipsis">
     
   
-    POSIX Flat Filesystem
+    Regular Files
   
 
     
@@ -1348,7 +1815,7 @@
   <span class="md-ellipsis">
     
   
-    Hierarchical Directory Trees
+    Directory Trees
   
 
     
@@ -1376,7 +1843,7 @@
   <span class="md-ellipsis">
     
   
-    Atomic Renames
+    Atomic Rename
   
 
     
@@ -1404,7 +1871,119 @@
   <span class="md-ellipsis">
     
   
-    Reliable Mount
+    Reliable Mount & Shutdown
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/observabledaemon/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability & Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/ondemandprofiling/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    On-Demand Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/replicated_filesystem/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Replicated Storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/optimizationroadmap/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Optimizations
   
 
     
@@ -1432,7 +2011,7 @@
   <span class="md-ellipsis">
     
   
-    Kernel Offloading Acceleration
+    Kernel Offloading
   
 
     
@@ -1481,42 +2060,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../../explanation/optimizationroadmap/" class="md-nav__link">
+      <a href="../../explanation/sharded_filesystem/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Optimization Roadmap
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../explanation/replicated_filesystem/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Replicated Storage
+    Sharded Filesystem
   
 
     
@@ -1557,6 +2108,80 @@
     
   
   
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#step-1-start-the-standby" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 1: start the standby
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-2-mount-with-the-replica" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 2: mount with the replica
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-3-write-wait-read" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 3: write, wait, read
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-4-take-the-standby-away" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 4: take the standby away
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-5-clean-up" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 5: clean up
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#what-we-did" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What we did
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
 </nav>
                   </div>
                 </div>
@@ -1575,24 +2200,83 @@
   
 
 
-<h1 id="tutorial-replicated-physical-standby-storage">Tutorial: Replicated Physical Standby Storage</h1>
-<p><strong>Feature</strong>: <code>spec.replica.ReplicatedFilesystem</code></p>
+<h1 id="tutorial-replicated-storage">Tutorial: Replicated Storage<a class="headerlink" href="#tutorial-replicated-storage" title="Permanent link">&para;</a></h1>
+<div class="admonition warning">
+<p class="admonition-title">Status: Partially implemented</p>
+<p>Write routing, lag detection, transparent fallback and the Docker standby work today. File contents (<code>read</code>) are still always served by the primary, and a standby that is unreachable when the daemon starts is dropped for the daemon's lifetime without a warning.</p>
+</div>
 <blockquote>
-<p>A pgfs mount can be backed by a primary Postgres and a physical
-streaming standby in Docker. Writes go to the primary; reads are
-served from whichever node is authoritative at that instant, falling
-back to the primary when the standby lags. The filesystem is
-eventually consistent with the standby's lag continuously bounded by
-the freshness check, and a standby failure never causes data loss or
-a kernel-visible error.</p>
+<p>A pgfs mount can be backed by a primary Postgres and a physical streaming standby in Docker. Writes go to the primary; reads are served from whichever node is authoritative at that instant, falling back to the primary when the standby lags. The filesystem is eventually consistent with the standby's lag continuously bounded by the freshness check, and a standby failure never causes data loss or a kernel-visible error.</p>
 </blockquote>
+<p><strong>Tutorial</strong> · <a href="../../how-to/replicated_filesystem/">How-to</a> · <a href="../../reference/replicated_filesystem/">Reference</a> · <a href="../../explanation/replicated_filesystem/">Explanation</a></p>
 <hr />
-<p>In this tutorial, we will set up and verify a replicated pgfs mount with primary/standby PostgreSQL.
-1. Start the Docker streaming standby container: <code>./scripts/replica_db.sh up</code>.
-2. Launch pgfs with primary and standby parameters: <code>./target/release/pgfs --conn postgres://127.0.0.1:5432/pgfs --replica postgres://127.0.0.1:5433/pgfs</code>.
-3. Perform write operations (<code>touch ./mnt/data.txt</code>) and observe writes directed to primary.
-4. Perform read operations (<code>cat ./mnt/data.txt</code>) and observe reads served from the standby node.
-5. Stop the standby container (<code>./scripts/replica_db.sh down</code>) and verify reads seamlessly fall back to primary without errors.</p>
+<p>In this tutorial we will give pgfs a read replica: a second
+PostgreSQL that follows the first by streaming its write-ahead
+log. We will mount pgfs with both, see metadata reads go to the
+replica, then take the replica away and see pgfs carry on
+without it.</p>
+<p>We need Docker, and the project-local cluster from <a href="../projectlocalenvironment/">Your first
+pgfs mount</a>.</p>
+<h2 id="step-1-start-the-standby">Step 1: start the standby<a class="headerlink" href="#step-1-start-the-standby" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code>./scripts/pgfs.sh<span class="w"> </span>down
+./scripts/replica_db.sh<span class="w"> </span>up
+</code></pre></div>
+<p>The script copies the primary with <code>pg_basebackup</code>, starts a
+<code>postgres:17</code> container on port 5433, and waits until it is
+streaming:</p>
+<div class="highlight"><pre><span></span><code>==&gt; standby is in recovery (streaming)
+
+ready. replica connection string (for --replica):
+  host=127.0.0.1 port=5433 dbname=pgfs user=alice
+</code></pre></div>
+<p>If it reports that the container name <code>/pgfs-replica</code> is
+already in use, run <code>docker rm pgfs-replica</code> and repeat.</p>
+<h2 id="step-2-mount-with-the-replica">Step 2: mount with the replica<a class="headerlink" href="#step-2-mount-with-the-replica" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code>mkdir<span class="w"> </span>-p<span class="w"> </span>testdata/mnt
+./target/debug/pgfs<span class="w"> </span>--replica<span class="w"> </span><span class="s2">&quot;</span><span class="k">$(</span>./scripts/replica_db.sh<span class="w"> </span>conn<span class="k">)</span><span class="s2">&quot;</span><span class="w"> </span>testdata/mnt<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span><span class="m">2</span>&gt;<span class="w"> </span>testdata/replica-demo.log<span class="w"> </span><span class="p">&amp;</span>
+sleep<span class="w"> </span><span class="m">1</span>
+grep<span class="w"> </span><span class="s1">&#39;replica mode&#39;</span><span class="w"> </span>testdata/replica-demo.log
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>INFO pgfs: replica mode: reads served from standby (host=127.0.0.1 port=5433 dbname=pgfs user=alice) when fresh
+</code></pre></div>
+<h2 id="step-3-write-wait-read">Step 3: write, wait, read<a class="headerlink" href="#step-3-write-wait-read" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code>mkdir<span class="w"> </span>testdata/mnt/replicated
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;on the primary&quot;</span><span class="w"> </span>&gt;<span class="w"> </span>testdata/mnt/replicated/a.txt
+sleep<span class="w"> </span><span class="m">1</span>
+ls<span class="w"> </span>-l<span class="w"> </span>testdata/mnt/replicated
+</code></pre></div>
+<p>Writes went to the primary. After a moment the standby has
+replayed them, and the <code>ls</code> (a directory listing plus
+attribute lookups) is answered by the standby. Ask the daemon:</p>
+<div class="highlight"><pre><span></span><code><span class="nb">kill</span><span class="w"> </span>-USR1<span class="w"> </span><span class="s2">&quot;</span><span class="k">$(</span>pgrep<span class="w"> </span>-f<span class="w"> </span><span class="s1">&#39;pgfs --replica&#39;</span><span class="k">)</span><span class="s2">&quot;</span><span class="p">;</span><span class="w"> </span>ls<span class="w"> </span>testdata/mnt<span class="w"> </span>&gt;<span class="w"> </span>/dev/null
+grep<span class="w"> </span><span class="s1">&#39;state|ino_cache&#39;</span><span class="w"> </span>testdata/replica-demo.log<span class="w"> </span><span class="p">|</span><span class="w"> </span>tail<span class="w"> </span>-1
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>... db=connected (replica fresh) ...
+</code></pre></div>
+<h2 id="step-4-take-the-standby-away">Step 4: take the standby away<a class="headerlink" href="#step-4-take-the-standby-away" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code>./scripts/replica_db.sh<span class="w"> </span>down
+ls<span class="w"> </span>-l<span class="w"> </span>testdata/mnt/replicated
+cat<span class="w"> </span>testdata/mnt/replicated/a.txt
+</code></pre></div>
+<p>Both commands still work. The log records the switch once:</p>
+<div class="highlight"><pre><span></span><code>WARN pgfs::db: reads falling back to primary (standby stale or unreachable)
+</code></pre></div>
+<h2 id="step-5-clean-up">Step 5: clean up<a class="headerlink" href="#step-5-clean-up" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><span class="nb">kill</span><span class="w"> </span>-TERM<span class="w"> </span><span class="s2">&quot;</span><span class="k">$(</span>pgrep<span class="w"> </span>-f<span class="w"> </span><span class="s1">&#39;pgfs --replica&#39;</span><span class="k">)</span><span class="s2">&quot;</span>
+rm<span class="w"> </span>-f<span class="w"> </span>testdata/replica-demo.log
+</code></pre></div>
+<p>The standby's data stays in the Docker volume
+<code>pgfs-replica-data</code>; <code>./scripts/replica_db.sh wipe</code> deletes it.</p>
+<h2 id="what-we-did">What we did<a class="headerlink" href="#what-we-did" title="Permanent link">&para;</a></h2>
+<p>We built a primary/standby pair, mounted pgfs across both, and
+saw reads move to the standby when it was current and back to
+the primary when it disappeared, with no error reaching the
+programs using the mount. The
+<a href="../../explanation/replicated_filesystem/">explanation</a> covers
+the consistency rules behind this.</p>
+<hr />
+<p><small>Generated from <code>spec.replica.ReplicatedFilesystem</code> by <code>scripts/build_docs.py</code>. Edit the specification, not this page.</small></p>
 
 
 

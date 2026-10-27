@@ -11,7 +11,7 @@
         <link rel="canonical" href="https://drhodes.github.io/pgfs/tutorials/flat_filesystem/">
       
       
-        <link rel="prev" href="../..">
+        <link rel="prev" href="../projectlocalenvironment/">
       
       
         <link rel="next" href="../hierarchicaldirectories/">
@@ -25,7 +25,7 @@
     
     
       
-        <title>POSIX Flat Filesystem - pgfs — PostgreSQL-Backed FUSE Filesystem</title>
+        <title>Regular Files - pgfs — PostgreSQL-Backed FUSE Filesystem</title>
       
     
     
@@ -76,7 +76,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#tutorial-posix-flat-filesystem" class="md-skip">
+        <a href="#tutorial-regular-files" class="md-skip">
           Skip to content
         </a>
       
@@ -110,7 +110,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              POSIX Flat Filesystem
+              Regular Files
             
           </span>
         </div>
@@ -246,7 +246,7 @@
     
     
       <li class="md-tabs__item md-tabs__item--active">
-        <a href="./" class="md-tabs__link">
+        <a href="../projectlocalenvironment/" class="md-tabs__link">
           
   
   
@@ -266,7 +266,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../how-to/flat_filesystem/" class="md-tabs__link">
+        <a href="../../how-to/projectlocalenvironment/" class="md-tabs__link">
           
   
   
@@ -286,7 +286,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../reference/flat_filesystem/" class="md-tabs__link">
+        <a href="../../reference/projectlocalenvironment/" class="md-tabs__link">
           
   
   
@@ -306,7 +306,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../explanation/flat_filesystem/" class="md-tabs__link">
+        <a href="../../explanation/projectlocalenvironment/" class="md-tabs__link">
           
   
   
@@ -451,6 +451,34 @@
                 
   
   
+  
+  
+    <li class="md-nav__item">
+      <a href="../projectlocalenvironment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Project-Local Development Environment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
     
   
   
@@ -463,6 +491,24 @@
         
       
       
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Regular Files
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
       <a href="./" class="md-nav__link md-nav__link--active">
         
   
@@ -470,7 +516,7 @@
   <span class="md-ellipsis">
     
   
-    POSIX Flat Filesystem
+    Regular Files
   
 
     
@@ -479,6 +525,113 @@
   
 
       </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#step-1-make-a-workspace" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 1: make a workspace
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-2-create-and-read-a-file" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 2: create and read a file
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-3-append-to-it" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 3: append to it
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-4-cut-it-short-then-grow-it" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 4: cut it short, then grow it
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-5-write-something-bigger" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 5: write something bigger
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-6-look-at-the-bytes-in-postgresql" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 6: look at the bytes in PostgreSQL
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-7-clean-up" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 7: clean up
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#what-we-did" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What we did
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
       
     </li>
   
@@ -499,7 +652,7 @@
   <span class="md-ellipsis">
     
   
-    Hierarchical Directory Trees
+    Directory Trees
   
 
     
@@ -527,7 +680,7 @@
   <span class="md-ellipsis">
     
   
-    Atomic Renames
+    Atomic Rename
   
 
     
@@ -555,7 +708,119 @@
   <span class="md-ellipsis">
     
   
-    Reliable Mount
+    Reliable Mount & Shutdown
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../observabledaemon/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability & Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../ondemandprofiling/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    On-Demand Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../replicated_filesystem/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Replicated Storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../optimizationroadmap/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Optimizations
   
 
     
@@ -583,7 +848,7 @@
   <span class="md-ellipsis">
     
   
-    Kernel Offloading Acceleration
+    Kernel Offloading
   
 
     
@@ -632,42 +897,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../optimizationroadmap/" class="md-nav__link">
+      <a href="../sharded_filesystem/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Optimization Roadmap
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../replicated_filesystem/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Replicated Storage
+    Sharded Filesystem
   
 
     
@@ -747,6 +984,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../how-to/projectlocalenvironment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Project-Local Development Environment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../how-to/flat_filesystem/" class="md-nav__link">
         
   
@@ -754,7 +1019,7 @@
   <span class="md-ellipsis">
     
   
-    POSIX Flat Filesystem
+    Regular Files
   
 
     
@@ -782,7 +1047,7 @@
   <span class="md-ellipsis">
     
   
-    Hierarchical Directory Trees
+    Directory Trees
   
 
     
@@ -810,7 +1075,7 @@
   <span class="md-ellipsis">
     
   
-    Atomic Renames
+    Atomic Rename
   
 
     
@@ -838,7 +1103,119 @@
   <span class="md-ellipsis">
     
   
-    Reliable Mount
+    Reliable Mount & Shutdown
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/observabledaemon/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability & Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/ondemandprofiling/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    On-Demand Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/replicated_filesystem/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Replicated Storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/optimizationroadmap/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Optimizations
   
 
     
@@ -866,7 +1243,7 @@
   <span class="md-ellipsis">
     
   
-    Kernel Offloading Acceleration
+    Kernel Offloading
   
 
     
@@ -915,42 +1292,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../../how-to/optimizationroadmap/" class="md-nav__link">
+      <a href="../../how-to/sharded_filesystem/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Optimization Roadmap
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../how-to/replicated_filesystem/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Replicated Storage
+    Sharded Filesystem
   
 
     
@@ -1030,6 +1379,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../reference/projectlocalenvironment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Project-Local Development Environment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../reference/flat_filesystem/" class="md-nav__link">
         
   
@@ -1037,7 +1414,7 @@
   <span class="md-ellipsis">
     
   
-    POSIX Flat Filesystem
+    Regular Files
   
 
     
@@ -1065,7 +1442,7 @@
   <span class="md-ellipsis">
     
   
-    Hierarchical Directory Trees
+    Directory Trees
   
 
     
@@ -1093,7 +1470,7 @@
   <span class="md-ellipsis">
     
   
-    Atomic Renames
+    Atomic Rename
   
 
     
@@ -1121,7 +1498,119 @@
   <span class="md-ellipsis">
     
   
-    Reliable Mount
+    Reliable Mount & Shutdown
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/observabledaemon/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability & Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/ondemandprofiling/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    On-Demand Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/replicated_filesystem/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Replicated Storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/optimizationroadmap/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Optimizations
   
 
     
@@ -1149,7 +1638,7 @@
   <span class="md-ellipsis">
     
   
-    Kernel Offloading Acceleration
+    Kernel Offloading
   
 
     
@@ -1198,42 +1687,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../../reference/optimizationroadmap/" class="md-nav__link">
+      <a href="../../reference/sharded_filesystem/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Optimization Roadmap
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../reference/replicated_filesystem/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Replicated Storage
+    Sharded Filesystem
   
 
     
@@ -1313,6 +1774,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../explanation/projectlocalenvironment/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Project-Local Development Environment
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../explanation/flat_filesystem/" class="md-nav__link">
         
   
@@ -1320,7 +1809,7 @@
   <span class="md-ellipsis">
     
   
-    POSIX Flat Filesystem
+    Regular Files
   
 
     
@@ -1348,7 +1837,7 @@
   <span class="md-ellipsis">
     
   
-    Hierarchical Directory Trees
+    Directory Trees
   
 
     
@@ -1376,7 +1865,7 @@
   <span class="md-ellipsis">
     
   
-    Atomic Renames
+    Atomic Rename
   
 
     
@@ -1404,7 +1893,119 @@
   <span class="md-ellipsis">
     
   
-    Reliable Mount
+    Reliable Mount & Shutdown
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/observabledaemon/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observability & Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/ondemandprofiling/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    On-Demand Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/replicated_filesystem/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Replicated Storage
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/optimizationroadmap/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Optimizations
   
 
     
@@ -1432,7 +2033,7 @@
   <span class="md-ellipsis">
     
   
-    Kernel Offloading Acceleration
+    Kernel Offloading
   
 
     
@@ -1481,42 +2082,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../../explanation/optimizationroadmap/" class="md-nav__link">
+      <a href="../../explanation/sharded_filesystem/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Optimization Roadmap
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../explanation/replicated_filesystem/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Replicated Storage
+    Sharded Filesystem
   
 
     
@@ -1557,6 +2130,102 @@
     
   
   
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#step-1-make-a-workspace" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 1: make a workspace
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-2-create-and-read-a-file" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 2: create and read a file
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-3-append-to-it" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 3: append to it
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-4-cut-it-short-then-grow-it" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 4: cut it short, then grow it
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-5-write-something-bigger" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 5: write something bigger
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-6-look-at-the-bytes-in-postgresql" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 6: look at the bytes in PostgreSQL
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-7-clean-up" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 7: clean up
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#what-we-did" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What we did
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
 </nav>
                   </div>
                 </div>
@@ -1575,19 +2244,94 @@
   
 
 
-<h1 id="tutorial-posix-flat-filesystem">Tutorial: POSIX Flat Filesystem</h1>
-<p><strong>Feature</strong>: <code>spec.app.FlatFilesystem</code></p>
+<h1 id="tutorial-regular-files">Tutorial: Regular Files<a class="headerlink" href="#tutorial-regular-files" title="Permanent link">&para;</a></h1>
+<div class="admonition success">
+<p class="admonition-title">Status: Stable</p>
+<p>Create, read, write, append, truncate and delete are implemented and covered by unit and integration tests. Permissions, ownership and timestamps are reported but not settable (see Reference).</p>
+</div>
 <blockquote>
-<p>Users can create, read, write, and delete files through standard
-POSIX file operations on the mounted directory.</p>
+<p>Users can create, read, write, and delete files through standard POSIX file operations on the mounted directory.</p>
 </blockquote>
+<p><strong>Tutorial</strong> · <a href="../../how-to/flat_filesystem/">How-to</a> · <a href="../../reference/flat_filesystem/">Reference</a> · <a href="../../explanation/flat_filesystem/">Explanation</a></p>
 <hr />
-<p>In this tutorial, we will mount a pgfs filesystem and perform basic POSIX file operations.
-1. Start the pgfs daemon mounted at <code>./mnt</code>.
-2. Create a file using <code>echo 'Hello pgfs' &gt; ./mnt/demo.txt</code>.
-3. Read the file back with <code>cat ./mnt/demo.txt</code> and verify the content.
-4. Append data using <code>echo 'More content' &gt;&gt; ./mnt/demo.txt</code>.
-5. Delete the file using <code>rm ./mnt/demo.txt</code> and confirm it no longer appears in <code>ls ./mnt</code>.</p>
+<p>In this tutorial we will create a file, read it, add to it, cut
+it short, grow it again, and then look at how its bytes are laid
+out in PostgreSQL. By the end we will have seen every basic file
+operation pgfs supports.</p>
+<p>We need a running mount. If <code>./scripts/pgfs.sh status</code> does not
+say <code>mount: active</code>, follow <a href="../projectlocalenvironment/">Your first pgfs
+mount</a> first, up to Step 2.</p>
+<h2 id="step-1-make-a-workspace">Step 1: make a workspace<a class="headerlink" href="#step-1-make-a-workspace" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code>mkdir<span class="w"> </span>testdata/mnt/files
+<span class="nb">cd</span><span class="w"> </span>testdata/mnt/files
+</code></pre></div>
+<h2 id="step-2-create-and-read-a-file">Step 2: create and read a file<a class="headerlink" href="#step-2-create-and-read-a-file" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><span class="nb">echo</span><span class="w"> </span><span class="s1">&#39;Hello pgfs&#39;</span><span class="w"> </span>&gt;<span class="w"> </span>demo.txt
+cat<span class="w"> </span>demo.txt
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>Hello pgfs
+</code></pre></div>
+<h2 id="step-3-append-to-it">Step 3: append to it<a class="headerlink" href="#step-3-append-to-it" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><span class="nb">echo</span><span class="w"> </span><span class="s1">&#39;More content&#39;</span><span class="w"> </span>&gt;&gt;<span class="w"> </span>demo.txt
+cat<span class="w"> </span>demo.txt
+wc<span class="w"> </span>-c<span class="w"> </span>demo.txt
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>Hello pgfs
+More content
+24 demo.txt
+</code></pre></div>
+<h2 id="step-4-cut-it-short-then-grow-it">Step 4: cut it short, then grow it<a class="headerlink" href="#step-4-cut-it-short-then-grow-it" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code>truncate<span class="w"> </span>-s<span class="w"> </span><span class="m">5</span><span class="w"> </span>demo.txt
+cat<span class="w"> </span>demo.txt<span class="p">;</span><span class="w"> </span><span class="nb">echo</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>Hello
+</code></pre></div>
+<p>Now grow the file to 10 bytes. The new bytes read back as
+zeros:</p>
+<div class="highlight"><pre><span></span><code>truncate<span class="w"> </span>-s<span class="w"> </span><span class="m">10</span><span class="w"> </span>demo.txt
+od<span class="w"> </span>-c<span class="w"> </span>demo.txt
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>0000000   H   e   l   l   o  \0  \0  \0  \0  \0
+0000012
+</code></pre></div>
+<h2 id="step-5-write-something-bigger">Step 5: write something bigger<a class="headerlink" href="#step-5-write-something-bigger" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code>head<span class="w"> </span>-c<span class="w"> </span><span class="m">200000</span><span class="w"> </span>/dev/urandom<span class="w"> </span>&gt;<span class="w"> </span>big.bin
+cp<span class="w"> </span>big.bin<span class="w"> </span>copy.bin
+cmp<span class="w"> </span>big.bin<span class="w"> </span>copy.bin<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span>identical
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>identical
+</code></pre></div>
+<h2 id="step-6-look-at-the-bytes-in-postgresql">Step 6: look at the bytes in PostgreSQL<a class="headerlink" href="#step-6-look-at-the-bytes-in-postgresql" title="Permanent link">&para;</a></h2>
+<p>From the repository root, in a second terminal:</p>
+<div class="highlight"><pre><span></span><code>psql<span class="w"> </span>-h<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PWD</span><span class="s2">/testdata&quot;</span><span class="w"> </span>-d<span class="w"> </span>pgfs<span class="w"> </span>-c<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">&quot;SELECT name, block_no, length(data) FROM blocks WHERE parent = &#39;files&#39; ORDER BY name, block_no&quot;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>   name   | block_no | length
+----------+----------+--------
+ big.bin  |        0 |  65536
+ big.bin  |        1 |  65536
+ big.bin  |        2 |  65536
+ big.bin  |        3 |   3392
+ copy.bin |        0 |  65536
+ ...
+ demo.txt |        0 |      5
+</code></pre></div>
+<p><code>big.bin</code> is four rows: three full 64 KiB blocks and a short
+last one. <code>demo.txt</code> is a single 5-byte block. Its declared
+size is 10, and the five missing bytes are the zeros we saw in
+Step 4.</p>
+<h2 id="step-7-clean-up">Step 7: clean up<a class="headerlink" href="#step-7-clean-up" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><span class="nb">cd</span><span class="w"> </span>../../..
+rm<span class="w"> </span>-r<span class="w"> </span>testdata/mnt/files
+</code></pre></div>
+<h2 id="what-we-did">What we did<a class="headerlink" href="#what-we-did" title="Permanent link">&para;</a></h2>
+<p>We used ordinary shell tools to exercise create, read, write,
+append, truncate and delete, and saw that a file's contents are
+stored as fixed-size blocks. To learn why it is built this
+way, read the <a href="../../explanation/flat_filesystem/">explanation</a>.
+Next, <a href="../hierarchicaldirectories/">Directory Trees</a>.</p>
+<hr />
+<p><small>Generated from <code>spec.app.FlatFilesystem</code> by <code>scripts/build_docs.py</code>. Edit the specification, not this page.</small></p>
 
 
 
