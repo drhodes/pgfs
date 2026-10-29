@@ -170,7 +170,7 @@ fn run(args: &Args) -> Result<()> {
     let _pid_guard = FileGuard(pid_path.clone());
     let _ready_guard = FileGuard(ready_path.clone());
 
-    let options = vec![
+    let mut options = vec![
         fuser::MountOption::FSName("pgfs".to_string()),
         fuser::MountOption::AutoUnmount,
     ];
@@ -182,14 +182,25 @@ fn run(args: &Args) -> Result<()> {
 
     println!("mounting pgfs at {}", args.mountpoint);
     let attr_ttl = std::time::Duration::from_secs_f64(args.attr_ttl);
-    let mut session = error::ctx(
-        fuser::Session::new(
-            PgFs::with_attr_ttl(db, Arc::clone(&dump_requested), attr_ttl),
-            std::path::Path::new(&args.mountpoint),
-            &options,
-        ),
-        &format!("mount at {}", args.mountpoint),
-    )?;
+    let mut session = match fuser::Session::new(
+        PgFs::with_attr_ttl(db.clone(), Arc::clone(&dump_requested), attr_ttl),
+        std::path::Path::new(&args.mountpoint),
+        &options,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("mount with AutoUnmount failed ({e:#}); retrying without AutoUnmount");
+            options.retain(|opt| !matches!(opt, fuser::MountOption::AutoUnmount));
+            error::ctx(
+                fuser::Session::new(
+                    PgFs::with_attr_ttl(db, Arc::clone(&dump_requested), attr_ttl),
+                    std::path::Path::new(&args.mountpoint),
+                    &options,
+                ),
+                &format!("mount at {}", args.mountpoint),
+            )?
+        }
+    };
 
     // Health: readiness file.  The supervisor polls for this.
     write_atomic(&ready_path, "ready");

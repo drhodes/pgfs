@@ -1099,7 +1099,7 @@ mod tests {
 
     #[test]
     fn connect_disables_synchronous_commit() {
-        let mut db = db_connect();
+        let db = db_connect();
         let row = db
             .client_guard()
             .query_one("SHOW synchronous_commit;", &[])

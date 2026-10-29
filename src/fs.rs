@@ -446,9 +446,8 @@ impl Filesystem for PgFs {
         config: &mut fuser::KernelConfig,
     ) -> Result<(), libc::c_int> {
         let _span = info_span!("init").entered();
-        let _ = config.add_capabilities(fuser::consts::FUSE_WRITEBACK_CACHE);
         let _ = config.add_capabilities(fuser::consts::FUSE_BIG_WRITES);
-        tracing::info!("FUSE init: negotiated FUSE_WRITEBACK_CACHE and FUSE_BIG_WRITES");
+        tracing::info!("FUSE init: negotiated FUSE_BIG_WRITES");
         Ok(())
     }
 
@@ -778,6 +777,7 @@ impl Filesystem for PgFs {
 
         let path = db::join(&parent_path, &name);
         let ino = self.ino_for(&path);
+        self.open_handles_by_ino.insert(ino, fh);
         let attr = Self::file_attr(ino, 0, std::time::SystemTime::now());
         reply.created(&self.attr_ttl, &attr, 0, fh, 0);
     }
