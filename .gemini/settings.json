@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "libspec": {
+      "command": "/home/derek/.local/bin/uv",
+      "args": [
+        "run",
+        "libspec",
+        "mcp"
+      ]
+    }
+  }
+}

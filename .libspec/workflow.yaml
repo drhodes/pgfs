@@ -1,21 +1,49 @@
-# Agent Workflow Hooks configuration file.
-# Hooks are run automatically at the named lifecycle stage.
+# Agent Workflow Hooks configuration file (.libspec/workflow.yaml)
+# Customize project-specific commands injected into the 9-phase developer agent workflow.
 
 hooks:
+  # Phase 1: Edit Spec [DECLARATIVE]
   post-edit:
     - "Validate spec: `uv run libspec diff`"
-  #
+
+  # Phase 2: Diff Spec [DECLARATIVE -> IMPERATIVE]
   pre-diff:
     - "Ensure deps: `uv sync`"
-  #
+  # post-diff:
+  #   - "Review generated imperative prompt deltas"
+
+  # Phase 3: Sort Topo Ordering [IMPERATIVE]
+  # post-dependencies:
+  #   - "Inspect implementation waves: `uv run libspec dependencies --topo`"
+
+  # Phase 4: Test Driven Development [IMPERATIVE - Contract Driven]
+  # pre-test:
+  #   - "Ensure testing dependencies are synced: `uv sync`"
+  # post-test:
+  #   - "Verify new tests fail before implementation (Red)"
+
+  # Phase 5: Implement [IMPERATIVE - Goal Directed]
   post-implement:
     - "Type-check: `cargo check`"
     - "Format check: `cargo fmt --check`"
     - "Lint: `cargo clippy -- -D warnings`"
     - "Run tests: `cargo test`"
-  #
+
+  # Phase 6: Code Quality & Verification [IMPERATIVE]
   pre-commit:
     - "Type-check: `cargo check`"
     - "Format check: `cargo fmt --check`"
     - "Lint: `cargo clippy -- -D warnings`"
     - "Run tests: `cargo test`"
+
+  # Phase 7: Verify Specification Sync [DECLARATIVE]
+  # post-sync:
+  #   - "Verify zero spec drift: `uv run libspec diff`"
+
+  # Phase 8: Version Bump [IMPERATIVE]
+  # pre-bump:
+  #   - "Review git status before bump: `git status -s`"
+
+  # Phase 9: Commit & Present [IMPERATIVE]
+  # post-commit:
+  #   - "Display commit summary and changed footprints"
