@@ -621,82 +621,126 @@ BEGIN
     RETURN true;
 END $$;
 
--- What changed between two views of one layer, from epochs (spec/branch.py
--- SnapshotDiff): every key born or retired in (p_from, p_to].
-CREATE FUNCTION pgfs.diff(p_layer bigint, p_from bigint, p_to bigint)
+-- What changed from view A to view B, computed from epochs rather than
+-- from the change feed (spec/branch.py SnapshotDiff). The views are two
+-- epochs of one layer, or a branch and the layer it is based on (in
+-- either order). Only keys whose rows changed between the views are
+-- examined, so the cost is proportional to the change. A non-directory is
+-- `modified` when its content (mtime or size), mode, owner or symlink
+-- target differs.
+CREATE FUNCTION pgfs.diff_views(p_la bigint, p_ea bigint, p_lb bigint, p_eb bigint)
 RETURNS TABLE (change text, ino bigint, kind "char", path bytea, old_path bytea)
 LANGUAGE plpgsql STABLE AS $$
 #variable_conflict use_column
 DECLARE
-    v_root bigint := pgfs._root_of(p_layer);
+    v_root_a bigint := pgfs._root_of(p_la);
+    v_root_b bigint := pgfs._root_of(p_lb);
+    v_branch bigint;       -- the branch layer (all of its rows are keys)
+    v_base bigint;         -- the layer it is based on
+    v_lo bigint;           -- base-layer rows changed in (v_lo, v_hi] are keys
+    v_hi bigint;
+    l pgfs.layers;
     x record;
     a pgfs.dentries;
     b pgfs.dentries;
+    n pgfs.dentries;
     ia pgfs.inodes;
     ib pgfs.inodes;
 BEGIN
-    -- Names.
-    FOR x IN SELECT DISTINCT d.parent_ino, d.name FROM pgfs.dentries d
-             WHERE d.layer = p_layer
-               AND ((d.born > p_from AND d.born <= p_to) OR (d.died > p_from AND d.died <= p_to))
-             ORDER BY 1, 2 LOOP
-        a := pgfs._dentry(p_layer, p_from, x.parent_ino, x.name);
-        b := pgfs._dentry(p_layer, p_to, x.parent_ino, x.name);
-        CONTINUE WHEN a.ino IS NOT DISTINCT FROM b.ino;
-        IF a.ino IS NOT NULL THEN
-            -- Renamed if the inode still has a name at p_to.
-            IF pgfs._name_of(p_layer, p_to, a.ino) IS NOT NULL THEN
-                IF NOT EXISTS (SELECT 1 FROM pgfs.dentries d WHERE d.layer = p_layer AND d.ino = a.ino
-                                 AND d.born > p_from AND d.born <= p_to
-                                 AND (d.parent_ino, d.name) < (x.parent_ino, x.name)) THEN
-                    change := 'renamed';
-                    ino := a.ino;
-                    kind := a.kind;
-                    path := pgfs._ino_path(p_layer, p_to, a.ino);
-                    old_path := pgfs._join(pgfs._path(p_layer, p_from, x.parent_ino, v_root), x.name);
-                    RETURN NEXT;
-                END IF;
+    IF p_la = p_lb THEN
+        v_branch := NULL;
+        v_base := p_la;
+        v_lo := LEAST(p_ea, p_eb);
+        v_hi := GREATEST(p_ea, p_eb);
+    ELSE
+        SELECT * INTO l FROM pgfs.layers WHERE layer = p_lb;
+        IF l.base_layer = p_la THEN
+            v_branch := p_lb;
+            v_lo := LEAST(p_ea, l.base_epoch);
+            v_hi := GREATEST(p_ea, l.base_epoch);
+        ELSE
+            SELECT * INTO l FROM pgfs.layers WHERE layer = p_la;
+            IF l.base_layer = p_lb THEN
+                v_branch := p_la;
+                v_lo := LEAST(p_eb, l.base_epoch);
+                v_hi := GREATEST(p_eb, l.base_epoch);
             ELSE
-                change := 'removed';
-                ino := a.ino;
-                kind := a.kind;
-                path := pgfs._join(pgfs._path(p_layer, p_from, x.parent_ino, v_root), x.name);
-                old_path := NULL;
-                RETURN NEXT;
+                RAISE EXCEPTION 'the two views are not related: neither is the other''s branch'
+                    USING ERRCODE = 'PF007';
             END IF;
         END IF;
-        IF b.ino IS NOT NULL AND pgfs._name_of(p_layer, p_from, b.ino) IS NULL THEN
-            change := 'added';
-            ino := b.ino;
-            kind := b.kind;
-            path := pgfs._join(pgfs._path(p_layer, p_to, x.parent_ino, v_root), x.name);
+        v_base := l.base_layer;
+    END IF;
+
+    -- Names.
+    FOR x IN SELECT DISTINCT d.parent_ino, d.name FROM pgfs.dentries d
+             WHERE (d.layer = v_base AND ((d.born > v_lo AND d.born <= v_hi) OR (d.died > v_lo AND d.died <= v_hi)))
+                OR d.layer = v_branch
+             ORDER BY 1, 2 LOOP
+        a := pgfs._dentry(p_la, p_ea, x.parent_ino, x.name);
+        b := pgfs._dentry(p_lb, p_eb, x.parent_ino, x.name);
+        CONTINUE WHEN a.ino IS NOT DISTINCT FROM b.ino;
+        IF a.ino IS NOT NULL AND pgfs._name_of(p_lb, p_eb, a.ino) IS NULL THEN
+            change := 'removed';
+            ino := a.ino;
+            kind := a.kind;
+            path := pgfs._join(pgfs._path(p_la, p_ea, x.parent_ino, v_root_a), x.name);
             old_path := NULL;
             RETURN NEXT;
         END IF;
+        IF b.ino IS NOT NULL THEN
+            n := pgfs._name_of(p_la, p_ea, b.ino);
+            IF n IS NULL THEN
+                change := 'added';
+                old_path := NULL;
+            ELSE
+                change := 'renamed';
+                old_path := pgfs._join(pgfs._path(p_la, p_ea, n.parent_ino, v_root_a), n.name);
+            END IF;
+            ino := b.ino;
+            kind := b.kind;
+            path := pgfs._join(pgfs._path(p_lb, p_eb, x.parent_ino, v_root_b), x.name);
+            RETURN NEXT;
+        END IF;
     END LOOP;
-    -- Contents and attributes of inodes that exist in both views.
+
+    -- Contents and attributes of inodes present in both views.
     FOR x IN SELECT DISTINCT i FROM (
-                 SELECT ino AS i FROM pgfs.inodes WHERE layer = p_layer
-                   AND ((born > p_from AND born <= p_to) OR (died > p_from AND died <= p_to))
+                 SELECT r.ino AS i FROM pgfs.inodes r
+                 WHERE (r.layer = v_base AND ((r.born > v_lo AND r.born <= v_hi) OR (r.died > v_lo AND r.died <= v_hi)))
+                    OR r.layer = v_branch
                  UNION
-                 SELECT ino FROM pgfs.file_blocks WHERE layer = p_layer
-                   AND ((born > p_from AND born <= p_to) OR (died > p_from AND died <= p_to))
+                 SELECT f.ino FROM pgfs.file_blocks f
+                 WHERE (f.layer = v_base AND ((f.born > v_lo AND f.born <= v_hi) OR (f.died > v_lo AND f.died <= v_hi)))
+                    OR f.layer = v_branch
                  UNION
-                 SELECT ino FROM pgfs.xattrs WHERE layer = p_layer
-                   AND ((born > p_from AND born <= p_to) OR (died > p_from AND died <= p_to))) s
+                 SELECT t.ino FROM pgfs.xattrs t
+                 WHERE (t.layer = v_base AND ((t.born > v_lo AND t.born <= v_hi) OR (t.died > v_lo AND t.died <= v_hi)))
+                    OR t.layer = v_branch) s
              ORDER BY 1 LOOP
-        ia := pgfs._inode(p_layer, p_from, x.i);
-        ib := pgfs._inode(p_layer, p_to, x.i);
-        CONTINUE WHEN ia IS NULL OR ib IS NULL;
-        CONTINUE WHEN ia.version = ib.version AND ia.size = ib.size;
+        ia := pgfs._inode(p_la, p_ea, x.i);
+        ib := pgfs._inode(p_lb, p_eb, x.i);
+        -- Directories change through their names, reported above; a rename
+        -- alone (ctime only) is not a modification.
+        CONTINUE WHEN ia IS NULL OR ib IS NULL OR ib.kind = 'd';
+        CONTINUE WHEN ia.mtime_ns = ib.mtime_ns AND ia.size = ib.size AND ia.mode = ib.mode
+                  AND ia.uid = ib.uid AND ia.gid = ib.gid
+                  AND ia.target IS NOT DISTINCT FROM ib.target;
         change := 'modified';
         ino := x.i;
         kind := ib.kind;
-        path := pgfs._ino_path(p_layer, p_to, x.i);
+        path := pgfs._ino_path(p_lb, p_eb, x.i);
         old_path := NULL;
         RETURN NEXT;
     END LOOP;
 END $$;
+
+-- Two epochs of one layer.
+CREATE FUNCTION pgfs.diff(p_layer bigint, p_from bigint, p_to bigint)
+RETURNS TABLE (change text, ino bigint, kind "char", path bytea, old_path bytea)
+LANGUAGE sql STABLE AS $$
+    SELECT * FROM pgfs.diff_views(p_layer, p_from, p_layer, p_to)
+$$;
 
 -- Control requests for an owning daemon (spec/branch.py DrainsOwnerBeforeSnapshot).
 CREATE FUNCTION pgfs.control_submit(p_tree text, p_kind text, p_args jsonb)

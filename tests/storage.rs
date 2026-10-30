@@ -1232,3 +1232,100 @@ fn the_runtime_role_can_only_go_through_the_functions() {
     drop(d);
     let _ = a.batch(&format!("DROP ROLE IF EXISTS {role}"));
 }
+
+#[test]
+fn diff_compares_a_branch_with_its_base() {
+    // spec/branch.py SnapshotDiff: "and for branches against their base".
+    let d = db!("diffbranch");
+    let mut be = d.backend();
+    let v = d.view("main");
+    let bs = d.block_size;
+    let f = mk(&mut be, v.layer, 1, b"f", Kind::File).unwrap();
+    write(
+        &mut be,
+        &v,
+        f.ino,
+        Some(f.gen),
+        0,
+        0,
+        b"one",
+        bs,
+        d.inline_max,
+    )
+    .unwrap();
+    mk(&mut be, v.layer, 1, b"old", Kind::File).unwrap();
+    mk(&mut be, v.layer, 1, b"gone", Kind::File).unwrap();
+    be.snapshot("main", "c1").unwrap();
+    be.branch("main", Some("c1"), "feat").unwrap();
+    let fv = d.view("feat");
+    write(
+        &mut be,
+        &fv,
+        f.ino,
+        Some(f.gen),
+        3,
+        3,
+        b"two",
+        bs,
+        d.inline_max,
+    )
+    .unwrap();
+    be.rename(
+        fv.layer,
+        &RenameArgs {
+            parent: 1,
+            name: b"old".to_vec(),
+            newparent: 1,
+            newname: b"new".to_vec(),
+            flags: 0,
+            open: vec![],
+            dirty: vec![],
+            now: now(),
+        },
+    )
+    .unwrap();
+    be.unlink(fv.layer, 1, b"gone", &[], &[], now()).unwrap();
+    mk(&mut be, fv.layer, 1, b"added", Kind::File).unwrap();
+    let c1 = d.snapshot_view("main", "c1");
+    let q = |a: &View, b: &View| -> Vec<(String, String, Option<String>)> {
+        d.conn()
+            .query_sql(
+                "SELECT change, pgfs.name_text(path), pgfs.name_text(old_path) FROM pgfs.diff_views($1, $2, $3, $4) ORDER BY 2",
+                &[&a.layer, &a.epoch.unwrap_or(1), &b.layer, &b.epoch.unwrap_or(1)],
+            )
+            .unwrap()
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2)))
+            .collect()
+    };
+    let fwd = q(&c1, &fv);
+    assert_eq!(
+        fwd,
+        vec![
+            ("added".into(), "/added".into(), None),
+            ("modified".into(), "/f".into(), None),
+            ("removed".into(), "/gone".into(), None),
+            ("renamed".into(), "/new".into(), Some("/old".into())),
+        ],
+        "{fwd:?}"
+    );
+    let back = q(&fv, &c1);
+    assert!(
+        back.contains(&("removed".into(), "/added".into(), None)),
+        "{back:?}"
+    );
+    assert!(
+        back.contains(&("renamed".into(), "/old".into(), Some("/new".into()))),
+        "{back:?}"
+    );
+    be.branch("main", None, "other").unwrap();
+    let e = d
+        .conn()
+        .query_sql(
+            "SELECT * FROM pgfs.diff_views($1, 1, $2, 1)",
+            &[&fv.layer, &d.layer("other")],
+        )
+        .unwrap_err();
+    assert_eq!(e.sqlstate.as_deref(), Some("PF007"));
+    d.assert_check();
+}

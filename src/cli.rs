@@ -843,22 +843,32 @@ fn diff(g: &Global, from: &str, to: &str) -> Result<i32> {
     );
     let (la, ea) = view_epoch(&mut c, &a)?;
     let (lb, eb) = view_epoch(&mut c, &b)?;
-    if la != lb {
-        let pp: Option<String> = q(&mut c, "find pre-promote snapshot",
-            "SELECT name FROM pgfs.snapshots WHERE tree = $1 AND name LIKE 'pre-promote-%' ORDER BY created_at DESC LIMIT 1", &[&b.tree])?
-            .first().map(|r| r.get(0));
-        bail!(
-            "{from} and {to} are on different layers: a --force promote moved {} (its previous contents are {}@{}); diff each side against that snapshot",
-            b.tree, b.tree, pp.unwrap_or_else(|| "pre-promote-<ts>".into())
-        );
-    }
-    let (lo, hi) = if ea <= eb { (ea, eb) } else { (eb, ea) };
-    let rows = q(
-        &mut c,
-        "diff",
-        "SELECT change, ino, path, old_path FROM pgfs.diff($1, $2, $3)",
-        &[&la, &lo, &hi],
-    )?;
+    let rows = match c.query_sql(
+        "SELECT change, ino, path, old_path FROM pgfs.diff_views($1, $2, $3, $4)",
+        &[&la, &ea, &lb, &eb],
+    ) {
+        Ok(rows) => rows,
+        Err(e) if e.sqlstate.as_deref() == Some("PF007") => {
+            // Unrelated layers: name the --force promote that moved a tree, if any.
+            let pp: Option<String> = q(
+                &mut c,
+                "find pre-promote snapshot",
+                "SELECT tree || '@' || name FROM pgfs.snapshots WHERE tree IN ($1, $2)
+                   AND name LIKE 'pre-promote-%' AND layer IN ($3, $4) ORDER BY created_at DESC LIMIT 1",
+                &[&a.tree, &b.tree, &la, &lb],
+            )?
+            .first()
+            .map(|r| r.get(0));
+            match pp {
+                Some(s) => bail!(
+                    "{from} and {to} are on unrelated layers: a --force promote moved the tree \
+                     (its previous contents are {s}); diff each side against that snapshot"
+                ),
+                None => bail!("{from} and {to} are unrelated: diff compares two views of one tree, or a branch with its base"),
+            }
+        }
+        Err(e) => return Err(cli_err("diff", e)),
+    };
     for r in rows {
         let (ch, ino, p, op): (String, i64, Option<Vec<u8>>, Option<Vec<u8>>) =
             (r.get(0), r.get(1), r.get(2), r.get(3));
