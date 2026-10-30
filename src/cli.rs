@@ -186,6 +186,12 @@ pub struct MountArgs {
     /// Let other users use the mount (needs user_allow_other in /etc/fuse.conf).
     #[arg(long)]
     pub allow_other: bool,
+    /// Honour set-uid and set-gid bits. Root only; anyone who can write the tree can gain root.
+    #[arg(long)]
+    pub suid: bool,
+    /// Allow device nodes to be opened. Root only; anyone who can write the tree can reach this host's devices.
+    #[arg(long)]
+    pub dev: bool,
     /// Run although the server cannot keep data durable.
     #[arg(long)]
     pub i_accept_data_loss: bool,
@@ -545,6 +551,8 @@ fn mount(g: &Global, a: MountArgs) -> Result<i32> {
         stall_error: Duration::from_secs(a.stall_error),
         shutdown_timeout: Duration::from_secs(a.shutdown_timeout),
         allow_other: a.allow_other,
+        suid: a.suid,
+        dev: a.dev,
         accept_data_loss: a.i_accept_data_loss,
         replicas: a.replica,
         replica_wait: Duration::from_millis(a.replica_wait),

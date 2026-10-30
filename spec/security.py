@@ -10,6 +10,9 @@ client, enforces the rules that matter).
 """
 
 from .err import STABLE, Feat, Req, md
+from .posix import (
+    SpecialFiles,
+)
 from .storage import (
     InodeTable,
     OperationsAsSqlFunctions,
@@ -63,6 +66,46 @@ class AllowOtherOptIn(Req):
     """
 
     deps = [EnforcesPermissions]
+
+
+class SetIdAndDevicesOptIn(Req):
+    """Every mount is `nosuid` and `nodev`: the kernel ignores set-user-id
+    and set-group-id bits when a program runs from it, and refuses to
+    open device nodes on it. pgfs still stores the bits and the device
+    numbers (`ClearsSetIdBits`, `posix.SpecialFiles`); the mount flags
+    decide only whether they take effect. The daemon asks for `nosuid`
+    and `nodev` explicitly, so a mount made by root is no exception.
+
+    `pgfs mount --suid` and `pgfs mount --dev` lift one flag each, for a
+    container or root filesystem that needs set-uid programs or device
+    nodes. Both need the daemon to run as root (effective uid 0), the only
+    case in which FUSE honours them; otherwise the mount is refused before
+    anything is mounted, naming the flag. Each such mount logs a WARN,
+    on every mount, naming the flag and what it grants.
+
+    **Security.** With `--suid`, anyone who can write the mounted tree can
+    gain root on the mounting host: any holder of the runtime role (the
+    `pgfs.*` functions trust the kernel's checks and take owners and modes
+    as given), the schema owner, `pgfs import` of a crafted archive, and
+    whoever prepared a branch that is promoted into the tree or a snapshot
+    that is mounted. One runtime role can write every tree in its
+    database, so the trust domain is the database. With `--dev`, the same
+    writers gain whatever the device numbers mean on the mounting host,
+    for example raw disk or memory access. The reference documentation
+    says so. Read-only and snapshot mounts may use both flags, which
+    limits the writers to whoever produced the snapshot.
+
+    **Invariant.** No mount honours set-id bits or device nodes unless it
+    was given `--suid` or `--dev`.
+
+    **Errors.** Without root, `--suid` or `--dev` exits with status 2
+    before mounting.
+
+    **Sources.** fusermount and `mount.fuse` (unprivileged FUSE mounts are
+    always `nosuid,nodev`); mount(8).
+    """
+
+    deps = [EnforcesPermissions, ClearsSetIdBits, SpecialFiles]
 
 
 class LeastPrivilegeRoles(Req):
@@ -132,6 +175,7 @@ class AccessControl(Feat):
         OwnershipFromCaller,
         ClearsSetIdBits,
         AllowOtherOptIn,
+        SetIdAndDevicesOptIn,
         LeastPrivilegeRoles,
         RequiresTlsForRemote,
         RedactsSecrets,
@@ -203,6 +247,21 @@ class AccessControl(Feat):
             Add `user_allow_other` to `/etc/fuse.conf`, then mount with
             `--allow-other`. Normal permissions still apply.
 
+            ## Run set-uid programs or use device nodes from a tree
+
+            For a container or root filesystem whose every writer you
+            trust with root on this host, run the daemon as root:
+
+            ```bash
+            sudo pgfs mount os /srv/os --allow-other --suid
+            ```
+
+            Add `--dev` only if programs must open device nodes stored in
+            the tree; a booted system or a container normally gets `/dev`
+            from devtmpfs or its runtime. To limit who can plant set-uid
+            programs, mount a snapshot (`os@release-42`) or `--read-only`,
+            and keep such trees in a database of their own.
+
             ## Encrypt data at rest
 
             Put the Postgres data directory on an encrypted volume.
@@ -222,6 +281,25 @@ class AccessControl(Feat):
             | Option | Effect |
             |---|---|
             | `--allow-other` | let other users reach the mount (permissions still apply) |
+            | `--suid` | honour set-user-id and set-group-id bits; root only; logged at WARN |
+            | `--dev` | allow device nodes to be opened; root only; logged at WARN |
+
+            ## Mount flags
+
+            Every mount is `nosuid,nodev` unless `--suid` or `--dev` is
+            given. With `--suid`, these can gain root on the mounting
+            host:
+
+            | Writer | How |
+            |---|---|
+            | any holder of the runtime role | `pgfs.setattr` or `pgfs.create` with owner 0 and mode 04755, called directly |
+            | the schema owner | writing the tables |
+            | `pgfs import` | an archive with set-uid-root files |
+            | the author of a promoted branch or a mounted snapshot | whatever they put in it |
+
+            With `--dev`, the same writers gain the devices their nodes'
+            numbers name on the mounting host. One runtime role writes
+            every tree in its database.
             | `--password-file PATH` | read the database password from PATH |
             | `--insecure-transport` | allow a non-TLS remote connection (logged) |
         """)
@@ -236,6 +314,19 @@ class AccessControl(Feat):
             FUSE's `default_permissions` option makes it apply them
             before a request reaches pgfs. Reimplementing them in the
             daemon would only add a second chance to get them wrong.
+
+            ## Why set-id bits and devices are opt-in
+
+            A set-uid-root program runs as root whoever wrote it, and
+            the kernel checks permissions only for writes that pass
+            through a mount. pgfs trees can also be written through SQL,
+            through `pgfs import`, and from other machines, so with
+            `--suid` the database's writers become root on the mounting
+            host. That is the bargain a container or root filesystem on
+            pgfs has to make, and it is why the flags need root, are
+            logged on every mount, and are off unless asked for.
+            Unprivileged FUSE mounts have always been `nosuid,nodev` for
+            the same reason.
 
             ## The database enforces pgfs's rules
 

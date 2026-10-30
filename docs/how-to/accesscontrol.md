@@ -21,6 +21,21 @@ pgfs mount --conn "host=db.example.com dbname=pgfs user=pgfs_runtime sslmode=ver
 Add `user_allow_other` to `/etc/fuse.conf`, then mount with
 `--allow-other`. Normal permissions still apply.
 
+## Run set-uid programs or use device nodes from a tree
+
+For a container or root filesystem whose every writer you
+trust with root on this host, run the daemon as root:
+
+```bash
+sudo pgfs mount os /srv/os --allow-other --suid
+```
+
+Add `--dev` only if programs must open device nodes stored in
+the tree; a booted system or a container normally gets `/dev`
+from devtmpfs or its runtime. To limit who can plant set-uid
+programs, mount a snapshot (`os@release-42`) or `--read-only`,
+and keep such trees in a database of their own.
+
 ## Encrypt data at rest
 
 Put the Postgres data directory on an encrypted volume.

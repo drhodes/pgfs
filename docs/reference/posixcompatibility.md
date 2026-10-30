@@ -95,8 +95,8 @@
     `mknod` creates regular files, FIFOs, sockets, and character and
     block devices, storing `rdev` for devices. pgfs stores these inodes
     and the kernel implements their I/O. Device nodes take effect only on
-    mounts without `nodev`, and the kernel permits creating them only to
-    privileged callers.
+    mounts given `--dev` (`security.SetIdAndDevicesOptIn`), and the kernel
+    permits creating them only to privileged callers.
 
 ??? abstract "ExtendedAttributes"
     `spec.posix.ExtendedAttributes`

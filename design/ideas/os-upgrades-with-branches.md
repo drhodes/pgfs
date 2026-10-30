@@ -111,13 +111,13 @@ the system tree changed underneath it.
 
 ### Upgrade a container rootfs
 
-Once `pgfs mount` has `--suid` and `--dev` (see [An operating system on
-pgfs](os-on-pgfs.md)):
+As root, with the security notes of [An operating system on
+pgfs](os-on-pgfs.md) in mind:
 
 ```bash
 pgfs snapshot os@before-upgrade
 pgfs branch os@before-upgrade upgrade
-pgfs mount upgrade /mnt/upgrade --suid --dev
+pgfs mount upgrade /mnt/upgrade --suid
 systemd-nspawn -D /mnt/upgrade apt full-upgrade
 systemd-nspawn -b -D /mnt/upgrade         # boot-test in a container
 ```
@@ -183,7 +183,6 @@ changes like an upgrade, or give it its own tree and merge by hand.
 
 | Piece | Why |
 |---|---|
-| `--suid`, `--dev` on `pgfs mount` | set-uid programs and device nodes |
 | initramfs hook for `pgfs.tree=` and `pgfs.promote=` | promote must run before root is mounted |
 | systemd root-storage-daemon handling | the daemon must survive `switch_root` and stop last at shutdown |
 | an "empty tree" command | today a separate state tree is made by branching an (empty) directory |

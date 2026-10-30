@@ -1,35 +1,38 @@
 # An operating system on pgfs
 
-Status: idea, not specified, not yet tried. Recorded 2026-10-30.
+Status: idea, not specified, not yet tried. Recorded 2026-10-30;
+`--suid` and `--dev` added the same day (`security.SetIdAndDevicesOptIn`).
 
 Could an operating system live on pgfs: first as a container or chroot
 root, then as the real root filesystem? Most of what an OS needs is
-already there. A small change is needed before a container works, and
-more before a machine can boot from it.
+already there, including the `--suid` and `--dev` mount flags a container
+needs. More is needed before a machine can boot from it.
 
 ---
 
 ## Tutorial
 
-Not yet possible. Every pgfs mount comes up `nosuid,nodev`, and
-`pgfs mount` has no option to change that, so set-uid programs such as
-`sudo` would not work and device nodes created inside would not open.
-Once `--suid` and `--dev` exist, the tutorial is: mount a tree as root,
-`debootstrap` into it, and boot it with `systemd-nspawn -b`. The [OS
-upgrades tutorial](os-upgrades-with-branches.md) shows the branching
-part with a simulated system tree today.
+Not yet written: it needs root, and nobody has run it end to end. The
+steps would be: mount a tree as root with `--suid`, `debootstrap` into
+it, and boot it with `systemd-nspawn -b` (see the how-to below). Read the
+security notes in the reference first. The [OS upgrades
+tutorial](os-upgrades-with-branches.md) shows the branching part with a
+simulated system tree, without root.
 
 ---
 
 ## How-to guides (outline)
 
-### Install a container rootfs (after `--suid` and `--dev`)
+### Install a container rootfs
 
 ```bash
-sudo pgfs mount os /srv/os --allow-other --suid --dev
+sudo pgfs mount os /srv/os --allow-other --suid
 sudo debootstrap stable /srv/os
 sudo systemd-nspawn -D /srv/os          # or: chroot /srv/os
 ```
+
+`debootstrap` creates device nodes; add `--dev` only if something must
+open them from the tree (a container gets `/dev` from its runtime).
 
 Run the daemon as root: files must be owned by root inside the tree, and
 `default_permissions` lets the kernel apply the usual rules.
@@ -38,7 +41,8 @@ Run the daemon as root: files must be owned by root inside the tree, and
 
 1. Keep `/boot` (kernel and initramfs) on a local disk or on the network.
 2. In the initramfs: bring up networking, then run
-   `pgfs mount os /sysroot --allow-other --suid --dev`, then
+   `pgfs mount os /sysroot --allow-other --suid` (the booted system mounts
+   devtmpfs on `/dev`, so `--dev` is not needed), then
    `switch_root /sysroot`.
 3. Start the daemon so systemd treats it as a root storage daemon
    (argv[0] starting with `@`), so it is not killed after `switch_root`
@@ -54,8 +58,8 @@ Run the daemon as root: files must be owned by root inside the tree, and
 | Need | pgfs |
 |---|---|
 | owners, modes, set-id bits | stored; cleared on chown and non-owner writes as Linux does |
-| set-uid programs | stored, but the mount is `nosuid` until `--suid` exists |
-| device nodes, FIFOs, sockets | `mknod` stores them; the mount is `nodev` until `--dev` exists |
+| set-uid programs | stored; honoured only with `--suid` (root only) |
+| device nodes, FIFOs, sockets | `mknod` stores them; device nodes open only with `--dev` (root only) |
 | hard links, symlinks | yes |
 | xattrs (`security.capability` for `ping`) | yes (`user.`, `trusted.`, `security.`) |
 | POSIX ACLs (journald, logind) | no: EOPNOTSUPP |
@@ -70,7 +74,6 @@ Run the daemon as root: files must be owned by root inside the tree, and
 
 | Piece | Size |
 |---|---|
-| `--suid` and `--dev` on `pgfs mount` | small: fuser already has the mount options |
 | initramfs hook | moderate |
 | root-storage-daemon handling | small |
 | in-place daemon upgrade (`ops.UpgradesByRemount`, hand-over of `/dev/fuse`) | planned in the spec, not built |
@@ -98,6 +101,18 @@ network to the database. If the database becomes unreachable, the system
 stalls, then gets EIO after the timeouts. The daemon fails fast and
 recovers by reconnecting and revalidating (`failure.ReconnectsWithBackoff`),
 but a root filesystem has nothing to fall back on.
+
+### What `--suid` costs
+
+With `--suid`, anyone who can write the tree can gain root on the host
+that mounts it: any holder of the database's runtime role (the SQL
+functions take owners and modes as given), the schema owner, `pgfs
+import` of a crafted archive, and whoever prepared a branch that is
+promoted or a snapshot that is mounted. One runtime role writes every
+tree in its database, so keep an OS tree in a database whose writers
+you would trust with root, and prefer mounting a snapshot or
+`--read-only` on machines that only run it. `--dev` extends the same
+writers to the host's devices. See `security.SetIdAndDevicesOptIn`.
 
 ### Why it is still interesting
 

@@ -18,7 +18,7 @@ Each note follows [Diátaxis](https://diataxis.fr/) and has four parts:
 |---|---|---|---|---|
 | [Can it git?](can-it-git.md): versioning a directory like a repository | runnable | yes | yes | yes |
 | [OS upgrades with branches](os-upgrades-with-branches.md): branch, upgrade, test, promote | runnable (a simulated OS tree) | yes | yes | yes |
-| [An operating system on pgfs](os-on-pgfs.md): containers and root filesystems | not yet: needs `--suid` and `--dev` | outline | yes | yes |
+| [An operating system on pgfs](os-on-pgfs.md): containers and root filesystems | not yet: needs root, untried | outline | yes | yes |
 | [Hosting PostgreSQL itself](hosting-postgres.md): the filesystem underneath | not applicable | yes | yes | yes |
 | [pgfs and ZFS](pgfs-vs-zfs.md): what each does that the other doesn't | not applicable | yes | yes | yes |
 

@@ -18,6 +18,19 @@ FUSE's `default_permissions` option makes it apply them
 before a request reaches pgfs. Reimplementing them in the
 daemon would only add a second chance to get them wrong.
 
+## Why set-id bits and devices are opt-in
+
+A set-uid-root program runs as root whoever wrote it, and
+the kernel checks permissions only for writes that pass
+through a mount. pgfs trees can also be written through SQL,
+through `pgfs import`, and from other machines, so with
+`--suid` the database's writers become root on the mounting
+host. That is the bargain a container or root filesystem on
+pgfs has to make, and it is why the flags need root, are
+logged on every mount, and are off unless asked for.
+Unprivileged FUSE mounts have always been `nosuid,nodev` for
+the same reason.
+
 ## The database enforces pgfs's rules
 
 A mount's database role can only call pgfs's functions. So

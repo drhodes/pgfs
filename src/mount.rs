@@ -42,6 +42,10 @@ pub struct MountOptions {
     pub stall_error: Duration,
     pub shutdown_timeout: Duration,
     pub allow_other: bool,
+    /// Honour set-id bits (spec/security.py SetIdAndDevicesOptIn).
+    pub suid: bool,
+    /// Allow device nodes to be opened.
+    pub dev: bool,
     pub accept_data_loss: bool,
     pub replicas: Vec<String>,
     pub replica_wait: Duration,
@@ -123,6 +127,52 @@ pub fn block_signals() -> [i32; 5] {
     signals
 }
 
+/// The FUSE mount options. Every mount is `nosuid,nodev` unless `--suid`
+/// or `--dev` lifts one; asking explicitly keeps a mount made by root from
+/// honouring them by default (spec/security.py SetIdAndDevicesOptIn).
+pub fn mount_options(
+    fsname: String,
+    allow_other: bool,
+    read_only: bool,
+    suid: bool,
+    dev: bool,
+) -> Vec<fuser::MountOption> {
+    use fuser::MountOption as M;
+    let mut o = vec![
+        M::FSName(fsname),
+        M::Subtype("pgfs".into()),
+        M::DefaultPermissions,
+        M::AutoUnmount,
+    ];
+    if allow_other {
+        o.push(M::AllowOther);
+    }
+    if read_only {
+        o.push(M::RO);
+    }
+    o.push(if suid { M::Suid } else { M::NoSuid });
+    o.push(if dev { M::Dev } else { M::NoDev });
+    o
+}
+
+/// `--suid` and `--dev` take effect only for a root mount; refuse them
+/// otherwise, before anything is mounted.
+pub fn check_privilege(suid: bool, dev: bool, euid: u32) -> Result<()> {
+    if (suid || dev) && euid != 0 {
+        let flags: Vec<&str> = [(suid, "--suid"), (dev, "--dev")]
+            .iter()
+            .filter(|f| f.0)
+            .map(|f| f.1)
+            .collect();
+        bail!(
+            "{} {} the daemon to run as root: FUSE honours set-id bits and device nodes only on mounts made by root",
+            flags.join(" "),
+            if flags.len() == 1 { "needs" } else { "need" }
+        );
+    }
+    Ok(())
+}
+
 fn check_mountpoint(p: &std::path::Path) -> Result<()> {
     let md = std::fs::metadata(p).with_context(|| format!("mountpoint {}", p.display()))?;
     if !md.is_dir() {
@@ -187,6 +237,8 @@ fn acquire(
 
 /// Mount and serve until unmounted. Returns the process exit status.
 pub fn run(o: MountOptions) -> Result<i32> {
+    // SAFETY: geteuid cannot fail.
+    check_privilege(o.suid, o.dev, unsafe { libc::geteuid() })?;
     let signals = block_signals();
     let ro = o.read_only || o.view.snapshot.is_some();
     let workers = if ro {
@@ -384,17 +436,19 @@ pub fn run(o: MountOptions) -> Result<i32> {
 
     // The FUSE session.
     let fsname = format!("pgfs-{}", &fs_uuid[..fs_uuid.len().min(8)]);
-    let mut options = vec![
-        fuser::MountOption::FSName(fsname),
-        fuser::MountOption::Subtype("pgfs".into()),
-        fuser::MountOption::DefaultPermissions,
-        fuser::MountOption::AutoUnmount,
-    ];
-    if o.allow_other {
-        options.push(fuser::MountOption::AllowOther);
+    let mut options = mount_options(fsname, o.allow_other, ro, o.suid, o.dev);
+    if o.suid {
+        tracing::warn!(
+            "--suid: set-uid and set-gid programs on this mount run with their owner's privileges; \
+             anyone who can write tree {} (the runtime role, the schema owner, pgfs import, a promoted branch) can gain root here",
+            o.view.tree
+        );
     }
-    if ro {
-        options.push(fuser::MountOption::RO);
+    if o.dev {
+        tracing::warn!(
+            "--dev: device nodes on this mount can be opened; anyone who can write tree {} can reach this host's devices",
+            o.view.tree
+        );
     }
     println!("mounting pgfs {} at {}", o.view, o.mountpoint.display());
     let session = fuser::Session::new(fs::Dispatcher::new(sh.clone()), &o.mountpoint, &options).or_else(|e| {
@@ -1143,6 +1197,32 @@ fn control_listener(ctx: Arc<MountCtx>, sh: Arc<Shared>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mounts_are_nosuid_and_nodev_unless_asked() {
+        // spec/security.py SetIdAndDevicesOptIn.
+        use fuser::MountOption as M;
+        let o = mount_options("pgfs-x".into(), false, false, false, false);
+        assert!(o.contains(&M::NoSuid) && o.contains(&M::NoDev));
+        assert!(!o.contains(&M::Suid) && !o.contains(&M::Dev));
+        assert!(o.contains(&M::DefaultPermissions) && o.contains(&M::AutoUnmount));
+        let o = mount_options("pgfs-x".into(), true, true, true, false);
+        assert!(o.contains(&M::Suid) && o.contains(&M::NoDev) && !o.contains(&M::NoSuid));
+        assert!(o.contains(&M::AllowOther) && o.contains(&M::RO));
+        let o = mount_options("pgfs-x".into(), false, false, false, true);
+        assert!(o.contains(&M::Dev) && o.contains(&M::NoSuid) && !o.contains(&M::NoDev));
+    }
+
+    #[test]
+    fn suid_and_dev_need_root() {
+        assert!(check_privilege(false, false, 1000).is_ok());
+        assert!(check_privilege(true, false, 0).is_ok());
+        assert!(check_privilege(false, true, 0).is_ok());
+        let e = check_privilege(true, false, 1000).unwrap_err().to_string();
+        assert!(e.contains("--suid") && e.contains("root"), "{e}");
+        let e = check_privilege(true, true, 1000).unwrap_err().to_string();
+        assert!(e.contains("--suid --dev"), "{e}");
+    }
 
     #[test]
     fn mountpoint_hash_is_16_hex_digits() {

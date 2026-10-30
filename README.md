@@ -15,8 +15,8 @@ A tree can be snapshotted and branched in constant time, and a branch can be pub
 `mkfs` [`--block-size` *BYTES*] [`--inline-max` *BYTES*] [`--capacity` *BYTES*] [`--scratch`] [`--runtime-role` *ROLE*] [`--force`]
 : Format a database. Nothing else ever runs DDL.
 
-`mount` *TREE*[`@`*SNAPSHOT*][`:`*/PATH*] *MOUNTPOINT* [`--read-only`] [`--takeover`] [`--workers` *N*] [`--replica` *CONNSTRING*] ...
-: Mount a tree, a snapshot (read-only), or a directory of either.
+`mount` *TREE*[`@`*SNAPSHOT*][`:`*/PATH*] *MOUNTPOINT* [`--read-only`] [`--takeover`] [`--workers` *N*] [`--replica` *CONNSTRING*] [`--suid`] [`--dev`] ...
+: Mount a tree, a snapshot (read-only), or a directory of either. Mounts are `nosuid,nodev`; `--suid` and `--dev` (root only) lift that, and let anyone who can write the tree gain root on this host.
 
 `snapshot` *TREE*`@`*NAME* | `snapshot list` [*TREE*] | `snapshot delete` *TREE*`@`*NAME*
 : Freeze a tree. While the tree is mounted, its daemon drains its buffers first (`--crash-consistent` skips that).
