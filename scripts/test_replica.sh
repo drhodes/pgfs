@@ -35,11 +35,11 @@ start_pgfs_with_replica() {
         mount_active || break
         sleep 0.1
     done
-    psql -h "$TESTDATA" -d pgfs -c "TRUNCATE entries" >/dev/null 2>&1 || true
-
     cargo build --quiet 2>/dev/null
+    # Formatting the primary replicates to the standby (a physical copy).
+    target/debug/pgfs mkfs --force --block-size 4096 </dev/null >/dev/null || return 1
     mkdir -p "$MOUNT"
-    target/debug/pgfs "$MOUNT" --replica "$REPLICA_CONN" &
+    target/debug/pgfs mount main "$MOUNT" --replica "$REPLICA_CONN" >>"$TESTDATA/pgfs.log" 2>&1 &
     PGFS_PID=$!
     for _ in $(seq 1 30); do
         mount_active && return 0
@@ -57,14 +57,17 @@ require_mounted
 
 # ── 3. Write through the mount (goes to primary) ──────────────────────
 echo "==> write via mount"
-echo "replica-test-payload" > "$MOUNT/repl.txt"
+printf 'replica-test-payload' > "$MOUNT/repl.txt"
+sync "$MOUNT/repl.txt"
 sleep 0.5
 
 # ── 4. Verify the write replicated to the standby ─────────────────────
 echo "==> verify row on standby (replication)"
 for _ in $(seq 1 20); do
     STANDBY_DATA=$(psql -h 127.0.0.1 -p 5433 -U "$(whoami)" -d pgfs -Atc \
-        "SELECT convert_from(data, 'UTF8') FROM entries WHERE name='repl.txt'" 2>/dev/null || true)
+        "SELECT convert_from(i.inline_data, 'UTF8') FROM pgfs.dentries d
+          JOIN pgfs.inodes i ON i.ino = d.ino AND i.died = 9223372036854775807
+          WHERE d.name = 'repl.txt'::bytea AND d.died = 9223372036854775807" 2>/dev/null | tr -d '\n' || true)
     if [ "$STANDBY_DATA" = "replica-test-payload" ]; then
         break
     fi
@@ -92,6 +95,9 @@ if [ "$CONTENT" != "replica-test-payload" ]; then
     fail "read failed after standby stop (should fall back to primary): '$CONTENT'"
 fi
 pass "reads fall back to primary when standby is down"
+grep -q "standby .* verified" "$TESTDATA/pgfs.log" || fail "the standby's identity was not verified"
+pass "standby identity verified (system identifier, timeline, recovery, fs_uuid)"
+./scripts/replica_db.sh up >/dev/null 2>&1 || true
 
 echo
 echo "=============================="

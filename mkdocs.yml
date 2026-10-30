@@ -47,12 +47,23 @@ nav:
   - Overview: index.md
   - Tutorials:
       - "Project-Local Development Environment": tutorials/projectlocalenvironment.md
+      - "Administering pgfs": tutorials/filesystemlifecycle.md
       - "Regular Files": tutorials/flat_filesystem.md
       - "Directory Trees": tutorials/hierarchicaldirectories.md
       - "Atomic Rename": tutorials/atomicrename.md
+      - "POSIX Compatibility": tutorials/posixcompatibility.md
+      - "Branchable Trees": tutorials/branchabletrees.md
+      - "Change Feed": tutorials/changefeed.md
+      - "Durability and Crash Safety": tutorials/durablestorage.md
+      - "Consistency and Mount Ownership": tutorials/consistentmounts.md
+      - "Storage Layout": tutorials/storagelayout.md
+      - "Space Management": tutorials/spacemanagement.md
+      - "Integrity and Backup": tutorials/dataintegrity.md
+      - "Access Control and Security": tutorials/accesscontrol.md
       - "Reliable Mount & Shutdown": tutorials/reliablemount.md
       - "Observability & Diagnostics": tutorials/observabledaemon.md
       - "On-Demand Profiling": tutorials/ondemandprofiling.md
+      - "Conformance Testing": tutorials/conformancetesting.md
       - "Replicated Storage": tutorials/replicated_filesystem.md
       - "Performance Optimizations": tutorials/optimizationroadmap.md
       - "Kernel Offloading": tutorials/kerneloffloadingacceleration.md
@@ -60,12 +71,23 @@ nav:
       - "Sharded Filesystem": tutorials/sharded_filesystem.md
   - How-To Guides:
       - "Project-Local Development Environment": how-to/projectlocalenvironment.md
+      - "Administering pgfs": how-to/filesystemlifecycle.md
       - "Regular Files": how-to/flat_filesystem.md
       - "Directory Trees": how-to/hierarchicaldirectories.md
       - "Atomic Rename": how-to/atomicrename.md
+      - "POSIX Compatibility": how-to/posixcompatibility.md
+      - "Branchable Trees": how-to/branchabletrees.md
+      - "Change Feed": how-to/changefeed.md
+      - "Durability and Crash Safety": how-to/durablestorage.md
+      - "Consistency and Mount Ownership": how-to/consistentmounts.md
+      - "Storage Layout": how-to/storagelayout.md
+      - "Space Management": how-to/spacemanagement.md
+      - "Integrity and Backup": how-to/dataintegrity.md
+      - "Access Control and Security": how-to/accesscontrol.md
       - "Reliable Mount & Shutdown": how-to/reliablemount.md
       - "Observability & Diagnostics": how-to/observabledaemon.md
       - "On-Demand Profiling": how-to/ondemandprofiling.md
+      - "Conformance Testing": how-to/conformancetesting.md
       - "Replicated Storage": how-to/replicated_filesystem.md
       - "Performance Optimizations": how-to/optimizationroadmap.md
       - "Kernel Offloading": how-to/kerneloffloadingacceleration.md
@@ -73,12 +95,23 @@ nav:
       - "Sharded Filesystem": how-to/sharded_filesystem.md
   - Reference:
       - "Project-Local Development Environment": reference/projectlocalenvironment.md
+      - "Administering pgfs": reference/filesystemlifecycle.md
       - "Regular Files": reference/flat_filesystem.md
       - "Directory Trees": reference/hierarchicaldirectories.md
       - "Atomic Rename": reference/atomicrename.md
+      - "POSIX Compatibility": reference/posixcompatibility.md
+      - "Branchable Trees": reference/branchabletrees.md
+      - "Change Feed": reference/changefeed.md
+      - "Durability and Crash Safety": reference/durablestorage.md
+      - "Consistency and Mount Ownership": reference/consistentmounts.md
+      - "Storage Layout": reference/storagelayout.md
+      - "Space Management": reference/spacemanagement.md
+      - "Integrity and Backup": reference/dataintegrity.md
+      - "Access Control and Security": reference/accesscontrol.md
       - "Reliable Mount & Shutdown": reference/reliablemount.md
       - "Observability & Diagnostics": reference/observabledaemon.md
       - "On-Demand Profiling": reference/ondemandprofiling.md
+      - "Conformance Testing": reference/conformancetesting.md
       - "Replicated Storage": reference/replicated_filesystem.md
       - "Performance Optimizations": reference/optimizationroadmap.md
       - "Kernel Offloading": reference/kerneloffloadingacceleration.md
@@ -86,12 +119,23 @@ nav:
       - "Sharded Filesystem": reference/sharded_filesystem.md
   - Explanation:
       - "Project-Local Development Environment": explanation/projectlocalenvironment.md
+      - "Administering pgfs": explanation/filesystemlifecycle.md
       - "Regular Files": explanation/flat_filesystem.md
       - "Directory Trees": explanation/hierarchicaldirectories.md
       - "Atomic Rename": explanation/atomicrename.md
+      - "POSIX Compatibility": explanation/posixcompatibility.md
+      - "Branchable Trees": explanation/branchabletrees.md
+      - "Change Feed": explanation/changefeed.md
+      - "Durability and Crash Safety": explanation/durablestorage.md
+      - "Consistency and Mount Ownership": explanation/consistentmounts.md
+      - "Storage Layout": explanation/storagelayout.md
+      - "Space Management": explanation/spacemanagement.md
+      - "Integrity and Backup": explanation/dataintegrity.md
+      - "Access Control and Security": explanation/accesscontrol.md
       - "Reliable Mount & Shutdown": explanation/reliablemount.md
       - "Observability & Diagnostics": explanation/observabledaemon.md
       - "On-Demand Profiling": explanation/ondemandprofiling.md
+      - "Conformance Testing": explanation/conformancetesting.md
       - "Replicated Storage": explanation/replicated_filesystem.md
       - "Performance Optimizations": explanation/optimizationroadmap.md
       - "Kernel Offloading": explanation/kerneloffloadingacceleration.md

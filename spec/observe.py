@@ -5,8 +5,9 @@ This module defines what "software excellence" means for pgfs in terms of
 runtime visibility: the program must be transparent about what it is doing
 right now, what it did recently, where time is spent, and why it failed.
 
-These Ctx classes are inherited by Feature and Requirement specs alongside
-the error-handling contexts in `err.py`.
+These Ctx classes accompany the error-handling and contract contexts in
+`err.py` and are inherited by observability and profiling specs (such as
+`OnDemandProfiling` in `perf.py`).
 """
 
 from libspec import Ctx
@@ -33,9 +34,10 @@ class Tracing(Ctx):
        The span is entered for the duration of the callback so all
        nested DB queries and error paths are automatically attributed.
 
-    3. **Span per DB operation.** `Db::getattr`, `Db::read`, `Db::write`,
-       `Db::rename`, etc. each open a `tracing::debug_span!` recording
-       the query intent and the (parent, name) key.
+    3. **Span per DB operation.** Every database call opens a
+       `tracing::debug_span!` recording the `pgfs` function or statement
+       name, the `ino` it concerns, and the backend pid, so a slow span
+       can be found in `pg_stat_activity`.
 
     4. **JSON output for machines.** Setting `RUST_LOG_FORMAT=json`
        emits newline-delimited JSON objects with `timestamp`, `level`,
@@ -78,6 +80,20 @@ class Metrics(Ctx):
        required in the first iteration — but the counters and histograms
        must be structured so an exporter can be added without rewriting
        the instrumentation.
+
+    6. **Signals that predict failure.** Besides counting what happened,
+       metrics expose what is going wrong slowly (Fail-Slow at Scale
+       r122, Gray Failure r124):
+       - the age of the oldest in-flight request;
+       - the database connection state, reconnects and fencing;
+       - the slow-database gauge;
+       - WAL bytes per byte of user data written (BlueStore r33,
+         Pangu 2.0 r51);
+       - dead tuples and bloat of the main tables, and the reclaim and
+         GC backlogs (LFS r22, DisCoGC r44);
+       - checksum failures;
+       - replica lag in bytes and seconds, and ticket waits
+         (FlightTracker r75).
     """
 
 
@@ -112,9 +128,11 @@ class StateIntrospection(Ctx):
 
     1. **SIGUSR1 state dump.** On receiving SIGUSR1, the daemon logs
        at `info!` level:
-       - Inode cache size (`ino_by_path.len()`, `path_by_ino.len()`)
-       - Next inode number
-       - DB connection status (connected, idle, error)
+       - Inode cache size and handle count
+       - The mounted view, the lease fence and the connection state
+         machine's state
+       - Each worker's in-flight request, with its age and backend pid
+       - Buffered bytes per mount
        - Uptime since mount
        - Metrics snapshot (counters + histogram summaries per Metrics
          spec)
@@ -123,12 +141,15 @@ class StateIntrospection(Ctx):
        starts or stops CPU profiling (see `Profiling` Ctx). The toggle
        event is logged at `info!`.
 
-    3. **Non-blocking.** Signal processing must not block the FUSE
-       dispatch. SIGUSR1 and SIGUSR2 are added to the blocked signal set
-       alongside the existing SIGINT/SIGTERM/SIGHUP; the dedicated
-       `sigwait` thread (already in `main.rs`) dispatches them by
-       setting `AtomicBool` flags or pushing messages into a lock-free
-       queue, serviced on the next event loop iteration.
+    3. **Non-blocking, and independent of dispatch.** Signal processing
+       must not block the FUSE dispatch, and must not depend on it
+       either. SIGUSR1 and SIGUSR2 are added to the blocked signal set
+       alongside the existing SIGINT/SIGTERM/SIGHUP. The dedicated
+       `sigwait` thread (already in `main.rs`) writes the dump itself,
+       from atomics and `try_lock` snapshots, printing `locked` for any
+       state it cannot take at once. A dump that waited for the next
+       callback would never appear on a stuck mount, which is exactly
+       when it is needed (Gray Failure r124).
     """
 
 
@@ -203,12 +224,16 @@ class HealthEndpoint(Ctx):
        `/tmp/pgfs-{mountpoint-hash}.pid`. Remove it on clean unmount.
        The file path is printed to stdout and logged at `info!`.
 
-    2. **Liveness check.** A background thread touches a shared
-       `AtomicU64` counter every N seconds. Each FUSE callback
-       (`lookup`, `read`, `write`, ...) observes the counter on entry;
-       if the counter has not advanced within 3×N seconds, the daemon
-       logs an `ERROR` and initiates a clean unmount. This catches
-       deadlock in the FUSE session.
+    2. **Liveness check.** Each dispatch worker stamps the start time
+       of the request it is serving into an atomic slot. A watchdog
+       thread checks the age of the oldest in-flight request. Past one
+       threshold it warns. Past a second it logs an `ERROR`, dumps
+       state from its own thread, and cancels the backend query
+       (`failure.InFlightAgeWatchdog`). This catches a dispatcher stuck
+       in a database call or a lock. The earlier design, a heartbeat
+       counter checked on callback entry, cannot: a stuck dispatcher
+       never enters the next callback (Gray Failure r124). The watchdog
+       also feeds systemd's watchdog (`ops.NotifiesSystemd`).
 
     3. **Readiness file.** A flag file
        `/tmp/pgfs-{mountpoint-hash}.ready` is created once the mount

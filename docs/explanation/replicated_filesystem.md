@@ -1,78 +1,42 @@
 # Explanation: Replicated Storage
 
 !!! warning "Status: Partially implemented"
-    Write routing, lag detection, transparent fallback and the Docker standby work today. File contents (`read`) are still always served by the primary, and a standby that is unreachable when the daemon starts is dropped for the daemon's lifetime without a warning.
+    Reads of names, attributes, listings and file contents go to the standby under per-inode LSN tickets, the standby's identity is verified, a lagging or unreachable standby falls back to the primary with no visible error, multi-host connection strings follow failover, and replica metrics are exported. Not yet: demoting a standby that is consistently slower, reading the primary's flush LSN other than from the mount's own commits, and spreading snapshot reads over several `--replica` standbys (only the first is used).
 
-> A pgfs mount can be backed by a primary Postgres and a physical streaming standby in Docker. Writes go to the primary; reads are served from whichever node is authoritative at that instant, falling back to the primary when the standby lags. The filesystem is eventually consistent with the standby's lag continuously bounded by the freshness check, and a standby failure never causes data loss or a kernel-visible error.
+> A pgfs mount can be backed by a primary Postgres and physical streaming standbys. Writes go to the primary. A read goes to a standby only when the standby has replayed the mount's own latest commit, so the mount always reads its own writes. Snapshots can be read from any standby that has them. A standby failure never causes a kernel-visible error. A standby is not protection against corruption: physical replication copies a damaged page faithfully, which is what checksums and scrub are for.
 
 [Tutorial](../tutorials/replicated_filesystem.md) · [How-to](../how-to/replicated_filesystem.md) · [Reference](../reference/replicated_filesystem.md) · **Explanation**
 
 ---
 
-## Why a physical standby
+## Why a read ticket
 
-PostgreSQL's physical streaming replication ships the primary's
-write-ahead log byte for byte, and the standby replays it. The
-standby is therefore an exact copy of the whole cluster: same
-tables, same rows, same schema, with no extra setup and no
-schema to keep in sync. That is why pgfs never initialises the
-schema on the standby. Nothing it could create would be
-different from what replication already delivers.
+A standby replays the primary's WAL a little behind it. A mount that
+reads from a standby must never miss its own writes, so each mutation
+records the LSN of its commit, and a read of that inode may use the
+standby only once the standby has replayed that far. Comparing the
+standby with the primary's *current* position instead is almost never
+true on a busy primary, and two positions read by separate queries on
+two nodes are not comparable at one instant.
 
-## Reads can go anywhere, decisions cannot
+Asynchronous commits complicate this: the WAL sender streams only up to
+the primary's flush position, so a commit not yet flushed cannot be on
+the standby however long one waits. The daemon therefore sends such
+reads straight to the primary instead of waiting.
 
-A standby is always slightly behind. Serving a stale
-directory listing is a small, recoverable inaccuracy. Making a
-write decision from stale data is a correctness bug. If
-`create` checked a stale standby for an existing file, it could
-decide the name was free when it was not.
+## Why identity checks
 
-So pgfs draws the line between answering and deciding. Pure
-metadata reads may use the standby. Every mutation, and every
-read whose result decides what a mutation does, goes to the
-primary. A lagging standby can therefore make the mount look
-briefly out of date, but it can never make it write the wrong
-thing.
+After a failover, an LSN alone cannot tell a standby of this cluster
+from a node of another one. Checking the system identifier, the
+timeline and `fs_uuid` makes sure the standby holds this filesystem's
+history.
 
-## Measuring lag instead of assuming it
+## What a standby is not
 
-Before using the standby, pgfs compares two positions in the
-write-ahead log: how far the primary has written, and how far
-the standby has replayed. If the standby has replayed at least
-as far, it holds everything the primary holds, and reading from
-it is indistinguishable from reading the primary.
-
-That check costs three small queries. Running it before every
-read would cost more than the reads it offloads, so the verdict
-is cached for half a second. This is the one place where pgfs
-trades strictness for speed. Inside that window, a read can see
-the standby's slightly older state.
-
-## Failing towards availability
-
-When the standby is stale, unreachable or broken, pgfs reads
-from the primary and says so once per minute in the log. The
-programs using the mount never see an error. A replicated mount
-degrades into a single-node mount, which is still correct and
-only less scalable.
-
-## What replication does not give you
-
-The standby offloads reads; it does not protect writes. If the
-primary fails, the mount fails. pgfs does not promote the
-standby or redirect writes, and a promoted standby is a new
-primary that pgfs would have to be restarted against. High
-availability for writes is a property of the PostgreSQL
-deployment underneath, not of pgfs.
-
-## Why Docker, and why host networking
-
-The standby needs its own PostgreSQL instance with its own data
-directory and port. A container provides that without a second
-installation, and the named volume survives container restarts.
-Host networking lets the container reach the primary on
-loopback, so the primary never has to listen on a routable
-interface.
+A standby is a copy, not protection against corruption: physical
+replication copies a damaged page faithfully. Checksums and
+`pgfs scrub` are for that. A standby failure never surfaces as an error
+in the mount; it only turns standby reads into primary reads.
 
 ---
 

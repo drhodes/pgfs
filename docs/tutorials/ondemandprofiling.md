@@ -21,13 +21,13 @@ its time.
 cargo build --release --features profiling
 ./scripts/ensure_db.sh
 mkdir -p testdata/mnt
-./target/release/pgfs testdata/mnt 2> testdata/profile-demo.log &
+./target/release/pgfs mount main testdata/mnt 2> testdata/profile-demo.log &
 sleep 1
 grep 'span trace will be written' testdata/profile-demo.log
 ```
 
 ```text
-INFO pgfs: span trace will be written to /tmp/pgfs-trace-1793059200.json on shutdown
+pgfs: span trace will be written to /tmp/pgfs-trace-1793059200.json on shutdown
 ```
 
 ## Step 2: profile a workload
@@ -35,7 +35,7 @@ INFO pgfs: span trace will be written to /tmp/pgfs-trace-1793059200.json on shut
 Start the sampler, run the workload, stop the sampler:
 
 ```bash
-PID=$(pgrep -f 'target/release/pgfs testdata/mnt')
+PID=$(pgrep -f 'target/release/pgfs mount main testdata/mnt')
 kill -USR2 $PID
 for i in $(seq 1 500); do echo "line $i" > testdata/mnt/p$i.txt; done
 kill -USR2 $PID
@@ -53,7 +53,7 @@ INFO pgfs::profiling: CPU profiling stopped; wrote /tmp/pgfs-profile-1793059231.
 Open the `.svg` file in a web browser. Each box is a function;
 its width is the share of samples in which it was on the stack.
 Hover over the widest towers to find which FUSE callbacks
-(`create`, `write`, `flush`) and which `postgres` client calls
+(`create`, `write`, `flush`) and which `tokio-postgres` client calls
 they lead to. Click a box to zoom into it.
 
 ## Step 4: stop and open the span trace

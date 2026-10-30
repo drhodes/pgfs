@@ -149,6 +149,11 @@ class PreCondition(Ctx):
     - Use the type system to make invalid states unrepresentable:
       newtypes, enums over magic strings, `NonZeroU64` over bare
       integers with sentinel values.
+    - Encode ordering obligations as typestate where it is cheap. For
+      example, the call that publishes a block mapping takes a
+      `BlobCommitted` token that only the blob insert can produce, so
+      metadata can never point at data that was not written (SquirrelFS
+      r64, ShardStore r128).
     """
 
 
@@ -162,9 +167,16 @@ class GlobalMutableState(Ctx):
     - **Avoid `lazy_static!` / `OnceLock<Mutex<T>>`** as a substitute
       for dependency injection. Pass state explicitly through function
       arguments or struct fields.
-    - **Prefer `&` and `&mut`** over `Arc<Mutex<T>>` within a
-      single-threaded context. FUSE's default single-threaded dispatch
-      makes interior mutability unnecessary for this project.
+    - **Shared daemon state is named and owned.** Dispatch is
+      multi-threaded (`concurrency.InodeShardedWorkers`). The state that
+      matters is the inode cache, the handle table and the per-inode
+      write buffers. Each entry is owned by the worker its inode hashes
+      to, so per-file state needs no lock. State that is genuinely
+      global (the mount lease, metrics, the in-flight table) is held in
+      atomics or behind one lock with a documented scope.
+    - **No lock is held across a database round trip**
+      (`concurrency.NoLockAcrossRoundTrip`). A guard that must span an
+      `.await` or a blocking query is a design error.
     - In the rare case shared state is needed (e.g., a metrics counter),
       isolate it behind a single `AtomicU64` rather than a
       `Mutex<HashMap>`.
@@ -183,6 +195,9 @@ class PostCondition(Ctx):
       chain and degrade gracefully.
     - Functions that mutate state should verify the state is internally
       consistent before returning `Ok`.
+    - This context is the coding rule for functions. What a filesystem
+      *operation* guarantees is stated in each requirement's contract
+      clauses (see `Contract`).
     """
 
 
@@ -190,7 +205,6 @@ class PostCondition(Ctx):
 
 class DefensiveProgramming(PreCondition, PostCondition, GlobalMutableState):
     """The union of all defensive-programming concerns."""
-    pass
 
 
 class Refactor(BoilerPlate, FunctionLines, Indentation):
@@ -204,7 +218,6 @@ class Refactor(BoilerPlate, FunctionLines, Indentation):
     - Generics and traits should be introduced only when they eliminate
       concrete duplication, not preemptively.
     """
-    pass
 
 
 class Robustness(DefensiveProgramming):
@@ -216,12 +229,54 @@ class Robustness(DefensiveProgramming):
       before returning.
     - Prefer composition over inheritance (struct fields over trait
       object hierarchies).
-    - Use dependency injection: pass `&mut Db` to functions that need
-      database access rather than reaching for a global singleton.
+    - Use dependency injection: pass the worker's database handle to
+      functions that need database access rather than reaching for a
+      global singleton.
     - Every `unsafe` block must be isolated in its own function with a
       `// SAFETY:` comment documenting the invariant that makes it sound.
     - External resources (database connections, file handles) must be
       released deterministically — implement `Drop` or use RAII wrappers.
+    - **Every external wait has a timeout, and every retry is bounded**
+      (FiDe r78, metastable failures r67). The values are stated in
+      `failure.BoundsEveryWait`, not chosen per call site.
+    - **Every intentional `.ok()` is listed and tested.** Each site that
+      deliberately discards an error is driven by a fault-injection test
+      (`verify.DbFaultInjection`), and CI rejects new unlisted sites.
+      Most catastrophic failures sit in error handlers that were never
+      run (Aspirator r119).
+    """
+
+
+# ── Operation contracts ──────────────────────────────────────────────
+
+class Contract(Ctx):
+    """
+    Every requirement is a contract, not a description of code. A
+    requirement's docstring opens with its behaviour and then states the
+    clauses below that apply to it, each as a paragraph that starts with
+    the clause name in bold. A clause that is absent means the
+    requirement makes no promise of that kind, never that the promise is
+    obvious. (SysSpec r43, PoWER r60, SquirrelFS r64.)
+
+    - **Postcondition.** What holds after a successful reply, in terms of
+      the observable filesystem state: bytes, sizes, names, attributes.
+    - **Invariant.** What holds before and after every operation, and
+      under any interleaving.
+    - **Durability.** The exact event after which the effect survives a
+      crash of the daemon, the host or Postgres. "None" is a valid
+      answer and must be written down.
+    - **Crash.** The set of states a crash at any instant may leave,
+      relative to the last acknowledged operation.
+    - **Concurrency.** What a concurrent observer may see, and which
+      locks are taken in which order.
+    - **Errors.** Each errno the operation can reply, and when.
+    - **Bounds.** Limits and costs that must not grow with the size of
+      the tree: round trips, rows touched, memory, time.
+    - **Sources.** The papers in `design/papers/reading-notes.md` that
+      the requirement relies on.
+
+    Requirements describe the target system. What exists today is stated
+    in the status note of the feature that lists the requirement.
     """
 
 
@@ -241,24 +296,23 @@ class Feat(Err, Refactor, Robustness, Diataxis):
     so the generated Reference page can enumerate them."""
     __is_base_spec__ = True
 
-    def title(self):
+    def title(self) -> str:
         """Human-readable feature title used for documentation headings."""
         raise UnimplementedMethodError()
 
-    def status(self):
+    def status(self) -> str:
         """Implementation status: one of STABLE (implemented and tested),
         PARTIAL (some requirements implemented), or PLANNED (specified,
         not yet implemented). Paired with `status_note()`."""
         raise UnimplementedMethodError()
 
-    def status_note(self):
+    def status_note(self) -> str:
         """One or two sentences qualifying `status()`: what works today and
         what does not. Rendered as an admonition on every generated page."""
         raise UnimplementedMethodError()
 
 
-class Req(Err, Refactor, Robustness, Requirement):
-    """Requirement specification: inherits all error-handling and
-    code-quality contexts. Every Requirement in the codebase must
-    conform to these rules."""
-    pass
+class Req(Err, Refactor, Robustness, Contract, Requirement):
+    """Requirement specification: inherits all error-handling,
+    code-quality and contract contexts. Every Requirement in the
+    codebase must conform to these rules."""

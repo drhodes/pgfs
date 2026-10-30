@@ -1,96 +1,93 @@
 # PGFS(1) | General Commands Manual
 
 ## NAME
-pgfs - FUSE filesystem backed by PostgreSQL
+pgfs - a POSIX filesystem stored in PostgreSQL
 
 ## SYNOPSIS
-`pgfs` [*OPTIONS*] *MOUNTPOINT*
+`pgfs` [`--conn` *CONNSTRING*] *COMMAND* [*ARGS*]
 
 ## DESCRIPTION
-**pgfs** mounts a POSIX-like directory hierarchy backed by a PostgreSQL database. File and directory metadata, directory relationships, and file contents are stored as rows in an `entries` table (`parent`, `name`, `kind`, `size`, `data`).
+**pgfs** stores a filesystem in a PostgreSQL database and mounts it with FUSE. Every inode, name, block and extended attribute is a row in the `pgfs` schema; every operation is one call to a `pgfs.*` SQL function, in one transaction. Inode numbers are permanent, names are exact bytes, small files live inside their inode, and file data is immutable, checksummed blocks that files, snapshots and branches share.
 
-File IO operations interact directly with PostgreSQL. FUSE callbacks map kernel inodes to database entries via an in-memory translation table.
+A tree can be snapshotted and branched in constant time, and a branch can be published back atomically. Each tree has at most one read-write mount, which holds a lease; any number of read-only and snapshot mounts may run alongside it, on any machine.
 
-## OPTIONS
-`-h`, `--host` *HOST*
-: PostgreSQL host or Unix socket directory. Default: `$(pwd)/testdata`.
+## COMMANDS
+`mkfs` [`--block-size` *BYTES*] [`--inline-max` *BYTES*] [`--capacity` *BYTES*] [`--scratch`] [`--runtime-role` *ROLE*] [`--force`]
+: Format a database. Nothing else ever runs DDL.
 
-`-d`, `--dbname` *NAME*
-: Database name. Default: `pgfs`.
+`mount` *TREE*[`@`*SNAPSHOT*][`:`*/PATH*] *MOUNTPOINT* [`--read-only`] [`--takeover`] [`--workers` *N*] [`--replica` *CONNSTRING*] ...
+: Mount a tree, a snapshot (read-only), or a directory of either.
 
-`-U`, `--user` *USER*
-: Database user. Default: current OS user.
+`snapshot` *TREE*`@`*NAME* | `snapshot list` [*TREE*] | `snapshot delete` *TREE*`@`*NAME*
+: Freeze a tree. While the tree is mounted, its daemon drains its buffers first (`--crash-consistent` skips that).
 
-`--replica` *CONNSTRING*
-: Connection string for secondary read replica. Read queries attempt replica execution first, falling back to primary on error or lag.
+`branch` *SOURCE* *NEW*
+: Create a writable tree from a tree or snapshot, optionally rooted at a directory.
 
-`--help`
-: Display usage summary.
+`promote` [`--force`] *BRANCH* *TREE*
+: Make a branch the new contents of a tree, atomically.
 
-`--version`
-: Display version information.
+`tree list` | `tree delete` *TREE* | `tree flatten` *TREE*
+: Manage trees.
 
-## CONTROL SCRIPTS
-`scripts/pgfs.sh up`
-: Provision local database cluster, build binary, and mount to `testdata/mnt`.
+`changes` *TREE* [`--since` *TOKEN*] [`--follow`] [`--consumer` *NAME*] | `changes register` *NAME* *TREE* | `changes unregister` *NAME*
+: Print the change feed as JSON lines.
 
-`scripts/pgfs.sh down`
-: Perform clean unmount and stop local database cluster.
+`diff` *TREE*`@`*A* *TREE*[`@`*B*]
+: List what changed between two views of one tree.
 
-`scripts/pgfs.sh status`
-: Display mount, daemon PID, and PostgreSQL status.
+`check` [*TREE*] [`--repair`], `scrub` [`--rate` *MIB*] [`--continuous`]
+: Verify invariants and checksums.
 
-`scripts/replica_db.sh` {`up`|`down`|`status`|`conn`}
-: Manage physical streaming read-replica Docker container.
+`export` *TREE*`@`*SNAPSHOT* > *FILE.tar*, `import` *TREE*[`:`*/DIR*] < *FILE.tar*
+: Portable pax archives.
 
-## DIAGNOSTICS & OBSERVABILITY
-**pgfs** outputs structured log messages using `tracing`.
+`migrate` [`--dry-run`], `tune` [`--capacity` *BYTES*|`none`] [`--new-uuid`] [`--runtime-role` *ROLE*], `stats` [*TREE*], `options`
+: Administration. `pgfs options` prints every option with its default; the same table is in `docs/cli-options.md`.
 
-### Environment Variables
-`RUST_LOG`
-: Log filter directive (e.g., `RUST_LOG=pgfs=info`, `RUST_LOG=pgfs::db=debug`).
+## CONNECTION
+`--conn` or `PGFS_CONN` gives a libpq connection string (default: the project-local cluster, `host=$(pwd)/testdata dbname=pgfs`). Passwords come from `PGPASSWORD`, a pgpass file or `--password-file`, never from the command line. A remote host needs `sslmode=verify-full` unless `--insecure-transport` is given. Connection strings are redacted in every log line.
 
-`RUST_LOG_FORMAT`
-: Log output format (`full`, `compact`, `pretty`, or `json`). Default: `full`.
+## EXIT STATUS
+0 on success; 1 when the command ran and found a problem (for example `check`), or a mount ended with buffered data it could not commit; 2 when it could not run.
 
-### Metrics
-Daemon logs aggregate statistics at `INFO` level every 60 seconds:
-- **Operation Counters**: Counts for `lookup`, `getattr`, `setattr`, `read`, `write`, `create`, `mkdir`, `unlink`, `rmdir`, `rename`, `readdir`, `open`, `fsync`.
-- **Error Counters**: Expected errnos (`ENOENT`, `EEXIST`, etc.) and unexpected failures (`EIO`).
-- **Replica Counters**: Replica read count and fallback count.
-- **Latency Histograms**: Microsecond-bucketed wall-clock distributions for FUSE callbacks and database queries.
-
-### Health Verification
-- `/tmp/pgfs-{hash}.pid`: Contains daemon process identifier.
-- `/tmp/pgfs-{hash}.ready`: Created when FUSE session begins serving requests.
-- **Liveness Watchdog**: Background thread increments heartbeat counter every 10 seconds. Callbacks verify counter progress; if stalled >30 seconds, watchdog unmounts filesystem cleanly.
-
-## SIGNALS
+## SIGNALS (mount)
 `SIGINT`, `SIGTERM`, `SIGHUP`
-: Initiate clean FUSE unmount and process exit.
+: Commit every buffer, run the synchronous barrier, unmount, release the lease.
 
 `SIGUSR1`
-: Request metric snapshot and internal state dump on next FUSE callback.
+: Write a state dump to the log from the signal thread.
 
 `SIGUSR2`
-: Toggle CPU profiling (enabled when compiled with `--features profiling`). Outputs flamegraph SVG and stack dumps to `/tmp/pgfs-profile-*.svg`.
+: Toggle CPU profiling (with `--features profiling`).
 
-## TESTING
+## DIAGNOSTICS
+Logs go to stderr through `tracing`: `RUST_LOG` filters (`RUST_LOG=pgfs=debug`), `RUST_LOG_FORMAT=json` switches to JSON. Every 60 seconds the daemon logs nine `metrics|…` lines (operations, errnos, replica, latency, connection state, in-flight age, space, integrity).
+
+The daemon writes `/tmp/pgfs-{hash}.pid` and, once serving, `/tmp/pgfs-{hash}.ready`, and talks to systemd when `NOTIFY_SOCKET` is set (`contrib/pgfs@.service`).
+
+## DEVELOPMENT
+`scripts/pgfs.sh up|down|status|run`
+: Project-local cluster (formatted with `pgfs mkfs`), build and mount at `testdata/mnt`.
+
 `make test`
-: Run Rust unit test suite (`cargo test`).
+: Unit tests, storage tests against PostgreSQL, and the model-conformance suite (`cargo test`).
 
 `make test-integration`
-: Execute integration test suite (`scripts/run_tests.sh` covering POSIX rename, append, truncate, integrity, directory operations, and `git init`).
+: `scripts/test_*.sh`, each followed by `pgfs check`.
+
+`make bench`
+: The benchmark workloads (`scripts/bench.sh`).
 
 ## FILES
-`testdata/pgdata`
-: Local PostgreSQL database storage directory.
+`sql/v1/`
+: The schema and its functions, embedded in the binary.
 
-`testdata/mnt`
-: Default mountpoint directory.
+`spec/`
+: The specification ([libspec](https://github.com/drhodes/libspec)); `docs/` is generated from it.
 
-`/etc/fuse.conf`
-: Must contain `user_allow_other` for `auto_unmount` execution.
+`testdata/`
+: The project-local cluster, mount point and logs. `rm -rf testdata` resets everything.
 
 ## SEE ALSO
-`MANUAL.md`, `mount(8)`, `fuse(8)`, `psql(1)`
+`MANUAL.md`, `docs/`, `mount(8)`, `fuse(8)`, `psql(1)`

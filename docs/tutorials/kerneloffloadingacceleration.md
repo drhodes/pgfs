@@ -1,91 +1,65 @@
 # Tutorial: Kernel Offloading
 
 !!! warning "Status: Partially implemented"
-    Server-side `copy_file_range` and `fallocate` are implemented in the storage backend and unit-tested, but the FUSE layer does not call them yet. On a mount, copies stream through the daemon and `fallocate` fails with `EOPNOTSUPP`. Reflink, subtree clone and content search are planned.
+    `copy_file_range` maps whole blocks to the source's blobs (shared, collected by GC) and copies only partial edge blocks, in one bounded transaction; `fallocate` extends, punches holes and zeroes ranges by changing map rows. Content search is planned.
 
-> pgfs incorporates Database-Native Kernel Offloading capabilities, utilizing copy_file_range, fallocate, reflink CoW, and server-side search to eliminate userspace byte streaming and deliver sub-millisecond execution for large-scale file operations.
+> Copies and hole punching run inside PostgreSQL. `cp` shares blocks instead of copying bytes, and `fallocate` punches holes and zeroes ranges by changing block-map rows, so no file data passes through the daemon. Content search through database indexes is planned.
 
 **Tutorial** · [How-to](../how-to/kerneloffloadingacceleration.md) · [Reference](../reference/kerneloffloadingacceleration.md) · [Explanation](../explanation/kerneloffloadingacceleration.md)
 
 ---
 
-The offloading callbacks are not connected to the mount yet,
-but the idea behind them can be tried today with plain SQL. In
-this tutorial we will copy a file without its bytes ever
-leaving PostgreSQL, then run the unit test that exercises the
-real implementation. We need a running mount (see [Your first
-pgfs mount](projectlocalenvironment.md)).
+In this tutorial we will copy a large file with `cp` and watch pgfs
+share its blocks instead of copying them, then punch a hole in a file
+and see the space go. We need a mounted filesystem (see
+[Your first pgfs mount](projectlocalenvironment.md)).
 
-## Step 1: create a file through the mount
+## Step 1: make a file and copy it
 
 ```bash
-mkdir testdata/mnt/offload
-head -c 300000 /dev/urandom > testdata/mnt/offload/big.bin
-```
-
-## Step 2: copy it inside the database
-
-One transaction copies the file's metadata row and its five
-block rows. No data passes through pgfs or through `psql`:
-
-```bash
-psql -h "$PWD/testdata" -d pgfs -v ON_ERROR_STOP=1 <<'SQL'
-BEGIN;
-INSERT INTO entries (parent, name, kind, size)
-  SELECT parent, 'clone.bin', kind, size FROM entries
-  WHERE parent = 'offload' AND name = 'big.bin';
-INSERT INTO blocks (parent, name, block_no, data)
-  SELECT parent, 'clone.bin', block_no, data FROM blocks
-  WHERE parent = 'offload' AND name = 'big.bin';
-COMMIT;
-SQL
-```
-
-## Step 3: see the copy appear on the mount
-
-Wait a second for the kernel's attribute cache to expire, then:
-
-```bash
-ls -l testdata/mnt/offload
-cmp testdata/mnt/offload/big.bin testdata/mnt/offload/clone.bin && echo identical
+head -c 2000000 /dev/urandom > testdata/mnt/orig.bin
+cp testdata/mnt/orig.bin testdata/mnt/copy.bin
+cmp testdata/mnt/orig.bin testdata/mnt/copy.bin && echo identical
 ```
 
 ```text
--rw-r--r-- 1 alice alice 300000 Oct 26 17:13 big.bin
--rw-r--r-- 1 alice alice 300000 Oct 26 17:13 clone.bin
 identical
 ```
 
-This is what `copy_file_range` offloading does on the
-inode-keyed schema: one set-based `INSERT … SELECT` instead of
-reading and rewriting every byte.
+coreutils 9 `cp` calls `copy_file_range(2)`, which reaches pgfs's
+`copy_file_range` callback. Whole blocks at the same offset become
+references to the source's blobs.
 
-## Step 4: run the real implementation's test
+## Step 2: see the sharing
 
 ```bash
-cargo test tests_offload
+psql -h "$PWD/testdata" -d pgfs -c "SELECT count(*) AS shared_blobs FROM pgfs.blobs WHERE shared"
 ```
 
 ```text
-test db::tests_offload::test_backend_offloaded_copy_file_range_and_fallocate ... ok
+ shared_blobs
+--------------
+           30
 ```
 
-The test copies 128 KiB between two files with
-`copy_file_range`, then punches it back out with `fallocate`.
+Thirty 64 KiB blocks are referenced by both files; only the partly
+covered last block was written again.
 
-## Step 5: clean up
+## Step 3: punch a hole
 
 ```bash
-rm -r testdata/mnt/offload
+fallocate --punch-hole --offset 65536 --length 655360 testdata/mnt/copy.bin
+du -k testdata/mnt/copy.bin
 ```
+
+The ten blocks in the range read as zero and no longer count in `du`.
 
 ## What we did
 
-We copied a file entirely inside PostgreSQL and saw it through
-the mount, then ran the backend code that will do the same for
-`cp` once it is wired to FUSE. The
-[explanation](../explanation/kerneloffloadingacceleration.md)
-covers the rest of the plan.
+We saw a copy that moved no data through the daemon, and a hole
+punched by removing map rows. The
+[explanation](../explanation/kerneloffloadingacceleration.md) says why
+these run inside PostgreSQL.
 
 ---
 

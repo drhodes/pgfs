@@ -25,6 +25,7 @@ TESTDATA="$ROOT/testdata"
 MOUNT="$TESTDATA/mnt"
 PGDATA="$TESTDATA/pgdata"
 PGFS_PID=""
+export PGFS_CONN="${PGFS_CONN:-host=$TESTDATA dbname=pgfs}"
 
 mount_active() { grep -q " $MOUNT fuse" /proc/mounts 2>/dev/null; }
 
@@ -51,11 +52,12 @@ start_pgfs() {
         mount_active || break
         sleep 0.1
     done
-    psql -h "$TESTDATA" -d pgfs -c "TRUNCATE entries" >/dev/null 2>&1 || true
-
     cargo build --quiet 2>/dev/null
+    # A fresh filesystem per test (spec/ops.py MakesFilesystem).
+    target/debug/pgfs mkfs --force --block-size "${PGFS_BLOCK_SIZE:-4096}" </dev/null >/dev/null \
+        || fail "pgfs mkfs failed"
     mkdir -p "$MOUNT"
-    target/debug/pgfs "$MOUNT" &
+    target/debug/pgfs mount main "$MOUNT" ${PGFS_MOUNT_ARGS:-} >>"$TESTDATA/pgfs.log" 2>&1 &
     PGFS_PID=$!
     for _ in $(seq 1 30); do
         mount_active && return 0
@@ -69,8 +71,18 @@ start_pgfs() {
     return 1
 }
 
-# stop_pgfs: unmount and reap the daemon. Safe to call twice.
+# stop_pgfs: clean shutdown (SIGTERM commits every buffer, then
+# unmounts and releases the lease), falling back to a lazy unmount.
+# Safe to call twice.
 stop_pgfs() {
+    cd "$ROOT"
+    if [ -n "$PGFS_PID" ] && kill -0 "$PGFS_PID" 2>/dev/null; then
+        kill -TERM "$PGFS_PID" 2>/dev/null || true
+        for _ in $(seq 1 100); do
+            kill -0 "$PGFS_PID" 2>/dev/null || break
+            sleep 0.1
+        done
+    fi
     fusermount3 -u -z "$MOUNT" 2>/dev/null || true
     if [ -n "$PGFS_PID" ]; then
         wait "$PGFS_PID" 2>/dev/null || true
@@ -78,11 +90,15 @@ stop_pgfs() {
     fi
 }
 
+# pgfs: the CLI against the test database.
+pgfs() { "$ROOT/target/debug/pgfs" "$@"; }
+
 # default_cleanup: trap target for scripts that want the standard
 # teardown. Any test that mounts must call start_pgfs and arrange for
 # this (or its own) cleanup to run on EXIT.
 default_cleanup() {
     echo "==> Cleaning up"
+    cd "$ROOT"   # a shell inside the mount keeps it busy
     stop_pgfs
 }
 

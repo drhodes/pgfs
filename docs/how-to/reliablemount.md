@@ -1,7 +1,7 @@
 # How-To: Reliable Mount & Shutdown
 
-!!! success "Status: Stable"
-    AutoUnmount, signal-driven clean unmount, the deadlock watchdog, health files and the `pgfs.sh` escalation path are all implemented.
+!!! warning "Status: Partially implemented"
+    AutoUnmount, clean shutdown that commits every buffer and runs the synchronous barrier, health files, bounded waits, the connection state machine with reconnect and revalidation (Bug 5), op_log idempotency, serialization retries, the in-flight watchdog, the slow-database signal and the SQLSTATE table are built and tested. The fuser 0.14 crate never delivers FUSE_INTERRUPT to the filesystem, so `failure.HonoursInterrupt` is limited to the watchdog's cancels.
 
 > The filesystem mounts and unmounts cleanly. Crashing or killing the daemon never leaves a ghost mount behind.
 
@@ -9,78 +9,26 @@
 
 ---
 
-## Stop the daemon cleanly
+## Take over a tree from a crashed daemon
 
 ```bash
-./scripts/pgfs.sh down
+pgfs mount --takeover main /srv/pgfs
 ```
 
-Or signal it directly; SIGINT, SIGTERM and SIGHUP all unmount
-cleanly:
+The new mount waits for the old lease to expire (`--lease`, default
+30 s), then acquires it and reclaims the old mount's orphans.
 
-```bash
-kill -TERM "$(cat testdata/pgfs.pid)"
-```
+## Find a stuck request
 
-## Wait for the mount to be ready (supervisors, scripts)
+The watchdog logs a WARN past `--stall-warn` (5 s) naming the worker,
+operation, inode and backend pid, and past `--stall-error` (60 s)
+writes a state dump and cancels the query. Match the pid in
+`pg_stat_activity`.
 
-Poll for the readiness file. Its name is printed at startup
-next to the PID file:
+## Run under systemd
 
-```bash
-until [ -e /tmp/pgfs-<hash>.ready ]; do sleep 0.1; done
-```
-
-Or poll `/proc/mounts` for the mount point, which is what
-`pgfs.sh up` does.
-
-## Fix "Device or resource busy" on unmount
-
-A process has its working directory or an open file inside the
-mount. `pgfs.sh down` lists the holders and then lazy-unmounts.
-To find them yourself:
-
-```bash
-fuser -vm testdata/mnt
-```
-
-## Fix "Transport endpoint is not connected"
-
-The daemon died and the mount was not removed, which happens
-only if it was started without AutoUnmount (see the
-`user_allow_other` warning below). Sweep it:
-
-```bash
-./scripts/pgfs.sh down
-```
-
-or `fusermount3 -u -z testdata/mnt`.
-
-## Make AutoUnmount available
-
-If the log shows
-`mount with AutoUnmount failed (...); retrying without AutoUnmount`,
-enable `user_allow_other`:
-
-```bash
-sudo sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf
-```
-
-## Run pgfs under systemd
-
-Use `Type=simple`, start the binary directly with an explicit
-`--conn`, and let systemd stop it with SIGTERM:
-
-```ini
-[Service]
-Type=simple
-ExecStart=/opt/pgfs/pgfs --conn "host=/run/postgresql dbname=pgfs" /srv/pgfs
-KillSignal=SIGTERM
-Restart=on-failure
-```
-
-Services that need the mount should wait for the `.ready`
-file, or for the mount point to appear in `/proc/mounts`.
+Install `contrib/pgfs@.service`; the daemon sends `READY=1`,
+`STOPPING=1` and `WATCHDOG=1` while no request is stalled.
 
 ---
 

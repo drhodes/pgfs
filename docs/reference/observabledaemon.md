@@ -1,7 +1,7 @@
 # Reference: Observability & Diagnostics
 
 !!! success "Status: Stable"
-    Tracing, the 60-second metrics, the SIGUSR1 state dump, error chains and crash reports all ship today. Of the per-errno counters, only `eio` and `enoent` are incremented yet.
+    Tracing with spans per callback (worker and view included) and per database call (statement, inode, backend pid, round trip), the nine 60-second metrics lines with every errno counted where it is replied, the SIGUSR1 dump written by the signal thread from atomics, and crash reports all ship. A test keeps the instrumented callback list in step with the `Filesystem` impl.
 
 > Operators can see what the daemon is doing, how fast it is doing it, and why something failed, from the log alone: structured spans for every operation, periodic metrics, an on-demand state dump, and self-contained error chains and crash reports.
 
@@ -9,132 +9,49 @@
 
 ---
 
-## Logging
-
-| Setting | Values | Default |
-|---|---|---|
-| `RUST_LOG` | `tracing-subscriber` `EnvFilter` syntax | `pgfs=info` |
-| `RUST_LOG_FORMAT` | `json` for newline-delimited JSON; anything else for text | text |
-| Destination | stderr | |
-
 ## Log levels
 
 | Level | Used for |
 |---|---|
-| ERROR | unexpected failures (with the full error chain), crash reports, deadlock detection |
-| WARN | degraded but working: replica fallback, AutoUnmount unavailable, health file write failures |
-| INFO | lifecycle (startup, mount, signals, shutdown), metrics, state dumps, profiling |
-| DEBUG | FUSE callback and database spans, reads served from the primary |
+| ERROR | unexpected failures with their full chain, fencing, crash reports, checksum mismatches |
+| WARN | degraded but working: retries, timeouts with their thresholds, slow database, standby fallbacks |
+| INFO | lifecycle, state transitions, metrics, state dumps |
+| DEBUG | expected errnos, per-operation detail |
 
-Expected conditions (`ENOENT`, `EEXIST`, `ENOTEMPTY`, `EISDIR`,
-`ENOTDIR`, `EINVAL`) are replied without logging.
+## Metrics lines (every 60 s)
 
-## Spans
-
-| Span | Level | Fields |
-|---|---|---|
-| `lookup`, `create`, `mkdir`, `unlink`, `rmdir` | INFO | `parent`, `name` |
-| `getattr`, `open`, `readdir` | INFO | `ino` (`readdir`: + `offset`) |
-| `read`, `write` | INFO | `ino`, `fh`, `offset`, `size`/`len` |
-| `setattr` | INFO | `ino`, `size` |
-| `fsync` | INFO | `fh` |
-| `rename` | INFO | `parent`, `name`, `newparent`, `newname`, `flags` |
-| `db::getattr`, `db::list`, `db::create`, `db::mkdir`, `db::unlink`, `db::rmdir` | DEBUG | `parent`, `name` |
-| `db::read_range`, `db::write_range` | DEBUG | `parent`, `name`, `offset`, `len` |
-| `db::truncate` | DEBUG | `parent`, `name`, `new_size` |
-| `db::write_blocks_batch` | DEBUG | `parent`, `name`, `count`, `new_size` |
-| `db::rename` | DEBUG | `old_parent`, `old_name`, `new_parent`, `new_name` |
-
-## Periodic metrics
-
-Logged at INFO every 60 s by the `metrics-export` thread:
-
-```text
-metrics|ops|lookup=N getattr=N setattr=N read=N write=N create=N mkdir=N unlink=N rmdir=N rename=N readdir=N open=N fsync=N
-metrics|errors|eio=N enoent=N eexist=N enotempty=N eisdir=N enotdir=N einval=N
-metrics|replica|reads=N fallbacks=N
-metrics|latency|fuse=fuse total=N p50=<=Xµs p95=<=Xµs p99=<=Xµs
-metrics|latency|db=db total=N p50=<=Xµs p95=<=Xµs p99=<=Xµs
-```
-
-| Counter | Incremented when |
+| Line | Fields |
 |---|---|
-| `ops` fields | the corresponding FUSE callback runs (`flush` and `release` are not counted) |
-| `eio` | an unexpected failure is logged and replied as `EIO` |
-| `enoent` | `lookup` cannot resolve its parent inode or name |
-| `eexist`, `enotempty`, `eisdir`, `enotdir`, `einval` | declared; not yet incremented |
-| `replica reads` | a `getattr`, `lookup` or `readdir` is served by the standby |
-| `replica fallbacks` | a read goes to the primary while a standby is configured |
-
-All counters are totals since startup.
-
-## Latency histograms
-
-| Histogram | Records |
-|---|---|
-| `fuse` | wall-clock time of every instrumented FUSE callback |
-| `db` | wall-clock time of every `Db` method |
-
-Buckets: `<=10`, `<=100`, `<=1k`, `<=10k`, `<=100k`, `<=1M`,
-`>1M` microseconds. Each percentile is reported as the upper
-bound of the bucket that contains it.
+| `metrics\|ops\|…` | one counter per callback |
+| `metrics\|errors\|…` | one counter per errno in the catalogue |
+| `metrics\|replica\|…` | reads, fallbacks, lag_bytes, lag_ms, ticket_waits |
+| `metrics\|latency\|fuse=…` | p50 / p95 / p99 of callbacks |
+| `metrics\|latency\|db=…` | p50 / p95 / p99 of database calls |
+| `metrics\|db\|…` | state, reconnects, fenced, slow_db |
+| `metrics\|inflight\|oldest_ms=…` | age of the oldest in-flight request |
+| `metrics\|space\|…` | live, physical, inline and snapshot-only bytes; backlog; dead tuples; WAL per user byte |
+| `metrics\|integrity\|checksum_failures=…` | checksum failures |
 
 ## State dump (SIGUSR1)
 
-```text
-state|ino_cache=N next_ino=N db=connected (replica none|fresh|stale or unreachable) uptime_secs=N
-state|fuse_latency=fuse total=N p50=… p95=… p99=…
-state|db_latency=db total=N p50=… p95=… p99=…
-```
+`state|mount=… view=… fence=… layer=… db=… uptime_secs=…`, one
+`state|worker=N` line per worker (operation, inode, age, backend pid),
+`state|cache=… handles=… buffered_bytes=…`, the replica line, and the
+latency summaries. Any lock that cannot be taken at once prints
+`locked`.
 
-| Field | Meaning |
-|---|---|
-| `ino_cache` | paths with an assigned inode number |
-| `next_ino` | next inode number to be assigned |
-| `replica` | `none` without `--replica`; otherwise the cached freshness verdict |
-| `uptime_secs` | seconds since the mount was created |
-
-A final dump is logged on clean shutdown.
-
-## Error chain format
-
-Unexpected failures are logged at ERROR as one line, the
-`anyhow` alternate (`{:#}`) rendering of the chain, inside the
-span of the FUSE callback that failed:
-
-```text
-ERROR <callback>{<span fields>}: pgfs::fs: <what was attempted> (at src/<file>.rs:<line>): <deeper context> (at …): <root cause>
-```
-
-Example:
-
-```text
-ERROR lookup{parent=1 name=after-stop}: pgfs::fs: get attributes of entry "after-stop" in "" (at src/db.rs:453): db error: FATAL: terminating connection due to administrator command
-```
-
-Startup failures are printed to stderr in the same form,
-prefixed `pgfs: `, and the process exits with status 1.
-
-## Crash report
-
-Written to stderr and logged at ERROR before the process
-unwinds or aborts:
-
-```text
-panic at <file>:<line>: <message>
-pgfs v<version> on <os>/<arch>, built with <rustc version>, RUST_BACKTRACE=<value>
-Backtrace:
-<backtrace>
-```
-
-## Background threads
+## Threads
 
 | Thread | Role |
 |---|---|
-| `signal-waiter` | receives SIGINT, SIGTERM, SIGHUP, SIGUSR1, SIGUSR2 |
-| `metrics-export` | logs metrics every 60 s |
-| `liveness` | heartbeat every 10 s |
-| `deadlock-watchdog` | unmounts when a stall is detected |
+| `worker-N` | dispatch workers, one database connection each |
+| `renewer` | lease renewal and self-fencing |
+| `reconnector` | reconnect and revalidation |
+| `housekeeping` | usage folding, reclaim, GC, change pruning and notifications, auto-flatten |
+| `control` | owner-drained snapshots and branches |
+| `watchdog` | in-flight ages, stall warnings and cancels, systemd watchdog |
+| `signal-waiter` | SIGINT/SIGTERM/SIGHUP shutdown, SIGUSR1 dump, SIGUSR2 profiling |
+| `metrics-export` | the 60 s metrics lines |
 
 
 ## Specification requirements
@@ -153,51 +70,77 @@ Backtrace:
 ??? abstract "InstrumentsFuseCallbacks"
     `spec.app.InstrumentsFuseCallbacks`
 
-    Every `Filesystem` callback (`lookup`, `getattr`, `read`, `write`,
-    `create`, `mkdir`, `unlink`, `rmdir`, `rename`, `readdir`, `setattr`,
-    `open`, `flush`, `fsync`, `copy_file_range`, `fallocate`) opens a
-    `tracing::info_span!` recording `ino` and `name` (where applicable).
-    The span is entered for the duration of the callback so nested DB
-    operations are automatically attributed.
+    Every `Filesystem` callback the daemon implements opens a
+    `tracing::info_span!` recording `ino`, `name` where there is one,
+    the worker, and the view. The span is entered for the duration of
+    the callback, so nested database operations are attributed to it.
+    The callbacks are those listed in `posix.PosixCompatibility`, plus
+    `init`, `destroy`, `forget`, `batch_forget`, `statfs`, `interrupt`
+    and the open and release calls. The list is checked by a test
+    against the `Filesystem` impl, so it cannot drift from the code.
 
 ??? abstract "InstrumentsDbOperations"
     `spec.app.InstrumentsDbOperations`
 
-    Every `Db` method (`getattr`, `read`, `write`, `create`, `mkdir`,
-    `unlink`, `rmdir`, `rename`, `list`) opens a `tracing::debug_span!`
-    recording the (parent, name) key. The span is entered for the
-    duration of the database round-trip.
+    Every database call opens a `tracing::debug_span!` recording the
+    `pgfs` function or prepared statement name, the `ino` it concerns,
+    the backend pid, and the round-trip time. A slow span can therefore
+    be matched to its row in `pg_stat_activity` (Fail-Slow at Scale
+    r122).
 
 ??? abstract "DistinguishesExpectedErrors"
     `spec.app.DistinguishesExpectedErrors`
 
-    Expected conditions (ENOENT, EEXIST, ENOTEMPTY, EISDIR, ENOTDIR,
-    EINVAL) are replied directly to the kernel without logging.
-    Unexpected failures (database errors, invariant violations) are
-    logged in full via `log_and_reply!` with the complete error chain
-    and replied as EIO.
+    Expected conditions reply their errno to the kernel and are logged
+    at DEBUG at most. These are the errnos in `posix.ErrnoCatalogue`
+    other than EIO. Unexpected failures are logged in full through
+    `log_and_reply!`: database errors that map to EIO, checksum
+    failures, invariant violations and fencing. Database errors are
+    classified by SQLSTATE in one table (`failure.MapsDatabaseErrors`),
+    never by matching message text.
 
 ??? abstract "ExportsPeriodicMetrics"
     `spec.app.ExportsPeriodicMetrics`
 
-    A background thread logs five INFO lines every 60 s:
+    A background thread logs nine INFO lines every 60 s:
     `metrics|ops|…` (per-callback counters), `metrics|errors|…` (EIO and
-    per-errno counters), `metrics|replica|reads=… fallbacks=…`,
-    `metrics|latency|fuse=…` and `metrics|latency|db=…`. Counters are
+    per-errno counters),
+    `metrics|replica|reads=… fallbacks=… lag_bytes=… lag_ms=… ticket_waits=…`
+    (`replica.ReplicaObservability`), `metrics|latency|fuse=…` and
+    `metrics|latency|db=…`. Counters are
     lifetime totals and never reset. Latency histograms bucket wall-clock
     durations at ≤10µs, ≤100µs, ≤1ms, ≤10ms, ≤100ms, ≤1s and >1s and
     report p50/p95/p99 as the upper bound of the bucket that contains the
     percentile.
 
+    Further lines report:
+
+    - `metrics|db|state=… reconnects=… fenced=… slow_db=…`;
+    - `metrics|inflight|oldest_ms=…`;
+    - `metrics|space|…` (`space.ReportsSpace`);
+    - `metrics|integrity|checksum_failures=…`.
+
+    Every per-errno counter is incremented where its errno is replied,
+    or removed. None stays at zero by omission.
+
 ??? abstract "DumpsStateOnSigusr1"
     `spec.app.DumpsStateOnSigusr1`
 
-    SIGUSR1 sets a flag on the signal-waiter thread. The next FUSE
-    callback clears it and logs, at INFO, `state|ino_cache=… next_ino=…
-    db=connected (replica none|fresh|stale or unreachable) uptime_secs=…`
-    followed by the FUSE and DB latency summaries. The dump never runs on
-    the signal thread and never blocks dispatch; on an idle mount it
-    appears with the next filesystem access.
+    SIGUSR1 makes the signal thread itself write a state dump at INFO.
+    It does not wait for the next callback, so the dump appears even
+    when every worker is stuck. The dump reads only atomics and
+    `try_lock` snapshots, and prints `locked` for any state it cannot
+    take at once. It contains:
+
+    - the mount, view, fence and connection states;
+    - the in-flight request of each worker, with its age and backend
+      pid;
+    - cache, handle and buffer sizes;
+    - the replica state;
+    - the latency summaries.
+
+    **Sources.** Gray Failure r124. The first design ran the dump on the
+    next callback, which on a stuck mount never comes.
 
 ??? abstract "WritesHealthFiles"
     `spec.app.WritesHealthFiles`

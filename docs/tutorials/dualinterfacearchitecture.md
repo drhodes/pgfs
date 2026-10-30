@@ -1,75 +1,48 @@
 # Tutorial: Dual-Interface Architecture
 
-!!! danger "Status: Planned, not implemented"
-    The `PgfsBackend` trait, its error mapping and an inode-keyed implementation on `Db` exist and are unit-tested, but the FUSE layer does not route through them yet. `RemoteBackend` is a stub, the `pgrx` engine and the `io_uring` transport are at the design stage, and there is no `--backend` option.
+!!! warning "Status: Partially implemented"
+    The FUSE layer reaches storage only through the synchronous `PgfsBackend` trait. `PgBackend` (tokio-postgres, one connection per worker, LSN tickets pipelined in the same round trip) is the remote engine, and the reference model in `tests/model/` implements the same trait. The pgrx engine waits on its measurement condition and the io_uring transport on crate support.
 
-> pgfs features a Dual-Interface Storage Architecture providing a sub-100µs Local In-Process Engine (`pgrx` + zero SQL parsing + `io_uring` zero copy) and a scalable Remote Async Network Engine (`tokio-postgres` + pipelining).
+> Two storage engines sit behind one interface: a planned local engine that runs inside PostgreSQL and sends no SQL text on the hot path, and a planned remote engine that pipelines queries over the network. The FUSE layer talks only to the interface, so the engine is chosen at startup.
 
 **Tutorial** · [How-to](../how-to/dualinterfacearchitecture.md) · [Reference](../reference/dualinterfacearchitecture.md) · [Explanation](../explanation/dualinterfacearchitecture.md)
 
 ---
 
-The dual-interface architecture is not wired into the daemon
-yet, so this tutorial explores the part that exists: the
-storage seam that both future engines will plug into. We will
-run its tests, read the trait, and see where the FUSE layer
-will connect to it. All we need is the repository and the
-project-local cluster.
+In this tutorial we will drive the same storage interface the daemon
+uses from two implementations: the PostgreSQL backend and the
+in-memory reference model, and watch them agree. We need the
+project-local cluster (see [Your first pgfs mount](projectlocalenvironment.md)).
 
 ## Step 1: run the backend tests
 
 ```bash
-./scripts/ensure_db.sh
-cargo test backend
+cargo test --test storage
 ```
 
-```text
-test backend::tests::test_storage_error_to_libc_errno ... ok
-test backend::tests::test_remote_backend_unimplemented_stubs ... ok
-test backend::tests::test_file_kind_conversion ... ok
-test backend::tests::test_prepare_sparse_block_write_overwrite_existing ... ok
-test backend::tests::test_prepare_sparse_block_write_zero_padding ... ok
-test db::tests_offload::test_backend_offloaded_copy_file_range_and_fallocate ... ok
-test result: ok. 6 passed; 0 failed; ...
-```
+Every test formats a fresh database, drives `PgBackend` through the
+`PgfsBackend` trait, and ends with `pgfs check`.
 
-## Step 2: read the trait
+## Step 2: run the model against the database
 
 ```bash
-grep -n 'async fn' src/backend.rs | head -16
+cargo test --test model_conformance
 ```
 
-Every method takes inode numbers rather than paths. That is the
-most important difference from the code that runs today, which
-keys everything by `(parent path, name)`.
+The suite generates operation sequences, runs each against
+`tests/model/` and against PostgreSQL through the same trait, and
+compares replies and whole trees after every step.
 
-## Step 3: see how errors become errnos
+## Step 3: read the trait
 
-```bash
-grep -n -A12 'impl From<StorageError> for libc::c_int' src/backend.rs
-```
-
-A backend reports what went wrong (`NotFound`, `NotEmpty`,
-`DatabaseError`, ...), and one function turns that into the
-errno the kernel receives.
-
-## Step 4: find the seam in the FUSE layer
-
-```bash
-grep -n 'backend' src/fs.rs | head
-```
-
-`PgFs` already holds a `backend` field, constructed as a
-`LocalBackend` around the same `Db`, but the callbacks still
-call `self.db` directly. Switching each callback from `self.db`
-to `self.backend` is the next step of this feature.
+Open `src/backend.rs`. Each method is one `pgfs.*` SQL function or
+prepared read; the FUSE layer in `src/fs.rs` calls nothing else.
 
 ## What we did
 
-We exercised and read the storage abstraction that will let
-pgfs choose between an in-process engine and a network engine.
-The [explanation](../explanation/dualinterfacearchitecture.md)
-describes where it is heading.
+We saw one interface with two implementations that the daemon cannot
+tell apart, which is what lets pgfs add a second engine later without
+touching the FUSE layer.
 
 ---
 

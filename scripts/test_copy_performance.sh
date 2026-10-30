@@ -9,17 +9,17 @@ trap default_cleanup EXIT
 echo "==> Building pgfs release binary"
 cargo build --release --quiet
 
-echo "==> Starting pgfs with full optimizations (--attr-ttl 1.0 --unlogged)"
+echo "==> Starting pgfs on a scratch filesystem (mkfs --scratch)"
 ensure_db
 fusermount3 -u -z "$MOUNT" 2>/dev/null || true
 for _ in $(seq 1 40); do
     mount_active || break
     sleep 0.1
 done
-psql -h "$TESTDATA" -d pgfs -c "TRUNCATE entries, blocks" >/dev/null 2>&1 || true
+target/release/pgfs mkfs --force --scratch </dev/null >/dev/null || fail "pgfs mkfs failed"
 
 mkdir -p "$MOUNT"
-target/release/pgfs "$MOUNT" --attr-ttl 1.0 --unlogged &
+target/release/pgfs mount main "$MOUNT" &
 PGFS_PID=$!
 for _ in $(seq 1 30); do
     mount_active && break

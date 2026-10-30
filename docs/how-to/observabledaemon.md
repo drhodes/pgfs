@@ -1,7 +1,7 @@
 # How-To: Observability & Diagnostics
 
 !!! success "Status: Stable"
-    Tracing, the 60-second metrics, the SIGUSR1 state dump, error chains and crash reports all ship today. Of the per-errno counters, only `eio` and `enoent` are incremented yet.
+    Tracing with spans per callback (worker and view included) and per database call (statement, inode, backend pid, round trip), the nine 60-second metrics lines with every errno counted where it is replied, the SIGUSR1 dump written by the signal thread from atomics, and crash reports all ship. A test keeps the instrumented callback list in step with the `Filesystem` impl.
 
 > Operators can see what the daemon is doing, how fast it is doing it, and why something failed, from the log alone: structured spans for every operation, periodic metrics, an on-demand state dump, and self-contained error chains and crash reports.
 
@@ -9,70 +9,22 @@
 
 ---
 
-## Change the log level
+## Get JSON logs
 
 ```bash
-RUST_LOG=pgfs=debug ./scripts/pgfs.sh run              # every DB query
-RUST_LOG=pgfs::fs=debug,pgfs::db=info ./scripts/pgfs.sh run
+RUST_LOG_FORMAT=json pgfs mount main /srv/pgfs 2> pgfs.jsonl
 ```
 
-The default is `pgfs=info`. The level is read at startup, so
-changing it requires a restart.
-
-## Get JSON logs for a log pipeline
+## Turn up one module
 
 ```bash
-RUST_LOG_FORMAT=json ./target/debug/pgfs testdata/mnt 2> pgfs.jsonl
-jq -c 'select(.level == "ERROR")' pgfs.jsonl
+RUST_LOG=pgfs=info,pgfs::pg=debug pgfs mount main /srv/pgfs
 ```
 
-## Find out why an operation returned "Input/output error"
+## Match a slow span to the database
 
-```bash
-grep ' ERROR ' testdata/pgfs.log | tail -5
-```
-
-Read each line left to right: the FUSE span that failed, then
-each layer's context with its `file:line`, then the root cause
-after the last `: `.
-
-## Recover from "Input/output error" on every operation
-
-If every access fails and the log shows connection errors, the
-daemon's database connection is gone. pgfs does not reconnect.
-Make sure PostgreSQL is running, then restart the daemon:
-
-```bash
-./scripts/ensure_db.sh
-./scripts/pgfs.sh down && ./scripts/pgfs.sh up
-```
-
-## Take a snapshot of a running daemon
-
-```bash
-kill -USR1 <pid>
-ls <mountpoint> > /dev/null     # any access triggers the dump
-```
-
-## Extract metrics from the log
-
-```bash
-grep -o 'metrics|ops|.*' testdata/pgfs.log | tail -1
-grep -o 'metrics|latency|.*' testdata/pgfs.log | tail -2
-```
-
-## Check that the daemon is alive from a script
-
-```bash
-pid=$(cat /tmp/pgfs-<hash>.pid) && kill -0 "$pid" && test -e /tmp/pgfs-<hash>.ready
-```
-
-## Get a useful crash report
-
-Run with `RUST_BACKTRACE=1` (or `full`) so the report includes a
-symbolised backtrace. The report is printed to stderr and
-logged at ERROR, so it ends up in `testdata/pgfs.log` when the
-daemon was started by `pgfs.sh`.
+The `db` span records the backend pid; look it up in
+`pg_stat_activity`.
 
 ---
 

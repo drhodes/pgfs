@@ -2,14 +2,17 @@
 # run_tests.sh — run the full pgfs integration test suite.
 #
 # Every scripts/test_*.sh is a self-contained integration test: it
-# sources scripts/test_lib.sh, mounts pgfs at testdata/mnt, runs its
-# checks, and unmounts. This runner executes each in isolation (so one
+# sources scripts/test_lib.sh, formats and mounts pgfs at testdata/mnt,
+# runs its checks, and unmounts. After every test the runner runs
+# `pgfs check`; a violation fails the test even if its own assertions
+# passed (spec/verify.py CheckAfterEveryTest). This runner executes each in isolation (so one
 # failure can't abort the rest), reports a pass/fail line per test, and
 # prints a summary — the same shape as `./check -g quick` in xfstests.
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
+export PGFS_CONN="${PGFS_CONN:-host=$ROOT/testdata dbname=pgfs}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -32,7 +35,8 @@ for t in "${TESTS[@]}"; do
     name=$(basename "$t")
     log="$ROOT/testdata/$name.log"
     echo "── $name"
-    if timeout 300 bash "$t" >"$log" 2>&1; then
+    if timeout 300 bash "$t" >"$log" 2>&1 \
+        && { echo "── pgfs check" >>"$log"; "$ROOT/target/debug/pgfs" check >>"$log" 2>&1; }; then
         echo -e "   ${GREEN}PASS${NC}"
         PASSED=$((PASSED + 1))
     else

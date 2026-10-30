@@ -1,7 +1,7 @@
 # How-To: Directory Trees
 
 !!! success "Status: Stable"
-    `mkdir`, `rmdir`, `readdir` and nested paths of any depth are implemented and covered by `test_dirs.sh`. Directory timestamps are not tracked.
+    `mkdir`, `rmdir`, `readdir` and `readdirplus` keep link counts and directory times, page by name with keyset cookies, and check emptiness in the same transaction as the delete. Covered by `tests/storage.rs`, the model-conformance suite and `test_dirs.sh`.
 
 > Users can create nested directories, list their contents, and remove empty directories through standard POSIX directory operations.
 
@@ -9,62 +9,26 @@
 
 ---
 
-## Create nested directories
+## List a large directory
 
-```bash
-mkdir -p a/b/c
-```
-
-## List a directory, including hidden entries
-
-```bash
-ls -la a
-```
-
-## Remove an empty directory
-
-```bash
-rmdir a/b/c
-```
-
-## Remove a directory and everything in it
-
-```bash
-rm -r a
-```
-
-## Find out why `rmdir` says "Directory not empty"
-
-Hidden files count. List everything:
-
-```bash
-ls -A a/b
-```
-
-Or ask the database directly; the result is the full path of
-every child of `a/b`:
-
-```sql
-SELECT parent || '/' || name FROM entries WHERE parent = 'a/b';
-```
+`ls` and `find` page through it 256 names at a time, resuming after
+the last name returned, so a listing costs O(n) whatever the size and
+never repeats an entry.
 
 ## Count everything below a directory
 
 ```sql
-SELECT kind, count(*) FROM entries
-WHERE parent = 'a' OR starts_with(parent, 'a/')
+SELECT kind, count(*) FROM pgfs.files
+WHERE tree = 'main' AND starts_with(path, '/a/')
 GROUP BY kind;
 ```
 
-Use `starts_with` rather than `LIKE 'a/%'`. In a `LIKE`
-pattern, `_` and `%` in directory names act as wildcards.
-
-## Find the largest directories by total file size
+## Find the largest directories
 
 ```sql
-SELECT parent, sum(size) AS bytes, count(*) AS files
-FROM entries WHERE kind = 'file'
-GROUP BY parent ORDER BY bytes DESC LIMIT 10;
+SELECT regexp_replace(path, '/[^/]*$', '') AS dir, sum(size) AS bytes
+FROM pgfs.files WHERE tree = 'main' AND kind = 'f'
+GROUP BY dir ORDER BY bytes DESC LIMIT 10;
 ```
 
 ---

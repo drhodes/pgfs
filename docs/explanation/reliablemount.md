@@ -1,7 +1,7 @@
 # Explanation: Reliable Mount & Shutdown
 
-!!! success "Status: Stable"
-    AutoUnmount, signal-driven clean unmount, the deadlock watchdog, health files and the `pgfs.sh` escalation path are all implemented.
+!!! warning "Status: Partially implemented"
+    AutoUnmount, clean shutdown that commits every buffer and runs the synchronous barrier, health files, bounded waits, the connection state machine with reconnect and revalidation (Bug 5), op_log idempotency, serialization retries, the in-flight watchdog, the slow-database signal and the SQLSTATE table are built and tested. The fuser 0.14 crate never delivers FUSE_INTERRUPT to the filesystem, so `failure.HonoursInterrupt` is limited to the watchdog's cancels.
 
 > The filesystem mounts and unmounts cleanly. Crashing or killing the daemon never leaves a ghost mount behind.
 
@@ -9,69 +9,24 @@
 
 ---
 
-## What a ghost mount is
+## Fail fast, recover by revalidating
 
-A FUSE filesystem is a contract between the kernel and a user
-process: the kernel forwards every operation on the mount to
-the process and waits for an answer. If the process disappears
-and nobody tells the kernel, the mount stays. Every access to
-it fails with "Transport endpoint is not connected", and tools
-that walk the filesystem tree, such as `df`, `find /` and
-backup jobs, hit the dead mount and stall or fail. That is a
-ghost mount, and avoiding them shaped how pgfs starts and
-stops.
+When the database goes away, a mount that queues requests builds a
+backlog that keeps it overloaded after the database returns. pgfs
+fails new requests at once with EIO, lets only the request in flight
+wait, and reconnects with jittered backoff. Before serving again it
+checks that the database is the same one with the same history: the
+system identifier, the timeline, the schema and `fs_uuid`, its own
+lease row, and that every worker's op_log slot holds at least the last
+mutation it acknowledged. If an acknowledged commit was lost, the
+mount fences itself rather than serve a rewound filesystem.
 
-## Three layers, weakest to strongest
+## A watchdog that can see a stuck worker
 
-**The lifecycle script** treats `/proc/mounts` as the source
-of truth rather than trusting PID files. If a mount exists
-with no live daemon behind it, `pgfs.sh up` sweeps it before
-mounting again. `pgfs.sh down` escalates from a polite signal
-to `fusermount3 -u` to a lazy unmount, and on the way it names
-the processes holding the mount busy, because "device busy"
-with no explanation is the most common frustration.
-
-**Signal handling** turns the polite signals into a clean
-unmount. pgfs blocks the signals it cares about in every
-thread and receives them with `sigwait` on one dedicated
-thread. That thread can safely take locks and call the
-unmount routine, which an asynchronous signal handler cannot.
-The signals are blocked before anything else happens, so a
-Ctrl+C during startup is queued rather than killing a
-half-initialised daemon.
-
-**AutoUnmount** is the layer that cannot fail. With it, the
-kernel itself watches the daemon process and removes the mount
-when the process exits for any reason: a clean return, a
-panic, SIGKILL or the OOM killer. Every other layer is a
-courtesy that produces a cleaner shutdown and clearer logs.
-AutoUnmount is the guarantee.
-
-## Why release builds abort on panic
-
-A panic in a FUSE daemon usually means an invariant has broken.
-Unwinding can leave the process alive in an inconsistent state
-and still answering kernel requests. In release builds, pgfs
-aborts instead. The panic hook writes a crash report first,
-and AutoUnmount turns the abort into a clean disappearance.
-
-## Why a deadlock unmounts the filesystem
-
-A wedged daemon is worse than a dead one. The kernel keeps
-waiting on it, and every process that touches the mount hangs
-in uninterruptible sleep. The liveness heartbeat detects this:
-a thread that cannot make progress stops advancing a counter,
-and the next request to arrive replies with an error and
-triggers an unmount. This converts a hang into an error, which
-processes can handle.
-
-## Health files
-
-Supervisors need a cheap way to ask "is it up yet?" without
-parsing logs. The PID file appears once the database is
-reachable, and the readiness file appears once the mount
-exists. Both are keyed by a hash of the mount point, so several
-pgfs mounts on one machine do not collide.
+A heartbeat thread can only notice that the heartbeat thread is stuck.
+pgfs records each worker's in-flight request in an atomic slot, and a
+separate thread watches the slots' ages, so a worker stuck in a query
+is reported, dumped and cancelled, never turned into a lost mount.
 
 ---
 

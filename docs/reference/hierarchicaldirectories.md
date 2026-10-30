@@ -1,7 +1,7 @@
 # Reference: Directory Trees
 
 !!! success "Status: Stable"
-    `mkdir`, `rmdir`, `readdir` and nested paths of any depth are implemented and covered by `test_dirs.sh`. Directory timestamps are not tracked.
+    `mkdir`, `rmdir`, `readdir` and `readdirplus` keep link counts and directory times, page by name with keyset cookies, and check emptiness in the same transaction as the delete. Covered by `tests/storage.rs`, the model-conformance suite and `test_dirs.sh`.
 
 > Users can create nested directories, list their contents, and remove empty directories through standard POSIX directory operations.
 
@@ -11,54 +11,18 @@
 
 ## FUSE operations
 
-| Operation | Behaviour | Errors |
+| Operation | SQL | Errors |
 |---|---|---|
-| `mkdir` | checks the primary for an existing entry, then inserts a `dir` row | `EEXIST`, `ENOENT` (parent unknown), `EIO` |
-| `rmdir` | checks the primary that the entry exists, then that no row has it as `parent`, then deletes it | `ENOENT`, `ENOTEMPTY`, `EIO` |
-| `readdir` | returns `.`, `..`, then every child ordered by name | `ENOENT`, `EIO` |
-| `lookup` | resolves `(parent inode, name)` to attributes | `ENOENT` |
+| `mkdir` | `pgfs.mkdir` | EEXIST, ENOENT, ENOTDIR, ENAMETOOLONG, EINVAL, ENOSPC, EROFS |
+| `rmdir` | `pgfs.rmdir` | ENOTEMPTY, ENOENT, ENOTDIR, EBUSY (root of the view), EROFS |
+| `readdir`, `readdirplus` | `pgfs.readdir`, `pgfs.readdirplus`, 256 names per page | ENOTDIR |
 
-The emptiness check and the delete in `rmdir` are separate
-statements, not one transaction.
+## Attributes
 
-## `readdir` offsets
-
-Entries are numbered from 1 in the order returned: `.` is 1,
-`..` is 2, and children follow sorted by name. The kernel
-resumes a partial listing by passing back the last number it
-received. Offsets index the current list, so if the directory
-changes between two calls of one listing, entries can be
-skipped or repeated.
-
-## Directory attributes
-
-| Attribute | Value |
+| Field | Value |
 |---|---|
-| `perm` | `0755` |
-| `nlink` | 2, regardless of the number of subdirectories |
-| `size`, `blocks` | 0 |
-| `uid`, `gid` | the daemon's own uid and gid |
-| `atime`, `mtime`, `ctime`, `crtime` | the Unix epoch (shown as 1970-01-01, or 1969-12-31 west of UTC) |
-
-## Root directory
-
-| Property | Value |
-|---|---|
-| Inode | 1 |
-| Path | `''` (empty string) |
-| Row | `parent = ''`, `name = ''`, `kind = 'dir'`, inserted at schema creation |
-| Attributes | always synthesised; never read from the database |
-| Listing | excludes the root's own row |
-
-## Paths and names
-
-| Rule | Detail |
-|---|---|
-| Key | `(parent, name)`, unique |
-| Full path | `parent || '/' || name`, or `name` when `parent = ''` |
-| Valid names | any UTF-8 string without `/` or NUL; non-UTF-8 names are rejected with `ENOENT` |
-| Depth | not limited by pgfs. The unique index on `(parent, name)` limits one key to about 2.7 kB, so a longer combined path fails with `EIO`. |
-| Index used by listings | `entries(parent)` |
+| `nlink` | 2 + subdirectories |
+| `mtime`, `ctime` | updated by every create, remove and rename in the directory |
 
 
 ## Specification requirements
@@ -68,39 +32,119 @@ skipped or repeated.
 ??? abstract "CreatesDirectories"
     `spec.app.CreatesDirectories`
 
-    A FUSE `mkdir` inserts a row with kind='dir'. If the entry exists
-    the kernel receives EEXIST. The reply includes a directory inode
-    with 0755 permissions and nlink=2.
+    A FUSE `mkdir` calls `pgfs.mkdir`, which in one transaction
+    following `concurrency.LockOrder`:
+
+    - allocates the new `ino` and a 63-bit random `gen`
+      (`storage.PersistentInodes`), locks the parent directory's inode
+      row, increments the parent's `nlink`, and updates the parent's
+      mtime and ctime;
+    - inserts a directory inode (`shadows_base = false`), with the
+      requested mode after umask and the caller's owner (set-group-id
+      inherited, `security.OwnershipFromCaller`);
+    - inserts its dentry, with `ON CONFLICT DO NOTHING` (or replaces an
+      existing whiteout with `shadows_base = true`,
+      `branch.EpochVersionedRows`);
+    - records the change.
+
+    **Postcondition.** The name resolves to an empty directory with
+    `nlink = 2`, and the parent's `nlink` grew by one (`posix.LinkCounts`).
+
+    **Crash.** All or nothing.
+
+    **Errors.** EEXIST, ENOENT, ENOTDIR, ENAMETOOLONG, EINVAL, ENOSPC,
+    EROFS, as for `CreatesFiles`.
 
 ??? abstract "RemovesDirectories"
     `spec.app.RemovesDirectories`
 
-    A FUSE `rmdir` deletes the directory row only if the directory is
-    empty (no child rows with matching parent path). If children exist
-    the kernel receives ENOTEMPTY. If the entry does not exist the
-    kernel receives ENOENT.
+    A FUSE `rmdir` calls `pgfs.rmdir`. In one transaction following
+    the discover-sort-lock-revalidate protocol of
+    `concurrency.LockOrder`, it discovers the directory's `ino`, locks
+    `parent_ino` and the directory's `ino` in ascending `ino` order,
+    checks that no live dentry names the directory as its parent, and
+    then:
+
+    - decrements the parent's `nlink` and updates the parent's mtime
+      and ctime;
+    - deletes or retires any child dentry whiteouts under the directory
+      in this layer so no live child row remains under a whited-out
+      directory (`storage.DentryTable`);
+    - deletes the directory's inode (or turns it into an inode whiteout
+      when `shadows_base = true`, `branch.CopiesUpOnWrite`);
+    - removes the directory's dentry, or writes a whiteout when
+      `shadows_base = true`;
+    - records the change.
+
+    On a branch, the emptiness check sees the merged view, so a
+    directory whose inherited entries are all whited out is empty.
+
+    **Concurrency.** A create in the directory locks the same inode row
+    (`concurrency.LockOrder`), so no create can land between the check
+    and the delete.
+
+    **Crash.** All or nothing.
+
+    **Errors.** ENOTEMPTY if any entry remains. ENOENT if absent.
+    ENOTDIR if not a directory. EBUSY for the root of a view. EROFS on a
+    snapshot.
 
 ??? abstract "ListsDirectories"
     `spec.app.ListsDirectories`
 
-    A FUSE `readdir` returns '.' and '..' followed by every child of
-    the directory inode, each with the correct inode number and file
-    type. Offsets are synthetic (1-based index); the reply stops when
-    the kernel's buffer is full and resumes on the next call.
+    A FUSE `readdir` or `readdirplus` returns `.` and `..` and then
+    the directory's entries in byte order of name. Each entry has its
+    inode number and type, and readdirplus also returns attributes. The
+    offset of each entry is a cookie that the directory handle maps to
+    the entry's name (a 64-bit offset cannot hold a 255-byte name). The
+    next call resumes with `name > cookie`, using keyset pagination over
+    the `(layer, parent_ino, name)` index. On a branch, the merged view of
+    `branch.LayeredLookup` is paginated the same way.
+
+    **Postcondition.** Every entry that exists for the whole listing is
+    returned exactly once. An entry created or removed during the
+    listing may or may not appear, never twice.
+
+    **Bounds.** Each call costs one indexed range scan of at most the
+    number of entries that fit the kernel's buffer. Listing a directory
+    of `n` entries is O(n) in total.
+
+    **Sources.** ScaleCheck r57, HMFS r131, TableFS r07. The first
+    implementation re-ran the full listing on every call and indexed
+    into it, which is O(n²) and skips or repeats entries under
+    concurrent change.
 
 ??? abstract "LooksUpEntries"
     `spec.app.LooksUpEntries`
 
-    A FUSE `lookup` on a (parent inode, name) pair returns the
-    entry's inode and attributes, or ENOENT if absent. Lookup allocates
-    a stable inode number for the entry's full path.
+    A FUSE `lookup` of `(parent ino, name)` returns the child's
+    persistent inode number (`ino`), generation (`inodes.gen`,
+    `storage.PersistentInodes`) and attributes, and increments the
+    kernel lookup count that `forget` later decrements
+    (`storage.ForgetsInodes`). A miss replies ENOENT with an entry TTL,
+    so the kernel caches the negative result
+    (`consistency.KernelCacheContract`).
+
+    **Postcondition.** The same name resolves to the same `(ino, gen)`
+    across lookups, restarts and remounts, until it is unlinked or
+    renamed.
+
+    **Bounds.** One index probe per layer of the view, in one round
+    trip, or none on a daemon cache hit.
 
 ??? abstract "ReportsAttributes"
     `spec.app.ReportsAttributes`
 
-    A FUSE `getattr` returns size, kind, permissions, timestamps,
-    and nlink for any inode. The root inode (ino=1) is always a
-    directory.
+    A FUSE `getattr` returns kind, mode, nlink, uid, gid, rdev, size,
+    `blocks` (512-byte units of stored data, holes excluded), `blksize`
+    (the block size), and atime, mtime, ctime and birth time in
+    nanoseconds. Size and mtime include writes still buffered on the
+    mount (`consistency.DrainsBuffersBeforeExternalising`). The reply's
+    TTL follows `consistency.KernelCacheContract`. Inode 1 is the root
+    directory of the mounted view.
+
+    **Postcondition.** The values reflect every operation that replied
+    before the request.
 
 ---
 

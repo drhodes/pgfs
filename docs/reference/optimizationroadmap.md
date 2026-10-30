@@ -1,215 +1,297 @@
 # Reference: Performance Optimizations
 
 !!! warning "Status: Partially implemented"
-    Chunked blocks, prepared statements, asynchronous commit, unlogged tables, per-handle write buffering, transaction batching and the attribute-cache TTL are implemented. Inode-keyed storage, the multi-threaded connection pool and the kernel writeback cache are not. The Reference page has the per-requirement status.
+    Inode-sharded workers with their own connections, the lock order, the rename serialisation point, cross-worker flush by message, bounded buffers, prepared statements and block-granular buffered writes ship. `make bench` runs portable workloads; fio, mdtest and the passthrough-FUSE ratio run only where installed, and the CI regression gate is not built. The writeback cache stays off by design.
 
-> pgfs incorporates a structured performance optimization pipeline targeting database access latency, connection concurrency, userspace buffering, and FUSE kernel-transport tuning.
+> The request path from the kernel to PostgreSQL is made fast where it costs most: concurrent dispatch sharded by inode, prepared statements, buffered writes and, later, the kernel's writeback cache. A fixed benchmark suite measures every change.
 
 [Tutorial](../tutorials/optimizationroadmap.md) · [How-to](../how-to/optimizationroadmap.md) · **Reference** · [Explanation](../explanation/optimizationroadmap.md)
 
 ---
 
-## Command-line options
+## Options
 
 | Option | Default | Effect |
 |---|---|---|
-| `--attr-ttl <seconds>` | `1.0` | TTL attached to every attribute and entry reply; fractional values allowed |
-| `--unlogged` | off | create `entries` and `blocks` as `UNLOGGED` tables; no effect on existing tables |
+| `--workers` | CPUs, at most 16 | inode-sharded dispatch workers |
+| `--buffer-per-file` | 8 MiB | commit a file's buffer at this size |
+| `--buffer-total` | 256 MiB | commit the oldest buffers past this total |
+| `--attr-ttl` | 3 600 s read-write, 1 s read-only | kernel entry and attribute TTL |
 
-## Built-in settings
+## Status
 
-| Setting | Value |
+| Requirement | State |
 |---|---|
-| Block size (FUSE path) | 65 536 bytes |
-| `synchronous_commit` | `off`, set on every pooled connection |
-| Connection pool | `r2d2`, max 10 per pool; the daemon holds 1 primary connection (plus 1 standby connection) for its lifetime |
-| FUSE dispatch | single-threaded |
-| Kernel capabilities requested | `FUSE_BIG_WRITES` |
-| Replica freshness cache | 500 ms |
-| Prepared on connect | `getattr`, `create`, `mkdir`, `unlink`, `rmdir`, `list`, `read_blocks`, `upsert_block`, `prune_blocks`, `delete_blocks`, and six inode-keyed statements |
-
-Replica queries, `rename`, size updates and `rmdir`'s emptiness
-check use unprepared SQL.
-
-## Requirement status
-
-| Requirement | Status | Notes |
-|---|---|---|
-| `ChunkedBlockStorageReq` | implemented | 64 KiB blocks in `blocks(parent, name, block_no)` |
-| `InoBasedRekeyingReq` | partial | `ino`/`parent_ino` columns and prepared statements exist; the FUSE path is still keyed by path and leaves them at their defaults |
-| `SparseWritePaddingReq` | partial | unbuffered writes merge with the stored block; writes buffered on an open handle do not, see `BufferedWriteFlushReq` |
-| `ReplicaFreshnessCacheReq` | implemented | 500 ms monotonic TTL |
-| `PreparedStatementReq` | implemented | hot-path primary statements; see list above |
-| `SynchronousCommitTuningReq` | implemented | always on; not configurable |
-| `UnloggedTableOptReq` | implemented | `--unlogged` |
-| `TransactionBatchingReq` | implemented | `write_range`, `truncate`, the buffered flush and `rename` are single transactions; `unlink` and `rmdir` are separate statements |
-| `MultiThreadedConnectionPoolReq` | partial | the pool exists but one connection is used and dispatch is single-threaded; no `--max-pool-size` |
-| `BufferedWriteFlushReq` | implemented | per open handle; flushed on `flush`, `fsync`, `release` and before a `read` of the same file; buffered blocks start empty rather than from the stored block |
-| `KernelAttrCacheTtlReq` | implemented | `--attr-ttl` |
-| `KernelWritebackCacheReq` | not implemented | only `FUSE_BIG_WRITES` is negotiated; no `--writeback-cache` |
+| `InodeShardedWorkers`, `WorkerOwnsConnection`, `NoLockAcrossRoundTrip` | built |
+| `LockOrder`, `RenameSerialisationPoint` | built, in the SQL functions |
+| `BoundedWriteBuffers`, `BufferedWriteFlushReq`, `PreparedStatementReq` | built |
+| `KernelWritebackCacheReq` | off by design until its preconditions are covered by crash tests |
+| `BenchmarkSuite` | portable workloads in `scripts/bench.sh`; fio, mdtest and the passthrough ratio where installed |
+| `BenchmarkRegressionGate` | not built |
 
 
 ## Specification requirements
 
 `OptimizationRoadmap` is built from these requirement classes. Each is declared in `spec/` and listed in the feature's `deps`.
 
-??? abstract "ChunkedBlockStorageReq"
-    `spec.optimize.ChunkedBlockStorageReq`
+??? abstract "InodeShardedWorkers"
+    `spec.concurrency.InodeShardedWorkers`
 
-    File contents are stored in fixed-size block chunks (64KB or 128KB) in a
-    `blocks(ino, block_no, data)` table rather than monolithic byte blobs in
-    `entries.data`.
+    The daemon runs `--workers` dispatch workers (default: the number
+    of CPUs, at most 16). Every request on an inode (`getattr`,
+    `setattr`, `open`, `read`, `write`, `flush`, `release`, `fsync`,
+    `readdir`, `readdirplus`, `*xattr`) goes to the worker that owns
+    its inode, `ino mod workers`. That worker owns the inode's open
+    handles and write buffers.
 
-    Technical Details:
+    The daemon's metadata cache (inode attributes, dentries, and an
+    atomic per-inode summary `(buffered_size, buffered_mtime_ns,
+    open_handles)`) is shared across workers so `getattr` and
+    `readdirplus` read buffered sizes without cross-worker round trips
+    (`consistency.DrainsBuffersBeforeExternalising`), and the
+    change-feed listener thread (`changefeed.ChangeNotifications`) can
+    evict entries directly.
 
-    - Read operations calculate block ranges `[start_block..end_block]` based on
-      `offset` and `size`, fetching only touched blocks from PostgreSQL.
-    - Write operations update or upsert only touched block records rather than
-      rewriting the entire file payload.
-    - Truncation via `setattr` deletes block records where `block_no > new_size / block_size`
-      and trims trailing block bytes.
-    - Metadata (`size`, `mtime`, `ctime`) remains in `entries` as the source of truth.
+    A request on a single name (`lookup`, `create`, `mkdir`, `mknod`,
+    `symlink`, `link`, `unlink`, `rmdir`) goes to `hash(parent_ino,
+    name) mod workers` (using `(newparent_ino, newname)` for `link`), so
+    operations on the same name are serialised while concurrent creates
+    or unlinks of different names in one directory fan out across all
+    workers. A request on two names (`rename`) goes to the worker of the
+    lower `(parent_ino, name)` hash. `copy_file_range` goes to `ino_out
+    mod workers`. Before starting a `rename`, `link`, `unlink` or
+    `copy_file_range` transaction, the worker checks the daemon's
+    metadata cache for the affected inode(s) (`source_ino` and any
+    overwritten `target_ino`, `link`'s `ino`, or `ino_in`) and, if any
+    has buffered writes on another worker, messages that worker (`ino
+    mod workers`) to commit its buffer first (`NoLockAcrossRoundTrip`).
+    In addition, `pgfs.rename` and `pgfs.unlink` take the set of inodes
+    that currently have dirty buffers anywhere on the mount (from the
+    shared per-inode summary, or `NULL` when none are dirty): after
+    `LockOrder` step 3, if a resolved `source_ino` or `target_ino` is in
+    that dirty set and was not pre-flushed (for example because a cache
+    miss skipped pre-resolution or another worker concurrently renamed a
+    dirty file onto the target name), the SQL function returns
+    `retry: inos = …` without committing, and the worker flushes those
+    inodes and calls again (`consistency.OneRoundTripPerOperation`).
 
-??? abstract "InoBasedRekeyingReq"
-    `spec.optimize.InoBasedRekeyingReq`
+    **Postcondition.** Requests on one inode, or on one `(parent_ino,
+    name)`, are applied in the order the kernel sent them.
 
-    Rekey `entries` and `blocks` tables from `(parent, name)` text keys to
-    64-bit integer `ino BIGSERIAL` primary keys (`entries(ino)` and
-    `blocks(ino, block_no)`).
+    **Concurrency.** No lock protects per-inode write buffers or handle
+    tables, because one worker thread owns each inode's mutable state.
 
-    Technical Details:
+    **Sources.** uFS r130, To FUSE or Not r12, RFUSE r17.
 
-    - `entries` table uses `ino BIGSERIAL PRIMARY KEY` and `parent_ino BIGINT REFERENCES entries(ino)`.
-    - Directory `rename(old_parent, old_name, new_parent, new_name)` updates `parent_ino = new_parent`
-      and `name = new_name` on a single row in $O(1)$ time, eliminating $O(N)$ cascading string updates.
-    - Path lookup is accelerated via B-Tree index on `(parent_ino, name)`.
-    - Inode numbers are guaranteed stable for open file handles and kernel VFS stat callbacks.
+??? abstract "WorkerOwnsConnection"
+    `spec.concurrency.WorkerOwnsConnection`
 
-??? abstract "SparseWritePaddingReq"
-    `spec.optimize.SparseWritePaddingReq`
+    Each worker owns one database connection, with its prepared
+    statements (`PreparedStatementReq`), for its whole life. Background
+    tasks (lease renewal, housekeeping, the change-feed listener) have
+    connections of their own. The total on the primary is `workers + 3`
+    (plus `workers + 1` standby connections when `--replica` is enabled,
+    `replica.ServesReadsFromReplica`), and the startup log reports it.
 
-    Unaligned or sparse block writes (where `offset_in_block > 0` on an
-    uninstantiated block record) zero-pad preceding bytes at the application layer
-    before upserting to prevent byte-0 data corruption.
+    **Bounds.** Connections per mount are fixed and stated. A mount
+    never opens connections on demand.
 
-    Technical Details:
+??? abstract "LockOrder"
+    `spec.concurrency.LockOrder`
 
-    - When `write_block(ino, block_no, data, offset_in_block)` is called for a block
-      that does not yet exist in `blocks`, the engine checks if `offset_in_block > 0`.
-    - If `offset_in_block > 0`, the engine constructs a zero-filled byte array of length
-      `offset_in_block` and prepends it to `data` before upserting.
-    - Subsequent reads of `[0..offset_in_block]` correctly return zero-filled bytes
-      conforming to POSIX sparse file behavior.
+    Inside a transaction that locks several rows, rows are locked in
+    this order:
 
-??? abstract "ReplicaFreshnessCacheReq"
-    `spec.optimize.ReplicaFreshnessCacheReq`
+    1. the layer gate, shared (`branch.EpochVersionedRows`);
+    2. the rename lock, for directory renames across parents
+       (`RenameSerialisationPoint`);
+    3. inode rows, in ascending `ino`;
+    4. dentry rows, in ascending `(parent_ino, name)`;
+    5. block map rows, in ascending `(ino, block_no)`;
+    6. blob rows, in ascending `blob_id`.
 
-    When running with `--replica`, the replica freshness check
-    (`replica_fresh`) caches its health and WAL LSN verdict using an atomic TTL cache
-    to eliminate per-read validation overhead.
+    Functions that need a row later in this order never wait for one
+    earlier in it. Because name-based operations (`unlink`, `rmdir`,
+    `rename`) do not know the child or overwritten target `ino`
+    beforehand, they execute a two-phase discover-sort-lock-revalidate
+    protocol (Frangipani 12, HopsFS r11, Chardonnay r66):
 
-    Technical Details:
+    1. **Discover:** read the relevant `dentries` row(s) without
+       `FOR UPDATE` (and for `create`/`mkdir`, allocate the new `ino`
+       from the sequence first) to learn all participating inode
+       numbers (`parent_ino`, `new_parent_ino`, `child_ino`,
+       `target_ino`).
+    2. **Lock inodes:** sort all participating existing inode numbers in
+       ascending `ino` order and lock their `inodes` rows with
+       `SELECT … FOR UPDATE`.
+    3. **Lock and revalidate dentries:** lock or insert the `dentries`
+       row(s) in ascending `(parent_ino, name)` order and verify that
+       each resolved `(parent_ino, name)` still maps to the `ino`
+       discovered in step 1 (if a concurrent operation changed it, abort
+       and retry from step 1).
 
-    - Uses `AtomicBool` for freshness state and `AtomicU64` for timestamp tracking.
-    - Re-evaluates Postgres physical streaming standby lag (`pg_is_in_recovery`,
-      `pg_current_wal_lsn`, `pg_last_wal_replay_lsn`) only when `now - last_checked > 500ms`.
-    - Consecutive read operations reuse the cached verdict, reducing query overhead by 75%
-      while ensuring automatic fallback to primary if lag exceeds tolerance.
+    Housekeeping follows the same order.
+
+    **Invariant.** No deadlock between pgfs transactions. One between a
+    pgfs transaction and an external client is resolved by Postgres and
+    retried (`failure.RetriesSerializationFailures`).
+
+    **Sources.** Frangipani 12, HopsFS r11, RefFS r65, Chardonnay r66,
+    LockFS r133.
+
+??? abstract "RenameSerialisationPoint"
+    `spec.concurrency.RenameSerialisationPoint`
+
+    A rename that moves a directory to a different parent takes a
+    transaction-level advisory lock for the layer, then checks that the
+    destination is not inside the source by walking the destination's
+    ancestors. The check and the update are in one transaction, so two
+    concurrent renames cannot form a cycle. Renames within one directory,
+    and renames of non-directories, do not take this lock.
+
+    **Errors.** EINVAL if the destination is inside the source.
+
+    **Bounds.** The ancestor walk is one recursive query, proportional
+    to the destination's depth.
+
+    **Sources.** InfiniFS r16, Mantle r127.
+
+??? abstract "NoLockAcrossRoundTrip"
+    `spec.concurrency.NoLockAcrossRoundTrip`
+
+    No daemon-side lock or guard is held while a database query runs.
+    Work that needs other workers' state, for example commits of their
+    buffers before a rename, is requested by message and awaited before
+    the transaction starts. While a worker waits on another worker, it
+    keeps servicing incoming commit-buffer requests from its peer
+    mailbox, never new FUSE requests (serving new FUSE requests would
+    reorder requests on one inode and make the wait re-entrant; handling
+    a commit-buffer request never sends a cross-worker message, so wait
+    chains have depth 1 and cannot form a cycle).
+
+    **Sources.** CetoFS r42, Chardonnay r66 (read before you lock).
+
+??? abstract "BoundedWriteBuffers"
+    `spec.concurrency.BoundedWriteBuffers`
+
+    Per-inode write buffers are bounded. A buffer is committed when
+    it holds `--buffer-per-file` (default 8 MiB). When the mount's total
+    reaches `--buffer-total` (default 256 MiB), the oldest buffers are
+    committed before new writes are accepted (workers awaiting room
+    continue servicing peer commit-buffer messages so two workers under
+    buffer pressure cannot deadlock, `NoLockAcrossRoundTrip`). A write
+    waits for that room rather than growing memory without limit.
+
+    **Bounds.** Buffered data on a mount never exceeds the total plus
+    one write.
+
+    **Sources.** ScaleCheck r57.
 
 ??? abstract "PreparedStatementReq"
     `spec.optimize.PreparedStatementReq`
 
-    All static SQL queries (getattr, read, write, create, mkdir, unlink,
-    rmdir, list, rename) are pre-compiled as prepared statements upon
-    database connection initialization.
+    Every single-statement read the daemon issues (lookup, getattr,
+    readdir pages, block reads, xattr reads) and every call to a `pgfs`
+    function is prepared once per connection, when the worker opens it
+    (`concurrency.WorkerOwnsConnection`). The hot path never sends SQL
+    text to be parsed and planned. Because each worker owns its
+    connection for life, a statement is never prepared lazily, and never
+    prepared twice.
 
-    Technical Details:
-
-    - Pre-compiles statement handles (`stmt_getattr`, `stmt_read_blocks`, `stmt_upsert_block`, etc.)
-      during `DbPool::get()` or worker initialization.
-    - Eliminates SQL lexical parsing, semantic analysis, and query planning overhead from
-      the FUSE operation hot path.
-
-??? abstract "SynchronousCommitTuningReq"
-    `spec.optimize.SynchronousCommitTuningReq`
-
-    The database layer supports connection-level tuning of
-    `synchronous_commit` (`SET synchronous_commit = off`) to optimize per-operation
-    fsync latency.
-
-    Technical Details:
-
-    - Executed during connection acquisition (`on_acquire` hook in connection pool manager).
-    - Allows transactions to return immediately after writing to Postgres WAL buffers,
-      trading a sub-second crash durability window for up to 10x higher metadata IOPS.
-
-??? abstract "UnloggedTableOptReq"
-    `spec.optimize.UnloggedTableOptReq`
-
-    The database schema supports creating `entries` and `blocks` as
-    `UNLOGGED` tables for high-performance development, caching, and testing workloads.
-
-    Technical Details:
-
-    - DDL specifies `CREATE UNLOGGED TABLE entries` and `CREATE UNLOGGED TABLE blocks`.
-    - Bypasses WAL logging entirely, maximizing raw write throughput for ephemeral mounts.
-
-??? abstract "TransactionBatchingReq"
-    `spec.optimize.TransactionBatchingReq`
-
-    FUSE operations that execute multiple sequential database queries
-    wrap them in a single explicit database transaction.
-
-    Technical Details:
-
-    - Groups multi-query operations (e.g. truncate + write, directory deletion checks)
-      within `BEGIN` ... `COMMIT` blocks.
-    - Reduces network round-trips and WAL commit fsync overhead from $N$ commits to 1 commit.
-
-??? abstract "MultiThreadedConnectionPoolReq"
-    `spec.optimize.MultiThreadedConnectionPoolReq`
-
-    The database client uses a thread-safe connection pool (`r2d2` or `bb8`),
-    combined with multi-worker FUSE session dispatch to process parallel operations concurrently.
-
-    Technical Details:
-
-    - Configures pool size via CLI `--max-pool-size`.
-    - Replaces single-threaded `&mut self` Db handles with pooled connection acquisition per thread.
+    **Bounds.** Parsing and planning happen once per statement per
+    connection.
 
 ??? abstract "BufferedWriteFlushReq"
     `spec.optimize.BufferedWriteFlushReq`
 
-    Small or non-aligned FUSE `write` calls buffer dirty byte ranges
-    or blocks in memory per open file handle, flushing pending writes
-    to PostgreSQL on `flush`, `release`, or explicit `fsync`.
+    Writes are buffered in a single per-inode write buffer owned by
+    the inode's worker (`concurrency.InodeShardedWorkers`). Every write
+    to an inode advances a per-inode monotonic `write_seq` and records
+    the handle's `last_write_seq` and `seen_err_seq` (`errseq_t`,
+    `durability.FsyncFailureSemantics`). The inode buffer is committed
+    as a unit by `flush`, `release`, `fsync`, any operation that names
+    the file (`consistency.DrainsBuffersBeforeExternalising`), and
+    buffer pressure (`concurrency.BoundedWriteBuffers`). A write of a
+    whole aligned block, or an `O_SYNC` / `O_DSYNC` / `O_DIRECT` write,
+    commits any overlapping dirty buffered data (or drains the inode
+    buffer first) so an earlier buffered byte can never overwrite a
+    later direct or aligned write (`durability.SyncHandles`).
 
-    Technical Details:
+    Buffers are block-granular, at the filesystem's block size
+    (`storage.FixedBlockSize`), with dirty byte intervals (or a dirty
+    bitmap) per block. Committing a partly dirty block reads the
+    committed block first and overlays the dirty intervals on it. A
+    block with nothing committed starts as zeros. This read-modify-write
+    rule is the fix for Bug 1.
 
-    - Maintains a per-fd dirty block buffer in daemon memory.
-    - Aggregates page-sized kernel writes into full 128KB block writes before issuing database upserts.
+    **Postcondition.** After commit, the file equals the committed
+    content with every buffered write applied in arrival order, across
+    all open descriptors on the inode.
 
-??? abstract "KernelAttrCacheTtlReq"
-    `spec.optimize.KernelAttrCacheTtlReq`
+    **Concurrency.** Every read, getattr and listing on the mount sees
+    the buffered data (`consistency.DrainsBuffersBeforeExternalising`).
 
-    The kernel attribute and entry cache TTL is configurable via a CLI
-    option (`--attr-ttl`), reducing repetitive `lookup` and `getattr` FUSE callbacks.
+    **Errors.** A failed commit keeps the uncommitted data in the inode
+    buffer and reports once per descriptor that wrote (`last_write_seq`)
+    via `errseq_t` (`durability.FsyncFailureSemantics`).
 
-    Technical Details:
-
-    - Sets `TTL` duration in `fuser::ReplyAttr` and `fuser::ReplyEntry` responses.
-    - Bypasses daemon and database queries for stat/lookup ops on unchanged paths during TTL window.
+    **Sources.** Skyros r129, r90.
 
 ??? abstract "KernelWritebackCacheReq"
     `spec.optimize.KernelWritebackCacheReq`
 
-    FUSE callback initialization negotiates kernel capabilities including
-    `FUSE_WRITEBACK_CACHE` and splice read/write.
+    The kernel writeback cache (`FUSE_WRITEBACK_CACHE`) is the largest
+    single win on the data path (To FUSE or Not r12). It stays off
+    (`posix.WritebackCacheDisabled`) until each of these holds and is
+    covered by a crash test:
 
-    Technical Details:
+    - mtime and size are owned by the kernel while the cache is on, and
+      the daemon accepts them from setattr;
+    - writes that arrive after `release`, from pages the kernel flushes
+      later, are accepted and committed;
+    - `O_APPEND` positioning is left to the kernel;
+    - `fsync` covers pages still in the kernel, because the kernel
+      flushes them before calling the daemon;
+    - `CrashConformance` runs a matrix with the cache on.
 
-    - Enables `CAP_WRITEBACK_CACHE` in `KernelConfig` during FUSE `init`.
-    - Allows Linux VFS page cache to coalesce small sequential write syscalls into 128KB block buffers.
+    Splice for reads and writes is negotiated with the cache.
+
+    **Sources.** To FUSE or Not r12, r77.
+
+??? abstract "BenchmarkSuite"
+    `spec.perf.BenchmarkSuite`
+
+    `make bench` runs a fixed set of named workloads on a fresh
+    filesystem, and writes the results as JSON with the commit, the
+    machine and the Postgres version:
+
+    | Workload | Measures |
+    |---|---|
+    | fio sequential read and write, 1 MiB | data-path throughput |
+    | fio random 4 KiB read and write | small I/O and read-modify-write |
+    | mdtest create, stat, unlink, 100k files | metadata operations per second |
+    | `git clone`, then `git status`, of a pinned repository | real tool workload (Bento r53) |
+    | untar of a pinned Linux kernel tarball | small-file creation (IndexFS r09) |
+    | snapshot, branch, promote and diff on a 100k-file tree | the killer feature's constant-time claim |
+
+    Each workload also runs on a passthrough FUSE filesystem over ext4
+    on the same machine, and results are reported as a ratio to it.
+    Comparing with ext4 directly would charge pgfs for FUSE itself
+    (Bento r53). Every run records WAL bytes per byte of user data
+    (`space.ReportsSpace`) and the p50 and p99 latency of each
+    operation.
+
+    **Sources.** Bento r53, IndexFS r09, To FUSE or Not r12.
+
+??? abstract "BenchmarkRegressionGate"
+    `spec.perf.BenchmarkRegressionGate`
+
+    CI runs `BenchmarkSuite` on a fixed runner and compares each
+    result with the stored baseline. A workload more than 10% slower,
+    or with a write amplification more than 10% higher, fails the run,
+    unless the commit updates the baseline with a stated reason.
+    Absolute targets are written into the baseline after the first run
+    of the inode-keyed design.
 
 ---
 

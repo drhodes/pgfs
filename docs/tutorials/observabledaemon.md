@@ -1,7 +1,7 @@
 # Tutorial: Observability & Diagnostics
 
 !!! success "Status: Stable"
-    Tracing, the 60-second metrics, the SIGUSR1 state dump, error chains and crash reports all ship today. Of the per-errno counters, only `eio` and `enoent` are incremented yet.
+    Tracing with spans per callback (worker and view included) and per database call (statement, inode, backend pid, round trip), the nine 60-second metrics lines with every errno counted where it is replied, the SIGUSR1 dump written by the signal thread from atomics, and crash reports all ship. A test keeps the instrumented callback list in step with the `Filesystem` impl.
 
 > Operators can see what the daemon is doing, how fast it is doing it, and why something failed, from the log alone: structured spans for every operation, periodic metrics, an on-demand state dump, and self-contained error chains and crash reports.
 
@@ -9,116 +9,36 @@
 
 ---
 
-In this tutorial we will watch pgfs work: follow its log, ask a
-running daemon for a state dump, read a metrics report, and
-then break the database on purpose to see what a real failure
-looks like. We need a terminal for the daemon and a second one
-for commands.
+In this tutorial we will read the daemon's log, metrics and state dump
+while it works. We need a mount started with `./scripts/pgfs.sh up`.
 
-## Step 1: run the daemon in the foreground
-
-In the first terminal:
+## Step 1: watch spans
 
 ```bash
-./scripts/pgfs.sh run
+pkill -f 'pgfs mount main' ; RUST_LOG=pgfs=debug ./target/debug/pgfs mount main testdata/mnt 2> testdata/obs.log &
+sleep 1; ls testdata/mnt > /dev/null
+grep 'fuse{op="getattr"' testdata/obs.log | head -2
 ```
 
-The startup lines show the replica mode, the health file and
-the negotiated FUSE capability:
+Every callback runs in a `fuse` span with its operation, inode, worker
+and view; database calls nest inside it as `db` spans with the
+statement, backend pid and round-trip time.
 
-```text
-INFO pgfs: replica mode: off (single primary)
-health pid file: /tmp/pgfs-5049eced64c2821d.pid
-INFO init: pgfs::fs: FUSE init: negotiated FUSE_BIG_WRITES
-```
-
-## Step 2: see that normal misses are quiet
-
-In the second terminal:
+## Step 2: ask for a state dump
 
 ```bash
-cat testdata/mnt/does-not-exist
+kill -USR1 "$(pgrep -f 'pgfs mount main testdata/mnt')"
+grep 'state|' testdata/obs.log | tail -12
 ```
 
-`cat` reports "No such file or directory", and the daemon's log
-stays silent. A missing file is an expected answer, not a
-failure, so pgfs does not log it.
+The signal thread writes the dump itself, so it appears even when
+every worker is stuck.
 
-## Step 3: ask for a state dump
+## Step 3: read the metrics
 
-```bash
-kill -USR1 "$(pgrep -f 'target/debug/pgfs')"
-ls testdata/mnt > /dev/null
-```
-
-The dump is written by the next filesystem operation, here the
-`ls`:
-
-```text
-INFO pgfs: SIGUSR1 received; state dump will appear on next FUSE callback
-INFO getattr{ino=1}: pgfs::fs: state|ino_cache=3 next_ino=4 db=connected (replica none) uptime_secs=41
-state|fuse_latency=fuse total=12 p50=<=1kµs p95=<=10kµs p99=<=10kµs
-state|db_latency=db total=15 p50=<=1kµs p95=<=1kµs p99=<=10kµs
-```
-
-## Step 4: read a metrics report
-
-Do some work, then wait for the minute to turn over:
-
-```bash
-for i in $(seq 1 50); do echo $i > testdata/mnt/m$i; done
-rm testdata/mnt/m*
-```
-
-Within 60 seconds, five `metrics|` lines appear. The
-`metrics|ops` line counts the 50 creates and 50 unlinks among
-the other operations.
-
-## Step 5: break the database
-
-Stop PostgreSQL underneath the running mount, then touch a name
-the kernel has not cached:
-
-```bash
-make db-stop
-ls testdata/mnt/after-stop
-```
-
-```text
-ls: cannot access 'testdata/mnt/after-stop': Input/output error
-```
-
-This time the first terminal shows an ERROR. Read it left to
-right: the FUSE operation and its arguments (the span), what
-pgfs was doing and where (`src/db.rs:453`), and the root cause
-reported by PostgreSQL:
-
-```text
-ERROR lookup{parent=1 name=after-stop}: pgfs::fs: get attributes of entry "after-stop" in "" (at src/db.rs:453): db error: FATAL: terminating connection due to administrator command
-```
-
-## Step 6: recover
-
-Start PostgreSQL again, then restart the daemon. pgfs holds a
-single database connection for its whole lifetime and does not
-reconnect, so it needs the restart:
-
-```bash
-./scripts/init_db.sh
-```
-
-Press Ctrl+C in the first terminal. The daemon logs
-`received signal 2; unmounting cleanly` and exits. Run
-`./scripts/pgfs.sh run` again, and `ls testdata/mnt` works.
-
-## What we did
-
-We saw that expected misses stay out of the log, pulled live
-state out of a running daemon, read its periodic metrics, and
-followed a real failure from the kernel's bare `EIO` to its
-root cause. The [reference](../reference/observabledaemon.md)
-lists every field; the [explanation](../explanation/observabledaemon.md)
-covers the design.
+Every 60 s the daemon logs nine `metrics|…` lines: operations, errnos,
+replica, FUSE latency, database latency, connection state, in-flight
+age, space and integrity.
 
 ---
 

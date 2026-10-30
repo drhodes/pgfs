@@ -1,7 +1,7 @@
 # Reference: Atomic Rename
 
 !!! success "Status: Stable"
-    File and directory renames, overwrite semantics and the full POSIX error matrix are implemented and covered by `test_rename.sh` and `test_git_init.sh`. `renameat2` flags (`RENAME_NOREPLACE`, `RENAME_EXCHANGE`) are rejected.
+    A rename moves one dentry in constant time with no name matching (Bug 2), commits the source's buffered writes first (Bug 3), takes the rename lock for directory moves, and honours `RENAME_NOREPLACE` and `RENAME_EXCHANGE`. Covered by `tests/storage.rs`, the model-conformance suite, `test_rename.sh`, `test_posix.sh` and the git workload.
 
 > Users can rename (move) files and directories with standard `mv` semantics, including overwriting existing files and empty directories.
 
@@ -14,56 +14,21 @@
 | Source | Target | Result |
 |---|---|---|
 | file | absent | moved |
-| file | file | target atomically replaced |
-| file | directory | `EISDIR` |
-| directory | absent | moved with all descendants |
+| file | file | target atomically replaced (deleted, or orphaned if open) |
+| file | directory | EISDIR |
+| directory | absent | moved, descendants untouched |
 | directory | empty directory | target atomically replaced |
-| directory | non-empty directory | `ENOTEMPTY` |
-| directory | file | `ENOTDIR` |
-| directory | inside its own subtree | `EINVAL` |
-| any | itself | success, no change |
-| absent | any | `ENOENT` |
-| any, with `renameat2` flags ≠ 0 | any | `EINVAL` |
+| directory | non-empty directory | ENOTEMPTY |
+| directory | inside itself | EINVAL |
+| either | the same inode | success, nothing changes |
 
-## Transaction
+## Flags
 
-Every check that decides the outcome reads the primary
-database, never a replica. A successful rename is one
-transaction:
-
-1. If the target exists, delete its `entries` row and its
-   `blocks` rows.
-2. If the source is a directory, rewrite `parent` in every
-   `entries` and `blocks` row below it, replacing the old path
-   prefix with the new one.
-3. Update the source's `entries` row to the new
-   `(parent, name)` and set its `mtime`.
-4. Move the source's `blocks` rows to the new `(parent, name)`.
-5. Commit. If no row moved, roll back and reply `EIO`.
-
-After the commit, the in-memory path ↔ inode maps are re-keyed
-for the entry and its whole subtree, so inode numbers the
-kernel already holds stay valid.
-
-## Cost
-
-| Rename | Rows written |
+| Flag | Behaviour |
 |---|---|
-| file | 1 entry + its blocks |
-| directory | 1 entry + every descendant entry + every descendant block |
-
-## Open files
-
-Pending writes in an open file's buffer are tied to the path
-the file had when it was opened. Close or `fsync` a file
-before renaming it, otherwise those writes are not carried
-over to the new name.
-
-## Isolation
-
-Concurrent SQL readers, and other pgfs daemons on the same
-database, see the tree either entirely before or entirely
-after the rename (PostgreSQL `READ COMMITTED`).
+| `RENAME_NOREPLACE` | EEXIST if the target exists |
+| `RENAME_EXCHANGE` | swap; ENOENT if either is missing |
+| `RENAME_WHITEOUT`, unknown | EINVAL |
 
 
 ## Specification requirements
@@ -73,37 +38,81 @@ after the rename (PostgreSQL `READ COMMITTED`).
 ??? abstract "RenamesEntries"
     `spec.app.RenamesEntries`
 
-    A FUSE `rename` moves an entry from one (parent, name) to
-    another. It follows POSIX semantics:
+    A FUSE `rename` calls `pgfs.rename`, which moves one dentry from
+    `(old parent, old name)` to `(new parent, new name)`. It follows
+    POSIX semantics:
 
-    - If the target exists and is a file, it is atomically replaced.
-    - If the target exists and is an empty directory, it is atomically
-      replaced.
-    - If the target is a non-empty directory, the kernel receives
-      ENOTEMPTY.
-    - If source is a file and target is a directory, the kernel receives
-      EISDIR.
-    - If source is a directory and target is a file, the kernel receives
-      ENOTDIR.
-    - Renaming a directory cascades: every descendant's `parent` path
-      is rewritten in the same database transaction.
-    - The in-memory inode<->path maps are re-keyed for the entire
-      subtree.
+    - If the target exists and is a non-directory, it is replaced
+      atomically. Its `nlink` drops, and it is deleted or orphaned as in
+      `UnlinksFiles`.
+    - If the target is an empty directory, it is replaced atomically.
+    - If the target is a non-empty directory, it replies ENOTEMPTY.
+    - If the source is a non-directory and the target a directory, it
+      replies EISDIR.
+    - If the source is a directory and the target a non-directory, it
+      replies ENOTDIR.
+    - A directory keeps its inode and its descendants. Only its dentry
+      row moves (preserving `shadows_base` on the old and new keys,
+      `branch.EpochVersionedRows`), and the parents' `nlink`, mtime and
+      ctime change. The renamed inode's ctime is set, and the change is
+      recorded (`changefeed.RecordsChanges`).
+
+    **Invariant.** Exactly one dentry changes, plus at most one replaced
+    target. No other row is touched, and no name matching of any kind is
+    involved. This is what makes Bug 2 impossible: the old rename
+    matched descendants with `LIKE`, so `_` and `%` acted as wildcards.
+
+    **Crash.** All or nothing: after a crash, the source name or the
+    target name resolves to the inode, never both and never neither.
+
+    **Concurrency.** Pending writes of the source and of a replaced
+    target are committed first (`durability.FlushesBeforeNaming`,
+    verified against the mount's dirty-inode set via
+    `concurrency.InodeShardedWorkers`). That is Bug 3: rename lost
+    buffered writes. A directory moving to a different parent takes the
+    rename lock (`concurrency.RenameSerialisationPoint`). Rows lock in
+    the order of `concurrency.LockOrder`.
+
+    **Errors.** ENOENT if the source is missing. EXDEV across trees.
+    EROFS on a snapshot. EBUSY for the root of a view.
+
+    **Bounds.** Constant work, whatever the size of the subtree (Oracle
+    FSS r91, InfiniFS r16).
 
 ??? abstract "RejectsInvalidRenames"
     `spec.app.RejectsInvalidRenames`
 
-    A FUSE `rename` with non-zero flags replies EINVAL. Renaming a
-    directory into one of its own descendants replies EINVAL. Renaming
-    an entry onto itself is a no-op.
+    `rename` validates before it changes anything:
+
+    - moving a directory into itself or one of its descendants replies
+      EINVAL, checked under the rename lock;
+    - renaming a name onto a name of the same inode succeeds and does
+      nothing, as POSIX requires;
+    - `RENAME_NOREPLACE` and `RENAME_EXCHANGE` are supported
+      (`posix.RenameFlags`);
+    - `RENAME_WHITEOUT` and unknown flags reply EINVAL;
+    - `.` and `..` as either name reply EINVAL (the kernel also checks).
 
 ??? abstract "SupportsGitInit"
     `spec.app.SupportsGitInit`
 
-    Running `git init` inside the mounted filesystem succeeds without
-    errors. This exercises the full rename-overwrite path: git creates
-    `.git/config`, then uses lock+rename to set config values, which
-    triggers rename-overwrite with POSIX semantics.
+    Git works on a mount, as a regression workload for the POSIX
+    details it depends on. On a mounted tree, `git init`, `git clone`
+    of a pinned repository, `git status`, `git commit`, `git gc` and
+    `git checkout` of another branch all succeed, and `git fsck` passes.
+    This exercises:
+
+    - rename-over for lockfiles;
+    - `O_EXCL` creates of `*.lock` (`posix.ExclusiveCreate`);
+    - `chmod +x` on hooks (`posix.SetsAttributes`);
+    - `fsync` of objects and refs under `core.fsync`
+      (`durability.FsyncIsDurable`);
+    - hard links and open-after-unlink during `gc`.
+
+    The same workload is a benchmark (`perf.BenchmarkSuite`).
+
+    **Sources.** Bento r53 (git through FUSE as the yardstick), ALICE
+    r118.
 
 ---
 

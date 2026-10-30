@@ -1,7 +1,7 @@
 # Tutorial: Atomic Rename
 
 !!! success "Status: Stable"
-    File and directory renames, overwrite semantics and the full POSIX error matrix are implemented and covered by `test_rename.sh` and `test_git_init.sh`. `renameat2` flags (`RENAME_NOREPLACE`, `RENAME_EXCHANGE`) are rejected.
+    A rename moves one dentry in constant time with no name matching (Bug 2), commits the source's buffered writes first (Bug 3), takes the rename lock for directory moves, and honours `RENAME_NOREPLACE` and `RENAME_EXCHANGE`. Covered by `tests/storage.rs`, the model-conformance suite, `test_rename.sh`, `test_posix.sh` and the git workload.
 
 > Users can rename (move) files and directories with standard `mv` semantics, including overwriting existing files and empty directories.
 
@@ -9,103 +9,40 @@
 
 ---
 
-In this tutorial we will rename files and whole directory
-trees, overwrite a file atomically, see which renames pgfs
-refuses, and finish by running git (which depends on atomic
-rename) inside the mount.
+In this tutorial we will replace a file atomically the way editors and
+package managers do, swap two names, and move a directory. We need a
+mount.
 
-We need a running mount; see [Your first pgfs
-mount](projectlocalenvironment.md).
-
-## Step 1: rename over an existing file
+## Step 1: write-then-rename
 
 ```bash
-mkdir testdata/mnt/rename && cd testdata/mnt/rename
-echo v1 > a.txt
-echo v2 > b.txt
-mv a.txt b.txt
-cat b.txt
-ls
+cd testdata/mnt
+echo "version 1" > config
+echo "version 2" > config.tmp
+mv config.tmp config
+cat config
 ```
 
-```text
-v1
-b.txt
-```
+Readers see either version 1 or version 2, never a mix; after a crash
+the new name never points at a file missing its writes.
 
-`b.txt` now holds what `a.txt` held, and `a.txt` is gone.
-
-## Step 2: move a directory with everything in it
+## Step 2: swap two names
 
 ```bash
-mkdir -p old/inner
-echo deep > old/inner/file.txt
-mv old new
-cat new/inner/file.txt
+echo a > left; echo b > right
+mv --exchange left right
+cat left right
 ```
 
-```text
-deep
-```
-
-## Step 3: see what pgfs refuses
-
-A directory cannot move inside itself:
+## Step 3: move a large directory
 
 ```bash
-mv new new/inner/x
+mkdir -p big/sub && for i in $(seq 1 1000); do : > big/sub/f$i; done
+time mv big moved
 ```
 
-```text
-mv: cannot move 'new' to a subdirectory of itself, 'new/inner/x'
-```
-
-A directory cannot replace a non-empty directory:
-
-```bash
-mkdir -p full && touch full/f
-mkdir empty
-mv -T empty full
-```
-
-```text
-mv: cannot overwrite 'full': Directory not empty
-```
-
-## Step 4: run git
-
-Git takes a lock by creating `config.lock`, writes the new
-configuration into it, and renames it over `config`. Each
-commit does the same with branch references.
-
-```bash
-git init -q repo && cd repo
-echo hello > README
-git add README
-git -c user.name=Tutorial -c user.email=tutorial@example.com commit -qm "first commit"
-git log --oneline
-```
-
-```text
-511658a first commit
-```
-
-Your commit hash will differ.
-
-## Step 5: clean up
-
-```bash
-cd ../../../..
-rm -rf testdata/mnt/rename
-```
-
-## What we did
-
-We replaced a file by renaming over it, moved a populated
-directory in one step, saw the two renames POSIX forbids, and
-ran a git workflow that depends on all of it. The
-[explanation](../explanation/atomicrename.md) describes how one
-database transaction makes this atomic.
+The move changes one row, so it takes as long as moving an empty
+directory.
 
 ---
 

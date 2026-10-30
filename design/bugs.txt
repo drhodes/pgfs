@@ -1,0 +1,1907 @@
+pgfs spec review: design bugs
+=============================
+
+Date:    2026-10-29
+Scope:   spec/ on branch `opt` (uncommitted working tree)
+Status:  For review. Nothing here has been fixed in the spec yet.
+
+These are places where the spec, if built exactly as written, would
+break one of its own guarantees. Each entry gives where it is, a
+concrete scenario, why it matters, a proposed fix, and what a reviewer
+should check. Where a bug rests on a Postgres behaviour, the behaviour
+is stated under "Check" so it can be confirmed independently.
+
+Suggested priority: 1, 2, 5 and 8 first. Each silently breaks a
+guarantee the spec makes, and none would show up in ordinary testing.
+
+Names like `failure.RevalidatesAfterReconnect` are spec classes:
+module `spec/failure.py`, class `RevalidatesAfterReconnect`.
+
+
+-----------------------------------------------------------------------
+1. Lost asynchronous commits are not detected after a Postgres crash,
+   a point-in-time restore, or an asynchronous failover
+-----------------------------------------------------------------------
+
+Where:
+  spec/failure.py:97    RevalidatesAfterReconnect
+  spec/failure.py:119   IdempotentMutations
+  spec/replica.py:141   FollowsFailover
+  spec/consistency.py   KernelCacheContract (3600 s TTL)
+  spec/storage.py       PersistentInodes
+  spec/verify.py:161    DivergenceTests
+
+Scenario:
+  1. A read-write mount creates file `f`. Like every metadata
+     operation, it commits with synchronous_commit = off
+     (durability.AsyncCommitWindow) and is acknowledged.
+  2. The kernel caches the dentry and attributes for up to 3600 s.
+  3. Postgres crashes within the ~600 ms window, before the commit
+     reaches disk. Crash recovery drops the commit.
+  4. The daemon reconnects. RevalidatesAfterReconnect checks the
+     schema version, fs_uuid, system identifier, timeline, server
+     settings, and that the mount still holds its lease with the same
+     fence. All pass: crash recovery changes none of them.
+  5. The kernel still shows `f`. The database has no such file.
+  6. The nextval() of the inode sequence was logged in the same lost
+     WAL, so the sequence restarts from an earlier value. The next
+     create gets the same ino that the kernel still maps to `f`.
+
+  The same thing happens with:
+  - a PITR restore of a basebackup: it keeps the system identifier,
+    reaches a successor timeline, and still holds the original's
+    lease rows with the same mount_id and fence;
+  - a failover to an asynchronous standby, which the spec accepts
+    ("timeline ... or a successor reached by failover").
+
+Why it matters:
+  It breaks the PersistentInodes invariant ("an ino, once allocated,
+  never names a different file"). The kernel cache then disagrees with
+  the database for up to an hour, and later writes go to the wrong
+  file. DivergenceTests already requires "a restored database copy
+  with the same fs_uuid is reported", but no requirement says how.
+
+Proposed fix:
+  Add a continuity check to RevalidatesAfterReconnect. The data
+  already exists: each worker knows the last op_seq it acknowledged,
+  and its op_log slot stores the last op_seq that committed. If the
+  slot's op_seq is lower than the acknowledged one, history went
+  backwards. Move to Fenced and require a remount, or invalidate every
+  kernel cache entry and fence. Alternatively, track the highest
+  acknowledged commit LSN and compare it with the server's WAL
+  position after reconnect.
+
+Check:
+  - Crash recovery and PITR preserve the system identifier
+    (pg_control_system()).
+  - A sequence's ahead-logged WAL record is lost with the rest of the
+    unflushed WAL under asynchronous commit, so values can be handed
+    out again after recovery.
+
+
+-----------------------------------------------------------------------
+2. Deleting a row in a branch layer can bring the base's copy back
+-----------------------------------------------------------------------
+
+Where:
+  spec/branch.py:77    EpochVersionedRows ("A row born in the layer's
+                       current epoch is updated or deleted in place")
+  spec/branch.py:155   CopiesUpOnWrite (whiteouts only for "inherited"
+                       names and xattrs)
+  spec/branch.py:367   FlattensBranch
+
+Scenario A (no flatten needed):
+  1. Branch `job` inherits name `a` from its base.
+  2. rename a -> b: writes a whiteout for `a` and a live dentry `b`
+     in the branch layer.
+  3. rename b -> a: the whiteout row for `a` was born in the current
+     epoch, so it is updated in place into a live dentry.
+  4. unlink a: the live `a` row was born in the current epoch, so it
+     is deleted in place. No whiteout is left.
+  5. Layered lookup finds no row in the branch and falls through to
+     the base, where `a` still exists. The deleted file is back.
+
+Scenario B (flatten):
+  1. FlattensBranch step 1 copies inherited dentry `x` into the
+     branch layer as born in the current epoch.
+  2. Before step 2 detaches the base, the user unlinks `x`. The row
+     looks like the branch's own, so it is deleted in place.
+  3. `x` reappears from the base until the flatten finishes.
+
+  The same applies to an xattr that is set then removed, and to a
+  dentry or xattr touched by any copy-up and then deleted.
+  FallocatePunchHoleReq already does the right thing for blocks: it
+  writes hole rows on any branch.
+
+Why it matters:
+  It breaks CopiesUpOnWrite's postcondition ("a view of the branch
+  equals the base snapshot with those operations applied"). Deleted
+  files and attributes come back.
+
+Proposed fix:
+  State the rule once in EpochVersionedRows or LayeredLookup: in a
+  layer that has a base, deleting a key that the base view can see
+  always leaves a whiteout (null ino, null value, null blob_id, or an
+  nlink = 0 inode row), whether or not the layer also had its own row
+  for that key.
+
+Check:
+  ModelConformance should generate rename-back-and-unlink and
+  set-then-remove-xattr sequences on a branch.
+
+
+-----------------------------------------------------------------------
+3. Branch depth only grows on a tree that has snapshots
+-----------------------------------------------------------------------
+
+Where:
+  spec/branch.py:404   PromotesBranch (TREE now points at the branch
+                       layer, whose base is TREE's old layer)
+  spec/branch.py:367   FlattensBranch (requires no retained epochs: no
+                       snapshots and no child branches)
+  spec/branch.py:354   LimitsBranchDepth (cap 8; auto-flatten past 4)
+
+Scenario:
+  A common workflow: snapshot `main` nightly, and for each job branch
+  `main`, change the branch, then promote it.
+  - Each promote makes `main` point at a layer one deeper than before.
+  - Every nightly snapshot of `main` is a retained epoch on its
+    current layer, so FlattensBranch refuses with EBUSY.
+  - Auto-flatten at depth 4 can never run, and the spec does not say
+    what happens then.
+  - After a handful of cycles, creating a branch fails with EMLINK,
+    and every lookup probes up to 9 layers.
+  - The only way out is deleting snapshots, which defeats the feature.
+
+Why it matters:
+  The killer feature degrades and then stops working under its own
+  intended use.
+
+Proposed fix (one of):
+  - Allow flattening a layer that has retained epochs: copy rows with
+    their born/died ranges rebased into the layer, so its own
+    snapshots stay valid.
+  - Make promote not add a layer when the branch's base is TREE's
+    current layer at TREE's current epoch (fast-forward).
+  - At minimum, state what auto-flatten does when it cannot run, and
+    warn before depth becomes a problem.
+
+
+-----------------------------------------------------------------------
+4. Workers can deadlock waiting on each other
+-----------------------------------------------------------------------
+
+Where:
+  spec/concurrency.py:26   InodeShardedWorkers (before rename, link,
+                           unlink or copy_file_range, "messages that
+                           worker ... to commit its buffers first")
+  spec/concurrency.py      NoLockAcrossRoundTrip ("requested by
+                           message and awaited")
+  spec/concurrency.py:159  BoundedWriteBuffers ("the oldest buffers
+                           are committed before new writes are
+                           accepted")
+
+Scenario:
+  1. Worker A handles a rename of file X, whose buffers are on
+     worker B. A messages B and waits.
+  2. At the same time, worker B handles a rename of file Y, whose
+     buffers are on worker A. B messages A and waits.
+  3. Each worker is single-threaded and blocked in its wait, so
+     neither serves the other's message. The mount hangs.
+
+  BoundedWriteBuffers can deadlock the same way: a write on A waits
+  for B to commit its oldest buffer while B waits for A.
+
+Why it matters:
+  The mount hangs under ordinary concurrent use (two builds renaming
+  files), and the watchdog can only report it.
+
+Proposed fix (one of):
+  - State that a worker waiting on another worker keeps serving
+    incoming commit-buffer messages: its wait is a loop over its
+    mailbox, not a blocking receive.
+  - Have the requesting worker take the buffers (move ownership of
+    the dirty data to the requester) and commit them itself.
+
+Check:
+  LinearizabilityCheck (shuttle) should include two cross-worker
+  renames and buffer pressure, so it finds this deadlock.
+
+
+-----------------------------------------------------------------------
+5. Per-handle commits break write order
+-----------------------------------------------------------------------
+
+Where:
+  spec/optimize.py:163    BufferedWriteFlushReq (postcondition: every
+                          buffered write applied "in arrival order";
+                          "A write of a whole aligned block may skip
+                          the buffer")
+  spec/durability.py:174  FlushesOnClose ("flush and release commit
+                          the handle's pending writes")
+
+Scenario A (two handles):
+  1. Handle H1 writes "X" at offset 0 (buffered).
+  2. Handle H2 writes "Y" at offset 0 (buffered, later).
+  3. H2 is closed first: its flush commits "Y".
+  4. H1 is closed: its flush commits "X".
+  5. The file holds "X", the older write.
+
+Scenario B (bypass):
+  1. A partial write to block 5 is buffered.
+  2. A later full aligned write to block 5 skips the buffer and
+     commits at once.
+  3. The buffer is later committed by read-modify-write over the
+     committed block, and the older partial write overwrites part of
+     the newer full-block write.
+
+Why it matters:
+  Data written later is replaced by data written earlier. This is the
+  same class of bug as Bug 1 (data corruption under buffering).
+
+Proposed fix:
+  - Any commit of buffered data for an inode commits all handles'
+    buffered writes for that inode, in arrival order. Keep the
+    per-handle record only for error attribution
+    (FsyncFailureSemantics).
+  - A full-block write that skips the buffer must first commit, or
+    discard as superseded, any buffered data for that block.
+
+
+-----------------------------------------------------------------------
+6. The change feed does not preserve order across batches
+-----------------------------------------------------------------------
+
+Where:
+  spec/changefeed.py:55   HorizonOrderedDelivery
+  spec/changefeed.py      module docstring ("an ordered ... stream")
+
+Scenario:
+  1. Transaction B gets xid 103. Transaction A gets xid 105.
+  2. A locks the row first and is allocated seq 10. B waits for A's
+     lock, then is allocated seq 11.
+  3. A commits, then B commits.
+  4. An unrelated transaction with xid 104 is still open, so the
+     horizon is h = 104.
+  5. The batch takes rows with xid < 104: it contains B (seq 11) but
+     not A (seq 10). A arrives in a later batch.
+  6. A consumer sees B before A, for example "unlink x" before
+     "create x".
+
+  The spec only promises seq order within a batch, but the module
+  says the stream is ordered, and sync, indexing and cache coherence
+  all need the cross-batch order.
+
+Proposed fix (one of):
+  - Hold back any row whose seq is above the lowest seq that a
+    transaction below or at the horizon could still produce. In
+    practice: deliver only up to the smallest seq of rows with
+    xid >= h. This needs a way to see in-flight seq allocations.
+  - Allocate seq at commit time from a serialized counter, which is
+    a hot row and costs throughput.
+  - Use logical decoding, which delivers in commit order.
+  - Or weaken the promise explicitly and tell consumers to reorder
+    by seq within a window.
+
+
+-----------------------------------------------------------------------
+7. NOTIFY on every mutation makes commits run one at a time
+-----------------------------------------------------------------------
+
+Where:
+  spec/changefeed.py:94   ChangeNotifications ("Each mutating
+                          transaction sends NOTIFY pgfs_changes")
+
+Problem:
+  A transaction that has queued a NOTIFY takes a database-wide lock
+  during commit to append to the notification queue. If every pgfs
+  mutation notifies, every mutating transaction on the database
+  commits one after another. That conflicts with inode-sharded
+  workers and the metadata-heavy performance goal (decision 8).
+
+Proposed fix:
+  Do not NOTIFY from mutating transactions. Have one background
+  connection per mount (or the housekeeper) send at most one
+  notification per short interval when the feed advanced, or rely on
+  the polling the spec already requires (the notification is "only a
+  hint").
+
+Check:
+  Confirm the lock in PreCommit_Notify (src/backend/commands/async.c)
+  for Postgres 17, and measure mdtest create throughput with and
+  without NOTIFY.
+
+
+-----------------------------------------------------------------------
+8. fsync can report success when the synchronous standby never got
+   the data
+-----------------------------------------------------------------------
+
+Where:
+  spec/failure.py        BoundsEveryWait ("A synchronous commit
+                         waiting for a standby is not covered by
+                         statement_timeout. The watchdog covers it")
+  spec/failure.py:189    InFlightAgeWatchdog (cancels the backend
+                         query at --stall-error)
+  spec/failure.py        HonoursInterrupt (cancels on FUSE INTERRUPT)
+  spec/durability.py     FsyncIsDurable ("that commit also waits for
+                         them")
+
+Scenario:
+  1. fsync commits with synchronous_commit = on. The commit is
+     written locally and waits for a synchronous standby.
+  2. The standby is slow. After 60 s the watchdog cancels the query,
+     or the caller is interrupted and the daemon cancels it.
+  3. Postgres does not fail the COMMIT. It returns success with a
+     WARNING: "canceling wait for synchronous replication ... The
+     transaction has already committed locally, but might not have
+     been replicated to the standby."
+  4. The daemon sees success and fsync returns 0. The data is not on
+     the standby, and a failover now loses data that fsync promised
+     was safe.
+
+Proposed fix:
+  State that a commit that returns this warning (or any cancel that
+  lands during a synchronous-replication wait) is reported as EIO to
+  fsync, O_SYNC writes, snapshot, branch and promote. Detect it by
+  the warning's SQLSTATE or message, and test it in DbFaultInjection.
+
+Check:
+  Postgres docs, "synchronous_commit" / syncrep.c: a cancel or
+  terminate during the sync-rep wait only emits a WARNING after the
+  local commit.
+
+
+-----------------------------------------------------------------------
+9. A timed-out snapshot request can still create a snapshot
+-----------------------------------------------------------------------
+
+Where:
+  spec/branch.py:222   DrainsOwnerBeforeSnapshot ("If the owner does
+                       not answer in time, the CLI exits non-zero with
+                       ETIMEDOUT and creates nothing")
+
+Scenario:
+  1. The CLI inserts a control_requests row and waits 30 s.
+  2. The owning daemon is slow, and the CLI times out and reports
+     failure.
+  3. The daemon then picks up the row, drains, and creates the
+     snapshot.
+  4. The user was told nothing was created. A retry with the same
+     name fails with EEXIST, and scripts that rely on the reported
+     failure are wrong.
+
+Proposed fix:
+  Give the request row a state machine changed under a row lock:
+  pending -> claimed (by the daemon) -> done, or pending -> cancelled
+  (by the CLI). The daemon may act only if it moves the row from
+  pending to claimed. The CLI may report "created nothing" only if it
+  moves the row from pending to cancelled. If the row is already
+  claimed, the CLI keeps waiting or reports "outcome unknown".
+
+
+-----------------------------------------------------------------------
+10. Clean shutdown does not make recent metadata changes durable
+-----------------------------------------------------------------------
+
+Where:
+  spec/durability.py:211   FlushesOnShutdown ("commits every handle's
+                           pending writes with synchronous_commit = on
+                           ... Durability. Every write acknowledged
+                           before the signal is durable once a clean
+                           shutdown completes")
+
+Scenario:
+  1. A program runs mkdir and rename, with no buffered file data.
+     Both commit asynchronously.
+  2. SIGTERM arrives within 600 ms. There are no pending writes, so
+     no synchronous commit runs.
+  3. The host loses power right after the clean shutdown. The mkdir
+     and rename can be lost, although shutdown "completed".
+
+Proposed fix:
+  Always end shutdown with one synchronous commit, for example by
+  releasing the lease with synchronous_commit = on. One flush is
+  cumulative and covers every earlier asynchronous commit, as
+  FsyncForcesEarlierCommits already notes. Widen the Durability
+  clause to "every operation acknowledged before the signal".
+
+
+-----------------------------------------------------------------------
+11. Scratch mode contradicts itself
+-----------------------------------------------------------------------
+
+Where:
+  spec/durability.py:246   ScratchMode ("creates every pgfs table
+                           UNLOGGED ... After a server crash the
+                           filesystem is empty and reformatted on the
+                           next mount")
+  spec/ops.py              RefusesUnformattedDatabase ("No command
+                           other than mkfs and migrate runs DDL")
+  spec/app.py              ConnectsToPostgres ("It never creates or
+                           alters tables")
+  spec/storage.py          SchemaVersion
+
+Problem:
+  After a server crash Postgres empties unlogged tables. With every
+  table unlogged, `meta` has no schema_version, block_size or
+  fs_uuid, and `trees` has no `main`. Mount then refuses an
+  unformatted database, yet ScratchMode says it is reformatted at the
+  next mount. Both cannot hold. The block size and inline limit chosen
+  at mkfs would also be lost.
+
+Proposed fix:
+  Keep `meta`, `trees` and `layers` logged (they are tiny), and make
+  only the data and metadata tables unlogged. Store a flag in `meta`
+  that marks the filesystem as scratch. At mount, if the flag is set
+  and the data tables are empty but `trees` is not, the mount runs a
+  stated reset function (a pgfs SQL function, not DDL) that
+  recreates the root inode of each tree, and logs that the contents
+  were lost.
+
+
+-----------------------------------------------------------------------
+12. Read-only and snapshot mounts are invisible to migrate and tune
+-----------------------------------------------------------------------
+
+Where:
+  spec/ops.py:89    MigratesSchema ("refuses while any tree has an
+                    unexpired read-write lease")
+  spec/ops.py:105   TunesFilesystem ("--new-uuid ... refuses while any
+                    daemon is mounted")
+  spec/consistency.py  ReadOnlyLiveMounts and branch.MountsSnapshots
+                    (these take no lease)
+
+Problem:
+  Read-only live mounts and snapshot mounts write no row anywhere, so
+  no command can find them.
+  - `pgfs migrate` can change the schema under a running read-only
+    mount. Its prepared statements then fail or, worse, run against a
+    changed table.
+  - `pgfs tune --new-uuid` cannot keep the promise "refuses while any
+    daemon is mounted".
+
+Proposed fix:
+  Register every mount, read-only ones included, in a table such as
+  `mount_sessions(mount_id, view, host, pid, read_only, heartbeat_at)`
+  with a heartbeat and expiry like the lease. migrate and tune refuse
+  while any unexpired session exists, and a running mount re-checks
+  schema_version on every reconnect and at a fixed interval.
+
+
+
+=======================================================================
+Review response (2026-10-29)
+=======================================================================
+
+All twelve bugs are genuine. The priority call (1, 2, 5, 8 first) is
+right, though several of the proposed fixes have traps of their own or
+interact with other clauses in `spec/`. Below is a critical review of
+each item, followed by two related spec bugs surfaced while checking
+these against the codebase and Postgres 17 internals.
+
+
+-----------------------------------------------------------------------
+Re 1. Lost asynchronous commits after crash, PITR, or async failover
+-----------------------------------------------------------------------
+
+Diagnosis:
+  Confirmed. Both Postgres claims hold in PG 17:
+  - `pg_control_system().system_identifier` is assigned at `initdb` and
+    preserved across crash recovery, `pg_basebackup`, and PITR.
+  - `nextval()` logs WAL in batches of 32 (`SEQ_LOG_VALS = 32` in
+    `src/backend/commands/sequence.c`), and under
+    `synchronous_commit = off` that WAL record sits in unflushed WAL
+    buffers with the mutation. A crash rewinds not only `ino`, but also
+    `blob_id`, `changes.seq`, and `usage_deltas.seq`.
+  - In addition to the kernel's 3600 s entry/attribute cache, the
+    daemon's own shared metadata cache (`concurrency.InodeShardedWorkers`)
+    retains stale dentries and inodes across a reconnect.
+
+Critique of the proposed fix:
+  1. Per-worker `op_log` checking races across connections.
+     `failure.DatabaseStateMachine` and `RevalidatesAfterReconnect` run
+     per connection, and `ReconnectsWithBackoff` uses independent full
+     jitter up to 10 s per worker. Suppose Worker 1 lost its recent
+     commit (`op_seq = 5`), while Worker 2 was idle for the last minute
+     (`op_seq = 12`, already flushed to disk). After crash recovery,
+     Worker 2 can reconnect first, check only its own `op_log` slot
+     (`12 = 12`), pass revalidation, and allocate the rewound `ino`
+     from the shared sequence before Worker 1 finishes backoff.
+     Fix: `RevalidatesAfterReconnect` must check mount-wide continuity
+     in one query — either verifying every worker's acknowledged
+     `op_seq` against `op_log WHERE mount_id = $1`, or comparing a
+     mount-wide atomic `max_acknowledged_lsn` against
+     `pg_current_wal_flush_lsn()` (or `pg_last_wal_replay_lsn()`).
+
+  2. Lease acquisition itself is not durable, and `RevalidatesAfterReconnect`
+     currently allows re-acquiring a missing lease.
+     `durability.DurabilityPoints` does not list lease acquisition as
+     `synchronous_commit = on`, and `spec/failure.py:105-107` allows:
+     "this mount still holds its lease with the same fence, or the
+     lease is free and can be re-acquired with no other holder in
+     between". If a crash within 600 ms of mount (or a PITR restore to
+     before the mount) drops the `mounts` row and all `op_log` rows,
+     treating a free lease as re-acquirable hides the rollback if a
+     worker had only served reads or if `op_log` was empty.
+     Fix: `ExclusiveTreeLease` acquisition and takeover must commit with
+     `synchronous_commit = on`, and `RevalidatesAfterReconnect` must
+     require the `mounts` row with the exact `(mount_id, fence)` to
+     exist (never silently re-insert a missing lease row on reconnect).
+
+  3. Direct contradiction between `IdempotentMutations` and
+     `HousekeepingInSeparateTransactions`.
+     `spec/failure.py:131-133` states that a mount's `op_log` rows are
+     deleted only when its lease row in `mounts` is released or
+     replaced, "so idempotency never expires during a long network
+     outage." Yet `spec/consistency.py:226-227` tells housekeeping to
+     reap "expired mount rows (together with their op_log slots)". If
+     another mount's housekeeper reaps an expired lease during a 35 s
+     outage, both `IdempotentMutations` and the `op_log` continuity
+     check break. Because `mounts` is keyed by `tree` (at most one row
+     per tree and `workers` rows in `op_log`), housekeeping must never
+     reap expired `mounts` or `op_log` rows; they should only be
+     replaced on takeover or deleted on clean unmount / `tree delete`.
+
+  4. Cache invalidation is not a valid alternative to `Fenced`.
+     The proposal offers "Move to Fenced and require a remount, or
+     invalidate every kernel cache entry and fence." `notify_inval_inode`
+     and `notify_inval_entry` cannot close open file descriptors held
+     by user processes. If an application opened newly created file `f`
+     (`ino = 1050`), the crash dropped `f`, and the sequence handed
+     `ino = 1050` to a new file `g`, the application's open fd for `f`
+     would read and write `g`. Moving to `Fenced` is mandatory.
+
+  5. Read-only live mounts (`consistency.ReadOnlyLiveMounts`) have no
+     `op_log` and no lease, yet `durability.AsyncCommitWindow` notes
+     that they can observe unflushed async commits on the primary and
+     cache them (including keeping the kernel page cache on reopen when
+     `inodes.version` is unchanged). Tracking the highest observed LSN on
+     read-only mounts and invalidating caches if WAL regresses on
+     reconnect closes the same gap for read-only mounts.
+
+
+-----------------------------------------------------------------------
+Re 2. Deleting a row in a branch layer can bring the base's copy back
+-----------------------------------------------------------------------
+
+Diagnosis:
+  Confirmed. There are two even simpler triggers than rename-back:
+  - Create-after-unlink: in a branch, `unlink a` (writes a whiteout with
+    `born = current_epoch`), `create a` (updates that whiteout in place
+    into a live dentry with `born = current_epoch` pointing to a new
+    branch-local `ino`), then `unlink a` again. The row has
+    `born = current_epoch` and a local `ino`, so deleting it in place
+    uncovers the base's `a`.
+  - Inode copy-up then unlink: `chmod` on an inherited file `a` copies
+    its `inodes` row into the branch with `born = current_epoch`. A
+    subsequent `unlink a` that deletes the current-epoch `inodes` row in
+    place instead of turning it into an `nlink = 0` whiteout lets `ino`
+    resolve through to the base layer again (breaking inherited hard
+    links and `pgfs check`).
+
+Critique of the proposed fix:
+  The rule "in a layer that has a base, deleting a key that the base
+  view can see always leaves a whiteout" is the right invariant, but
+  implementing it by probing the base layer chain (up to 8 layers) on
+  every `unlink`, `rmdir`, `rename`, or `removexattr` adds an O(depth)
+  read to every delete of a branch-local file. Conversely, blindly
+  writing a whiteout on every delete in a branch without checking
+  whether the base had the key leaves dead whiteout rows for every
+  temporary file created and deleted during a build.
+
+  Better fix:
+  Separate the two orthogonal questions in `EpochVersionedRows`:
+  - Intra-layer snapshot visibility (`born < epoch` vs `born = epoch`)
+    governs only whether the previous row in *this* layer is retired
+    (`died = epoch`) vs mutated in place.
+  - Inter-layer shadowing governs whether removing a key leaves no live
+    row vs a live whiteout row (`died = ∞`).
+  To avoid probing the base chain on delete, carry a boolean
+  `shadows_base` on branch rows (or use the fact that any dentry/xattr
+  row created by copying up, replacing an inherited entry, or updating
+  an existing whiteout has `shadows_base = true`, whereas a fresh
+  insert into a whiteout-free slot after a negative `LayeredLookup` has
+  `shadows_base = false`). Deleting a row with `shadows_base = true`
+  leaves a whiteout; deleting one with `shadows_base = false` removes
+  it cleanly.
+
+
+-----------------------------------------------------------------------
+Re 3. Branch depth only grows on a tree that has snapshots
+-----------------------------------------------------------------------
+
+Diagnosis:
+  The failure mode is real and severe, and digging into the layer
+  mechanics shows three compounding problems:
+
+  1. Correction to the scenario that makes it even sharper:
+     When `job` is promoted to `main`, `main` moves to `job`'s layer
+     (`layer L+1`), while snapshots taken *before* the promote stay on
+     `layer L`. However:
+     - `CreatesBranch` (`spec/branch.py:301`) automatically creates a
+       snapshot `main@branch-NEW` on `main`'s current layer whenever
+       branching from a tree;
+     - `PromotesBranch` (`spec/branch.py:422`) automatically creates a
+       snapshot `main@pre-promote-<ts>` on `main`'s old layer on every
+       promote;
+     - As soon as *any* nightly snapshot or new branch is taken on the
+       newly promoted layer before background auto-flatten completes,
+       that layer acquires a retained epoch and `FlattensBranch`
+       refuses with `EBUSY`. Even taking a snapshot while
+       `FlattensBranch` is running causes step 2 (`spec/branch.py:381`)
+       to abort after copying millions of rows.
+
+  2. O(tree size) metadata duplication every 4 promotes:
+     Even when `FlattensBranch` succeeds on `layer 5` because no
+     snapshot was taken on `layer 5` yet, it copies *every* visible
+     `inodes`, `dentries`, `file_blocks`, and `xattrs` row of the
+     entire tree into `layer 5`, while `layers 1..4` still cannot be
+     reclaimed because the automatic `pre-promote` and `branch-*`
+     snapshots keep them alive. A 10-million-file tree that publishes
+     3-file changes via `branch -> edit -> promote` duplicates 10
+     million metadata rows every 4 deploys.
+
+  3. Collateral bug in `SnapshotDiff` (`spec/branch.py:484`):
+     `SnapshotDiff` specifies `pgfs diff TREE@A TREE@B` (or
+     `TREE@A TREE`) as computing changes "between two views of one
+     layer, computed from epochs". Because `PromotesBranch` moves
+     `TREE` to a new layer on every promote, `pgfs diff main@v1 main`
+     fails after a single promote (including in the tutorial workflow
+     of `BranchableTrees`), because `main@v1` and `main` are no longer
+     on the same layer.
+
+Critique of the proposed fixes:
+  Both the first and second proposed fixes should be adopted together,
+  because they solve different halves of the problem:
+
+  - Fast-forward / fold-back on `promote` (solves depth growth, O(N)
+    metadata duplication, and `SnapshotDiff`):
+    In a standard (non-`--force`) promote where `BRANCH` has no
+    snapshots or child branches of its own, `TREE` has had no changes
+    since `BRANCH.base_epoch` (`TREE.epoch = BRANCH.base_epoch + 1`).
+    Instead of pointing `TREE` at `BRANCH.layer` (`depth + 1`), fold
+    `BRANCH`'s delta rows into `TREE.layer` at `TREE.epoch` (retiring
+    overwritten or whited-out rows in `TREE.layer` with
+    `died = TREE.epoch` and moving `BRANCH`'s live rows into
+    `TREE.layer` with `born = TREE.epoch`). Cost is proportional to the
+    branch delta (`O(|delta|)`), `TREE` stays at `depth = 0` on its
+    original layer, and `pgfs diff` across promotes works on one layer.
+
+  - Rebasing `born = 0` in `FlattensBranch` (solves `EBUSY` when
+    flattening a long-lived branch that *does* have snapshots):
+    `FlattensBranch` only forbids retained epochs because step 1
+    inserts inherited rows with `born = current_epoch`. If instead
+    step 1 inserts each inherited row from `(base_layer, base_epoch)`
+    with `born = 0` and
+    `died = min(born of earliest row for that key in this layer, ∞)`
+    (and inserts inherited blocks truncated at epoch `e` with
+    `born = 0, died = e`), then every snapshot `E >= 1` of the branch
+    sees `0 <= E < died`, matching what it previously saw through
+    `base_layer`. Step 2 can then detach `base_layer = NULL` and remove
+    whiteouts even when the layer has snapshots or child branches.
+
+
+-----------------------------------------------------------------------
+Re 4. Workers can deadlock waiting on each other
+-----------------------------------------------------------------------
+
+Diagnosis:
+  Confirmed. Both cross-worker `FlushesBeforeNaming` waits and
+  `BoundedWriteBuffers` waits can form a wait cycle across
+  single-threaded workers.
+
+Critique of the proposed fixes & an adjacent race in `InodeShardedWorkers`:
+  1. Having a waiting worker service incoming `CommitBuffer` messages
+     (Proposed Fix 1) is deadlock-free *only* if handling `CommitBuffer`
+     never sends a cross-worker message itself (which holds, as a
+     buffer commit only runs a transaction on that worker's own DB
+     connection, giving dependency depth 1). However, if Worker B is in
+     the middle of a slow 20 s database statement when Worker A
+     messages it, Worker A still blocks across B's database round trip.
+     Having the requesting worker take ownership of the dirty buffer
+     and commit it (Proposed Fix 2), or committing it inside the same
+     transaction, avoids blocking on a busy peer worker.
+
+  2. Adjacent bug in `InodeShardedWorkers` (`spec/concurrency.py:49-54`):
+     The spec says that *before* starting a `rename`, `link`, `unlink`,
+     or `copy_file_range` transaction, the worker resolves `source_ino`
+     and any overwritten `target_ino` and messages their owning workers
+     to commit buffers first.
+     - How does the worker know `source_ino` and `target_ino` before
+       the transaction starts if the dentry is not in the daemon's
+       cache? Querying Postgres first violates
+       `consistency.OneRoundTripPerOperation`.
+     - Even on a cache hit, another worker can concurrently `rename` a
+       different file (with dirty buffers!) onto `(new_parent, new_name)`
+       *between* the pre-transaction buffer flush and the transaction's
+       `LockOrder` discover-sort-lock-revalidate step.
+     Fix: `pgfs.rename` / `pgfs.unlink` must either verify that the
+     resolved `source_ino` and `target_ino` match the pre-flushed inodes
+     (and abort/retry to flush if a concurrent rename swapped in a
+     dirty inode), or check the shared atomic per-inode summary
+     (`InodeShardedWorkers` line 34) after locking.
+
+  3. Unnecessary flush on last-link `unlink`:
+     When `unlink` removes the last link (`nlink = 1`) of a file with
+     no open handles, committing its dirty write buffers to Postgres
+     just before `pgfs.unlink` deletes the inode and its blocks wastes
+     a transaction and WAL. The dirty buffer for a file being deleted
+     with `nlink -> 0` and `open_handles = 0` should be dropped, not
+     flushed.
+
+
+-----------------------------------------------------------------------
+Re 5. Per-handle commits break write order
+-----------------------------------------------------------------------
+
+Diagnosis:
+  Confirmed, and there are two more scenarios of the exact same bug
+  class in `optimize.BufferedWriteFlushReq` and `durability.SyncHandles`:
+
+  - Scenario C (`O_SYNC` / `O_DIRECT` handle mixed with a buffered
+    handle):
+    `durability.SyncHandles` (`spec/durability.py:89`) states that
+    writes on `O_SYNC`, `O_DSYNC`, or `O_DIRECT` handles commit at once,
+    bypassing the daemon's buffer. If Handle 1 buffers a write to block
+    0, Handle 2 (`O_SYNC` or `O_DIRECT`) writes to block 0 and commits
+    immediately, and Handle 1 later flushes, Handle 1's older buffered
+    write overwrites Handle 2's committed write (and Handle 2's
+    `O_SYNC` read-modify-write also missed Handle 1's earlier write).
+
+  - Scenario D (Non-contiguous partial writes to the same block):
+    `spec/optimize.py:172-173` says: "Buffers are block-granular, at the
+    filesystem's block size (`storage.FixedBlockSize`), with a dirty
+    byte range per block." A single contiguous range `[start, end)` per
+    block cannot represent two non-adjacent writes to the same block
+    (e.g. `[0, 100)` followed by `[200, 300)` on an existing block).
+    Coalescing them into `[0, 300)` overwrites `[100, 200)` with zeros
+    on read-modify-write commit — reintroducing the exact partial-block
+    zeroing bug that `BufferedWriteFlushReq` was written to prevent.
+
+Critique of the proposed fix:
+  The fix is right and should be stated structurally:
+  - There is only *one* write buffer per inode (owned by `ino mod
+    workers`), never per-handle buffers.
+  - Within each buffered block, dirty data is tracked as non-overlapping
+    byte intervals (or a dirty bitmap), never a single `[start, end)`
+    span.
+  - Every write to the inode (buffered, aligned full-block, `O_DIRECT`,
+    `O_SYNC`, `O_DSYNC`) is ordered through the per-inode buffer and
+    assigned a monotonic per-inode `write_seq`. A full-block write
+    supersedes any buffered intervals in that block; an `O_DIRECT` or
+    `O_SYNC` write commits the inode's dirty buffer through its own
+    `write_seq`.
+  - Each open handle records only `(last_write_seq, reported_err_seq)`.
+    On `flush(fh)` or `release(fh)`, if
+    `inode.committed_seq < fh.last_write_seq`, the worker commits the
+    inode's buffer up to `last_write_seq`; if `inode.committed_seq >=
+    fh.last_write_seq`, `flush(fh)` is a no-op (after checking sticky
+    errors for `FsyncFailureSemantics`).
+
+
+-----------------------------------------------------------------------
+Re 6. The change feed does not preserve order across batches
+-----------------------------------------------------------------------
+
+Diagnosis:
+  Confirmed for PostgreSQL 17. In `src/backend/access/heap/heapam.c`
+  (`heap_lock_tuple`), `SELECT ... FOR UPDATE` calls
+  `GetCurrentTransactionId()` *before* waiting on `XactLockTableWait`.
+  In `concurrency.LockOrder` (`spec/concurrency.py:106`), Transaction B
+  can therefore be assigned `xid = 103`, block on an inode lock held by
+  Transaction A (`xid = 105`), and allocate `seq = 11` after A commits
+  `seq = 10`, while an unrelated open transaction holds `xmin = 104`.
+
+Critique of the proposed fixes:
+  1. Trap in Proposed Fix 1 as written:
+     Proposed Fix 1 says: "deliver only up to the smallest `seq` of
+     rows with `xid >= h`. This needs a way to see in-flight `seq`
+     allocations."
+     Watch what happens in the scenario above (`h = 104`, B has
+     `xid = 103, seq = 11`, A has `xid = 105, seq = 10`):
+     If the batch query holds back B (`xid = 103, seq = 11`) because
+     A (`xid = 105, seq = 10`) has `seq < 11`, and the reader still
+     sets its new watermark to `w = h = 104` (`HorizonOrderedDelivery`,
+     `spec/changefeed.py:59`), then the next batch queries
+     `104 <= xid < h'` and **B (`xid = 103`) is never delivered at
+     all**!
+     Furthermore, an uncommitted transaction `T` (`xid >= h`) that has
+     allocated `seq = 10` on an unrelated file is invisible to `SELECT`
+     until it commits, so `SELECT min(seq) FROM changes WHERE xid >= h`
+     cannot see `T`'s `seq = 10`.
+
+  2. Key observation — conflicting operations are *already* committed:
+     Because a transaction holds all its `FOR UPDATE` locks until
+     `COMMIT`, and `RecordsChanges` allocates `seq` only *after* all
+     locks are held (`spec/changefeed.py:33`), if operation B
+     (`seq = 11`) conflicted with operation A (`seq = 10`) on any
+     inode or dentry, **A has necessarily already committed before B
+     could acquire the lock and allocate `seq = 11`**. Thus whenever B
+     is visible in `changes`, any conflicting earlier operation A is
+     *already* committed and visible in the same snapshot — even if
+     `A.xid >= h`!
+     The only reason A was left behind in `HorizonOrderedDelivery` is
+     that the batch cut strictly on `xid < h` with a scalar `xid`
+     watermark.
+
+  3. Cleanest fix:
+     Store the consumer watermark as `(w_xid, w_seq)`. For a snapshot
+     with `h = pg_snapshot_xmin(snap)`:
+     - Let `s_cap = SELECT min(seq) FROM pgfs.changes WHERE layer = $1
+       AND xid >= h` (visible rows already committed at or above `h`).
+     - Deliver rows with `(xid >= w_xid AND xid < h AND seq > w_seq AND
+       (s_cap IS NULL OR seq < s_cap))` ordered by `seq`.
+     - Advance `w_seq` to the max delivered `seq`, and advance `w_xid`
+       to ` coalesce(min(xid) of held-back rows with xid < h, h)`.
+     This guarantees that no two conflicting operations are ever
+     delivered out of `seq` order across batches, and no held-back row
+     below `h` is ever dropped. For non-conflicting operations on
+     unrelated files, either state that cross-batch ordering is causal
+     (per-inode / per-directory), or take a transaction-level advisory
+     lock on `(layer, 'changes_seq')` right before `nextval` at the very
+     end of each mutating SQL function so `seq` order matches commit
+     order globally per layer.
+
+
+-----------------------------------------------------------------------
+Re 7. NOTIFY on every mutation makes commits run one at a time
+-----------------------------------------------------------------------
+
+Diagnosis:
+  Confirmed, and in PostgreSQL 17 the lock is heavier than a queue
+  spinlock: `PreCommit_Notify()` (`src/backend/commands/async.c`) calls
+  `LockSharedObject(DatabaseRelationId, MyDatabaseId, 0,
+  AccessExclusiveLock)` *before* `RecordTransactionCommit()`, and holds
+  that heavyweight database-wide `AccessExclusiveLock` across the WAL
+  write/flush and any synchronous replication wait until
+  `AtCommit_Notify()` releases it after commit.
+  Consequence: if Worker 1 runs an `fsync` or `O_SYNC` write that
+  flushes dirty blocks (`modify` in `changes`) with
+  `synchronous_commit = on` and emits `NOTIFY pgfs_changes`, Worker 1
+  holds the database-wide `AccessExclusiveLock` while waiting for the
+  disk and synchronous standby, stalling every async commit on Workers
+  2..16 for the entire disk/network round trip.
+
+Critique of the proposed fix:
+  Removing `NOTIFY` from foreground mutating SQL functions and having
+  the mount's housekeeping connection emit at most one coalesced
+  `NOTIFY pgfs_changes` per short interval (e.g. 50–100 ms) when
+  `changes` has advanced is the right fix. Unmounted CLI commands that
+  mutate the tree (`pgfs snapshot`, `pgfs branch`, `pgfs promote`,
+  `pgfs import`) can still `NOTIFY` once when they finish.
+
+
+-----------------------------------------------------------------------
+Re 8. fsync can report success when the synchronous standby never got
+      the data
+-----------------------------------------------------------------------
+
+Diagnosis:
+  Confirmed in PostgreSQL 17 (`src/backend/replication/syncrep.c`,
+  `SyncRepWaitForLSN`): `QueryCancelPending` / `ProcDiePending` is
+  handled *after* the transaction is marked committed in `pg_xact` and
+  flushed locally. Postgres resets the interrupt flag, emits a
+  `WARNING` (default SQLSTATE `01000`, `"canceling wait for synchronous
+  replication due to user request"`), and returns `COMMIT` success.
+
+Critique of the proposed fix (three subtleties that must be handled):
+  1. `WARNING` is a wire-protocol `NoticeResponse`, not a query result.
+     In `libpq` and `tokio-postgres`, a `WARNING` does not cause
+     `execute()` / `query()` to return `Err`, nor is it in the returned
+     rows; it arrives out-of-band on the connection's notice callback.
+     The spec must state that each worker connection hooks its notice
+     channel and checks for the sync-rep warning before treating a
+     synchronous commit as successful.
+
+  2. Retrying `fsync` after this `WARNING` hits a trap in
+     `IdempotentMutations` and `FsyncForcesEarlierCommits`:
+     Because the transaction *did* commit locally on the primary, its
+     blobs and `file_blocks` rows are already in the database and the
+     worker's `op_log` slot already stores `op_seq`.
+     - If the daemon keeps the buffer and retries the mutation with the
+       same `op_seq` (`FsyncFailureSemantics`), `IdempotentMutations`
+       sees `op_seq` in `op_log` and returns early **without writing
+       any WAL**.
+     - And in PostgreSQL (`RecordTransactionCommit` in
+       `src/backend/access/transam/xact.c`), a transaction that writes
+       **no WAL records** (`XactLastRecEnd == InvalidXLogRecPtr`) writes
+       no commit record, does **not** call `XLogFlush()`, and does
+       **not** call `SyncRepWaitForLSN()`, even when
+       `synchronous_commit = on`!
+     Therefore, when a commit succeeds locally but catches the sync-rep
+     cancel warning, the buffer's data is already committed on the
+     primary (do not re-insert blobs), the daemon must record the error
+     on the open handles (`FsyncFailureSemantics`) and reply `EIO` (or
+     `EINTR` if interrupted, while keeping the handle's unsynced flag
+     set), and the next `fsync` must call a dedicated `pgfs.fsync` SQL
+     function that **emits a WAL record** (see New Bug 13 below) with
+     `synchronous_commit = on` so Postgres actually waits in
+     `SyncRepWaitForLSN` for the standby to catch up.
+
+
+-----------------------------------------------------------------------
+Re 9. A timed-out snapshot request can still create a snapshot
+-----------------------------------------------------------------------
+
+Diagnosis:
+  Confirmed. This affects both `pgfs snapshot` and `pgfs branch` when
+  the source tree has a read-write mount (`CreatesBranch` uses
+  `DrainsOwnerBeforeSnapshot`).
+
+Critique of the proposed fix:
+  We can do strictly better than the proposed 3-state machine
+  (`pending -> claimed -> done` with `"outcome unknown"` on timeout).
+  Notice that Step 1 of `DrainsOwnerBeforeSnapshot` (committing the
+  daemon's pending write buffers) has no snapshot side effect —
+  flushing dirty buffers is always valid even if the snapshot is
+  cancelled. And Step 2 (`pgfs.snapshot` / `pgfs.branch`) and Step 3
+  (updating `control_requests`) run inside **one single Postgres
+  transaction**.
+
+  Better fix (2-state `pending -> done | cancelled`, no ambiguity):
+  - The daemon does *not* change `control_requests` before draining
+    buffers; the row stays `pending` during the drain.
+  - Inside the single `pgfs.snapshot` (or `pgfs.branch`) transaction,
+    the SQL function locks the request row with
+    `SELECT state FROM pgfs.control_requests WHERE request_id = $1 FOR
+    UPDATE`. If `state = 'cancelled'`, it does nothing and returns. If
+    `state = 'pending'`, it creates the snapshot and sets
+    `state = 'done'` in the same transaction.
+  - When the CLI's `--timeout` expires, the CLI runs
+    `UPDATE pgfs.control_requests SET state = 'cancelled' WHERE
+    request_id = $1 AND state = 'pending'`.
+    - If 1 row is updated, the snapshot was definitely not created and
+      never will be; the CLI exits with `ETIMEDOUT`.
+    - If 0 rows are updated, the daemon's `pgfs.snapshot` transaction
+      already committed `state = 'done'`, so the CLI reads the row and
+      reports success instead of a false timeout or "outcome unknown".
+
+
+-----------------------------------------------------------------------
+Re 10. Clean shutdown does not make recent metadata changes durable
+-----------------------------------------------------------------------
+
+Diagnosis:
+  Confirmed, and the bug is broader than metadata-only workloads:
+  because `durability.FlushesOnClose` (`spec/durability.py:174`)
+  commits a handle's buffered writes with `synchronous_commit = off`
+  when `close(2)` is called, a program that writes a file and closes it
+  50 ms before `SIGTERM` leaves **no pending writes in any handle's
+  buffer**. `FlushesOnShutdown` then runs no synchronous commit, and a
+  power loss right after clean shutdown loses the closed file's data —
+  violating `FlushesOnShutdown`'s literal guarantee ("Every write
+  acknowledged before the signal is durable once a clean shutdown
+  completes").
+
+Critique of the proposed fix:
+  Releasing the lease (`DELETE FROM pgfs.mounts WHERE tree = $1`) with
+  `synchronous_commit = on` does write a WAL record and therefore
+  flushes all earlier async commits. However, look at the shutdown
+  sequence in `app.HandlesShutdownSignals` (`spec/app.py:488-493`):
+  1. commit every buffer (`FlushesOnShutdown`);
+  2. call `session.unmount()`;
+  3. release the lease (`MountsCleanly`), skipped if `unmount()` fails.
+  If the synchronous WAL flush only happens in step 3 (lease release):
+  - processes waiting on `umount` / `fusermount3 -u` see the unmount
+    finish at step 2 before WAL is flushed at step 3;
+  - if `session.unmount()` fails, step 3 is skipped and the WAL is
+    never flushed.
+  Fix: `FlushesOnShutdown` must run a WAL-emitting synchronous commit
+  in step 1 *before* `session.unmount()`, and step 3 should also release
+  the lease with `synchronous_commit = on`.
+
+
+-----------------------------------------------------------------------
+Re 11. Scratch mode contradicts itself
+-----------------------------------------------------------------------
+
+Diagnosis:
+  Confirmed. In PostgreSQL (`ResetUnloggedRelations` in
+  `src/backend/storage/ipc/reinit.c`), crash recovery truncates all
+  `UNLOGGED` tables to empty; table definitions survive in `pg_class`,
+  but `meta`, `trees`, and `layers` lose all rows.
+
+Critique of the proposed fix:
+  Keeping `meta`, `trees`, `layers`, and `mounts` logged while making
+  the high-churn tables (`inodes`, `dentries`, `file_blocks`, `blobs`,
+  `xattrs`, `orphans`, `op_log`, `changes`, `usage_deltas`, `gc_queue`)
+  `UNLOGGED`, with `meta('scratch' = 'true')`, is the right design.
+  Three edge cases the spec must also cover:
+  1. Branches and snapshots created before the crash:
+     If a user created snapshots or branches on the scratch filesystem
+     before Postgres crashed, `snapshots` (if logged) and `trees` /
+     `layers` will still have multi-layer chains, `epoch > 1`, or
+     subtree `root_ino != 1` whose inodes were wiped with `inodes`.
+     Merely "recreating the root inode of each tree" leaves broken
+     snapshots, dangling base layers, and `pgfs check` failures. The
+     scratch-reset SQL function must reset `snapshots`, collapse
+     `layers` and `trees` back to freshly formatted state (`depth = 0,
+     base_layer = NULL, epoch = 1, root_ino = 1`), and recreate root
+     `ino = 1` for each tree.
+  2. Live daemon reconnect after a scratch crash:
+     If a daemon is mounted when Postgres crashes and restarts, its
+     reconnect must *not* silently reset the filesystem under active
+     kernel caches and open file descriptors. Because `op_log` is
+     `UNLOGGED`, the continuity check in Bug 1 (plus checking that
+     root `ino = 1` exists in `RevalidatesAfterReconnect`) will move a
+     live mount to `Fenced`, so the reset function runs only on a fresh
+     `pgfs mount`.
+  3. Detection predicate:
+     `meta.scratch = 'true' AND NOT EXISTS (SELECT 1 FROM pgfs.inodes
+     WHERE layer = 1 AND ino = 1)` reliably detects that Postgres
+     wiped the unlogged tables during crash recovery.
+
+
+-----------------------------------------------------------------------
+Re 12. Read-only and snapshot mounts are invisible to migrate and tune
+-----------------------------------------------------------------------
+
+Diagnosis:
+  Confirmed, and there is a third command broken by this that is even
+  more destructive than `migrate` and `tune`:
+  - `branch.DeletesSnapshotsAndTrees` (`spec/branch.py:454-463`):
+    `pgfs snapshot delete TREE@NAME` and `pgfs tree delete TREE` check
+    for dependent branches and read-write mounts, but cannot see a
+    running snapshot mount (`MountsSnapshots`) or read-only live mount
+    (`ReadOnlyLiveMounts`). Deleting a snapshot or tree while it is
+    mounted read-only succeeds, and `space.ReclaimsRetiredRows` then
+    garbage-collects its inodes, dentries, block maps, and blobs out
+    from under the live mount (which on a snapshot mount has unbounded
+    kernel cache TTLs), causing subsequent reads to fail with `EIO`.
+
+Critique of the proposed fix:
+  1. Rather than introducing a second table `mount_sessions` alongside
+     `mounts`, consider unifying them in `mounts` (keyed by `mount_id`,
+     with `tree`, `snapshot`, `read_only`, `fence`, `host`, `pid`,
+     `acquired_at`, `lease_until`, and a partial unique index enforcing
+     at most one unexpired read-write lease per `tree`). That gives one
+     heartbeat/expiry mechanism and one table for `migrate`, `tune`,
+     `snapshot delete`, `tree delete`, and `pgfs stats`.
+  2. `DeletesSnapshotsAndTrees` must refuse with `EBUSY` while any
+     unexpired mount session (read-write or read-only) is using the
+     target tree or snapshot.
+  3. Note interaction with `replica.SnapshotReadsFromAnyStandby`: the
+     session registration and heartbeat must always run on the primary
+     connection (`--conn`), since a standby is read-only.
+
+
+=======================================================================
+Additional spec bugs found during this review
+=======================================================================
+
+-----------------------------------------------------------------------
+13. FsyncForcesEarlierCommits is a no-op in Postgres when the minimal
+    transaction writes no WAL
+-----------------------------------------------------------------------
+
+Where:
+  spec/durability.py:74   FsyncForcesEarlierCommits ("In that case fsync
+                          runs a minimal transaction with
+                          synchronous_commit = on, which flushes the WAL
+                          up to and including those commits")
+
+Scenario:
+  1. A program creates a file, writes to it, and calls `close(fd)`.
+     `FlushesOnClose` commits the data with `synchronous_commit = off`
+     and clears the buffer. (Or the program runs `mkdir("d")` and calls
+     `fsync` on the parent directory.)
+  2. Within 600 ms, the program reopens the file and calls `fsync(fd)`
+     (or calls `fsyncdir`).
+  3. Nothing is pending in the daemon's write buffer, so
+     `FsyncForcesEarlierCommits` runs a "minimal transaction with
+     synchronous_commit = on".
+  4. In PostgreSQL (`RecordTransactionCommit` in
+     `src/backend/access/transam/xact.c`), if a transaction did not
+     insert any WAL records (`XactLastRecEnd == InvalidXLogRecPtr`),
+     `COMMIT` skips writing a commit WAL record, skips `XLogFlush()`,
+     and skips `SyncRepWaitForLSN()`, even when
+     `synchronous_commit = on`.
+  5. `fsync` returns 0 immediately without flushing the disk or waiting
+     for synchronous standbys. A crash within the 600 ms window loses
+     the earlier `close`-flushed write or `mkdir`.
+
+Proposed fix:
+  Specify that `pgfs.fsync` (the SQL function called when no buffered
+  blocks need committing) forces a small WAL record — for example by
+  updating the worker's `op_log` slot with the `fsync`'s `op_seq` or
+  calling `pg_logical_emit_message(true, 'pgfs', '')` — inside a
+  transaction with `SET LOCAL synchronous_commit = on`. That guarantees
+  `XactLastRecEnd` is valid so `RecordTransactionCommit` calls both
+  `XLogFlush` and `SyncRepWaitForLSN`.
+
+
+-----------------------------------------------------------------------
+14. LsnTicketReads + AsyncCommitWindow stalls every read for 20 ms and
+    falls back to the primary after any mutation
+-----------------------------------------------------------------------
+
+Where:
+  spec/replica.py:96       LsnTicketReads ("After each commit, the
+                           daemon records a read ticket: the value of
+                           pg_current_wal_insert_lsn() ... When
+                           standby_lsn < ticket, the daemon waits up to
+                           --replica-wait (default 20 ms) for the
+                           standby to catch up, then serves the read
+                           from the primary")
+  spec/durability.py:103   AsyncCommitWindow (default 600 ms;
+                           `wal_writer_delay` default 200 ms)
+
+Scenario:
+  1. A mount with `--replica` performs any ordinary mutation (`create`,
+     `mkdir`, `setattr`, `unlink`, or `close` flushing a buffer).
+  2. The mutation commits with `synchronous_commit = off`, and the
+     daemon records `ticket = pg_current_wal_insert_lsn()`.
+  3. Because `synchronous_commit = off` does not flush WAL on the
+     primary, and Postgres's `walsender` only ships WAL up to the
+     primary's flush LSN (`pg_current_wal_flush_lsn()`), the primary
+     does not even send the commit to the standby until `walwriter`
+     wakes up (up to `wal_writer_delay`, default 200 ms).
+  4. Every read on the mount during the next ~200 ms sees
+     `standby_lsn < ticket`, sleeps for the full `--replica-wait`
+     (20 ms) polling the standby, and then falls back to the primary.
+  5. Result: on any workload that mixes reads with metadata writes,
+     enabling `--replica` adds a 20 ms stall to reads and still serves
+     them from the primary.
+
+Proposed fix:
+  Along with `pg_current_wal_insert_lsn()` (`ticket`), have the
+  post-mutation query (or a shared poll) also read
+  `pg_current_wal_flush_lsn()` on the primary. When `primary_flush_lsn
+  < ticket`, the primary has not even flushed the WAL that `walsender`
+  would stream, so waiting 20 ms on the standby cannot succeed unless
+  the primary flushes first; route the read directly to the primary
+  without waiting `--replica-wait` (or, for read-heavy replica mounts,
+  document tuning `wal_writer_delay`).
+
+
+=======================================================================
+Second review (2026-10-29)
+=======================================================================
+
+Read against the `spec/` working tree on `opt`. I agree with most of
+the first response. The notes below cover places where it is wrong or
+incomplete, or where its fix brings in a new problem. Items marked
+"Check" rest on Postgres behaviour I remember but did not confirm
+against the PG 17 source in this pass.
+
+
+-----------------------------------------------------------------------
+Re 1 (second review)
+-----------------------------------------------------------------------
+
+  a. The LSN alternative cannot detect the loss. Drop it.
+     After crash recovery, Postgres replays to the end of valid WAL,
+     writes an end-of-recovery checkpoint, and appends new WAL from
+     that point. The lost commit's LSN range is reused by new records.
+     As soon as enough new WAL is written (the checkpoint, other
+     databases, this mount's own housekeeping connection, which may
+     reconnect first), `pg_current_wal_flush_lsn()` passes the mount's
+     `max_acknowledged_lsn`, and `flush_lsn >= max_ack_lsn` holds while
+     the commit is gone. PITR to a successor timeline behaves the same.
+     The original fix and Re 1.1 both offer this as an alternative.
+     Only the `op_log` comparison detects lost history.
+
+  b. State why the `op_log` check is enough, so nobody weakens it
+     later. A crash keeps a prefix of history (PrefixCrashConsistency).
+     If any acknowledged commit is lost, then the mount's latest
+     acknowledged commit is lost, and that commit is the latest one of
+     some worker. Comparing every worker's slot with that worker's last
+     acknowledged op_seq therefore catches every loss. Two details the
+     spec must state:
+     - Compare with the last op_seq that was *replied to*, not the one
+       in flight. The in-flight operation is resolved separately
+       (IdempotentMutations: slot = in-flight op_seq means it
+       committed).
+     - Housekeeping and lease-renewal commits need no slot. Their work
+       is idempotent and redone after a loss (a lost lease renewal only
+       shortens the lease).
+
+  c. The check fences only when something was actually lost. A mount
+     that was idle for longer than the AsyncCommitWindow before the
+     crash passes it. Say this in the spec, because "every Postgres
+     restart forces a remount" is the objection that would get the
+     check weakened.
+
+  d. Re 1.3 is right for read-write leases. If `mounts` is re-keyed by
+     `mount_id` (Re 12.1), the "one row per tree" bound it relies on no
+     longer holds. Read-only sessions should then be reaped on expiry,
+     while read-write rows and their `op_log` slots are only replaced
+     at takeover or deleted at clean unmount or `tree delete`.
+
+
+-----------------------------------------------------------------------
+Re 2 (second review)
+-----------------------------------------------------------------------
+
+  a. `shadows_base` is sound, for a reason the spec should state: the
+     base view `(base_layer, base_epoch)` is frozen, so whether it can
+     see a key never changes. A flag computed when the row is born stays
+     correct for as long as the base stays the same.
+
+  b. The flag is relative to one base. It must be recomputed when the
+     base changes:
+     - FlattensBranch step 2 (detach): every flag becomes false.
+     - The promote fold-back proposed in Re 3: folded rows must get
+       flags relative to TREE.layer's base, not BRANCH's. If TREE.layer
+       itself has a base (depth > 0), folding a branch delete without
+       recomputing the flag drops the row with no whiteout, and TREE's
+       base shows through. That is this same bug, one level up.
+
+  c. For `inodes` the flag is just "this row was copied up". An ino
+     allocated in the branch is never visible in the frozen base view,
+     because the base view only sees rows born at or before
+     base_epoch.
+
+
+-----------------------------------------------------------------------
+Re 3 (second review)
+-----------------------------------------------------------------------
+
+  a. Fold-back must state its epoch exactly. A view `(layer, E)` sees
+     a row when `born <= E < died` (EpochVersionedRows). PromotesBranch
+     records `TREE@pre-promote-<ts>` at the current epoch E and then
+     advances to E+1. Folded rows must have `born = E+1`, and the TREE
+     rows they replace must get `died = E+1`; the fold happens after the
+     advance. Re 3 says "at TREE.epoch". If that means E, the
+     pre-promote snapshot shows the branch's contents, and the undo
+     path PromotesBranch promises (branch the snapshot, promote it back
+     with --force) restores the new contents, not the old ones.
+
+  b. A whiteout in the branch folds into a retire in TREE.layer
+     (`died = E+1`). If TREE.layer has a base that can see the key, the
+     fold must also write a whiteout (Re 2 rule).
+
+  c. Fold-back conflicts with BoundedTransactions ("Snapshot, branch
+     and promote are constant-size"). A branch that rewrote a large
+     build output can have a delta of millions of rows, and the fold
+     must commit in one transaction to stay atomic. Either change the
+     bound to O(|delta|) and accept a long promote that holds both
+     gates, or fast-forward only when the delta is below a stated row
+     limit and move the layer otherwise. I would do the second, and
+     have `pgfs promote` print which path it took.
+
+  d. Fold-back must also carry the branch's change-feed rows. See new
+     bug 15.
+
+  e. The `born = 0` rebase in FlattensBranch fixes EBUSY, but it still
+     copies O(tree) rows. Once fold-back handles the common case,
+     flatten matters mainly for `--force` promotes and long-lived
+     branches, and that cost is acceptable there.
+
+
+-----------------------------------------------------------------------
+Re 4 (second review)
+-----------------------------------------------------------------------
+
+  a. Taking ownership of a buffer does not avoid waiting on a busy
+     peer. InodeShardedWorkers says no lock protects buffers because
+     one thread owns each inode's mutable state. For A to take B's
+     buffer, B must hand it over, so B has to process a message. That is
+     the same wait the response meant to avoid. Making buffers
+     stealable would need a per-inode lock, which the spec rules out.
+     Adopt fix 1 (serve the mailbox while waiting). Waiting for a busy
+     peer adds latency, bounded by statement_timeout, but it cannot
+     deadlock.
+
+  b. Fix 1 needs one more rule. While waiting, a worker serves only
+     commit-buffer requests from other workers, never new FUSE requests.
+     Otherwise requests on one inode can be applied out of the order the
+     kernel sent them (InodeShardedWorkers postcondition), and the wait
+     becomes re-entrant.
+
+  c. The second option in Re 4.2 cannot be built. The SQL function
+     cannot read the daemon's shared per-inode summary from inside its
+     transaction, and a check after the function returns comes after
+     the commit. Only verify-and-retry works. The daemon passes the inos
+     it pre-flushed to `pgfs.rename` / `pgfs.unlink`. After LockOrder
+     step 3, if the resolved source or target is a different ino, the
+     function returns "retry: actual inos = …" without committing. The
+     daemon flushes those inodes and calls again. The extra round trip
+     happens only under contention, which keeps
+     OneRoundTripPerOperation. A cache miss before rename is rare: the
+     VFS looks up both names before it calls rename, so the daemon's
+     cache almost always has the dentries.
+
+  d. Drop Re 4.3. FlushesBeforeNaming commits pending writes when the
+     last handle is released, so an inode with `open_handles = 0` has no
+     dirty buffer to drop. If handles are still open, the unlinked file
+     becomes an orphan whose data must stay readable through those
+     handles, so its buffer cannot be dropped either. With the writeback
+     cache removed (08d65ac), no dirty data arrives after release.
+
+
+-----------------------------------------------------------------------
+Re 5 (second review)
+-----------------------------------------------------------------------
+
+  a. Agreed. The clauses that still say "per handle" and need edits:
+     concurrency.BoundedWriteBuffers ("Per-handle write buffers"),
+     consistency.DrainsBuffersBeforeExternalising ("trims every
+     handle's pending writes"), durability.FlushesOnClose ("the
+     handle's pending writes"), durability.FlushesOnShutdown and
+     branch.DrainsOwnerBeforeSnapshot ("every handle's pending writes").
+
+  b. FsyncFailureSemantics reports an error "to each open descriptor
+     that wrote the lost range". That needs byte ranges per handle,
+     which the per-inode buffer removes. Use the Linux errseq_t model
+     instead: the inode keeps an error sequence number, each handle
+     keeps the number it last saw, and every descriptor open when the
+     error happened sees it once. It is simpler, and it is what
+     applications already get from Linux (r90).
+
+  c. Under the per-inode buffer, `flush(fh)` commits the inode's buffer
+     up to `fh.last_write_seq`, which includes other handles' earlier
+     writes. Write order requires this, but it means close() on one
+     handle can return an error caused by another handle's data. The
+     errseq model in (b) covers this case.
+
+
+-----------------------------------------------------------------------
+Re 6 (second review)
+-----------------------------------------------------------------------
+
+  a. The proposed `(w_xid, w_seq)` watermark loses changes. The filter
+     `seq > w_seq` drops any row with a lower seq that was not yet
+     visible when the batch was read:
+       1. T (xid 106) allocates seq 7 and stays open. Rows up to seq 9
+          from other transactions have committed.
+       2. h = 104. The batch delivers rows up to seq 9, so w_seq = 9.
+       3. T commits.
+       4. The next batch (h' > 106) selects T, but `7 > 9` is false.
+          T is never delivered.
+     Re 6.1 itself notes that seq allocations in flight are invisible,
+     and then filters on them. Losing a change breaks exactly-once
+     delivery, which is worse than the reordering it fixes.
+
+  b. The watermark has to describe the delivered set exactly. Keep the
+     scalar horizon h ("everything with xid < h has been delivered,
+     except the held-back list") and store the held-back rows
+     explicitly: watermark = (h, held_back keys). The next batch is
+     held_back ∪ {h <= xid < h'}, with the s_cap rule applied again.
+     The held-back list is small: only rows below h whose seq is at or
+     above s_cap. This makes the watermark an opaque token rather than
+     a bigint, which changes ResumableCursors (`changes_ack`) and
+     ChangesCommand (`--since`).
+
+  c. Do not add the per-layer advisory lock for a global order. It is
+     another hot point that every commit waits on, the same problem as
+     bug 7. State the guarantee as "conflicting changes arrive in commit
+     order; changes to unrelated objects may arrive in any order", which
+     is what allocating seq after the locks already gives.
+
+
+-----------------------------------------------------------------------
+Re 7 (second review)
+-----------------------------------------------------------------------
+
+  Check the scope of the lock. As I recall, PreCommit_Notify locks
+  "database 0" (`LockSharedObject(DatabaseRelationId, InvalidOid, 0,
+  AccessExclusiveLock)`), and a comment in the source says so. If that
+  is right, the lock serialises NOTIFY-ing commits across the whole
+  cluster, not one database, and pgfs would also slow every other
+  application on the server that uses NOTIFY. That makes the fix more
+  urgent; it does not change it.
+
+
+-----------------------------------------------------------------------
+Re 8 (second review)
+-----------------------------------------------------------------------
+
+  a. The warning cannot be detected reliably by SQLSTATE or text.
+     Check: the cancel variant is raised without an errcode, so it
+     carries the generic `01000`; the terminate variant carries
+     `57P01`. The message text is translated under a non-English
+     `lc_messages`, and `lc_messages` can only be set by a superuser, so
+     the least-privileged runtime role (security.LeastPrivilegeRoles)
+     cannot force `C`. A robust rule: the daemon knows when it sent a
+     cancel itself (watchdog, interrupt). Any synchronous commit that
+     returns success after the daemon cancelled it counts as not
+     replicated. Use the warning only as a second signal, for cancels
+     from outside such as an administrator's pg_cancel_backend.
+
+  b. The `op_log` path has the same hole. If the backend is terminated
+     during the sync-rep wait (pg_terminate_backend, server shutdown,
+     network loss), the client sees a broken connection. On reconnect,
+     IdempotentMutations finds the op_seq in `op_log`, and
+     FsyncFailureSemantics then allows reporting success, but the
+     commit may never have reached the standby. Rule: when an
+     ambiguous synchronous operation (fsync, an O_SYNC write, snapshot,
+     branch, promote) turns out through `op_log` to have committed, the
+     daemon runs the WAL-emitting synchronous barrier from bug 13
+     before it replies success. Sync rep waits for the barrier's LSN,
+     which comes after the original commit, so a successful barrier
+     proves the original commit was replicated. This also replaces the
+     retry logic in Re 8.2: the recovery step is always a barrier, never
+     a re-run of the mutation.
+
+  c. CLI commands that commit synchronously themselves (snapshot or
+     promote with no mount) need the same rule.
+
+
+-----------------------------------------------------------------------
+Re 9 (second review)
+-----------------------------------------------------------------------
+
+  a. The two-state design is right, but it relies on READ COMMITTED:
+     the CLI's `UPDATE … WHERE state = 'pending'` waits on the row lock
+     held by `pgfs.snapshot`, then re-reads the row and finds `done`.
+     Under REPEATABLE READ the UPDATE fails with a serialization error
+     instead. State the isolation level.
+
+  b. The drain in DrainsOwnerBeforeSnapshot is not a barrier. See new
+     bug 16.
+
+
+-----------------------------------------------------------------------
+Re 10 (second review)
+-----------------------------------------------------------------------
+
+  Agreed. Use the bug 13 barrier as step 1, so fsync with nothing
+  pending, shutdown, and sync-rep recovery (Re 8b) share one function
+  and one test.
+
+
+-----------------------------------------------------------------------
+Re 11 (second review)
+-----------------------------------------------------------------------
+
+  a. The detection predicate `layer = 1 AND ino = 1` is wrong after a
+     promote. TREE then points at another layer, and layer 1 may have
+     been deleted. Recovery wipes all unlogged tables together, so
+     `NOT EXISTS (SELECT 1 FROM pgfs.inodes)` is a reliable signal. A
+     stricter test is "the root inode row of every tree is missing".
+
+  b. Check: Postgres does not allow a permanent table to have a foreign
+     key into an unlogged table. If any logged table (`trees`, `layers`,
+     `snapshots`, `mounts`) references `inodes` or `blobs`, a scratch
+     mkfs fails. The split must state which foreign keys are dropped in
+     scratch mode.
+
+  c. Failover gives the same result as a crash: a standby holds only
+     the empty init forks of unlogged tables. A scratch filesystem on a
+     primary that has standbys (without `--replica`) looks wiped after a
+     failover. The predicate catches this. Document it.
+
+
+-----------------------------------------------------------------------
+Re 12 (second review)
+-----------------------------------------------------------------------
+
+  a. Registering sessions only protects anything if a mount stops
+     serving when its session expires. A snapshot mount reading from a
+     standby while the primary is unreachable cannot renew its session.
+     Once the session expires, `snapshot delete` goes ahead and
+     ReclaimsRetiredRows removes rows the mount still reads. Rule: a
+     read-only or snapshot mount whose renewal has not succeeded within
+     the expiry minus a margin replies EIO to reads the kernel cache
+     cannot answer, the same way FencesStaleWriters handles writers.
+     Data already in the kernel cache stays correct, because a snapshot
+     is frozen.
+
+  b. Alternatively, or as well: reclaim the rows of a deleted snapshot
+     or tree only after the session expiry plus a grace period, so a
+     mount that has just lost its session fails cleanly and does not
+     read half-deleted rows.
+
+
+-----------------------------------------------------------------------
+Re 13 (second review)
+-----------------------------------------------------------------------
+
+  a. Use the `op_log` update, not `pg_logical_emit_message`. Check: I
+     believe EXECUTE on `pg_logical_emit_message` is revoked from
+     PUBLIC by default, so the least-privileged runtime role cannot
+     call it. Also, RecordTransactionCommit flushes WAL and waits for
+     sync rep only when the transaction both has an xid assigned and
+     wrote WAL. A heap UPDATE of the worker's `op_log` slot does both.
+
+  b. The barrier takes an op_seq like any other mutation. An ambiguous
+     barrier then resolves through `op_log` like everything else, and
+     Re 1's continuity check covers it.
+
+
+-----------------------------------------------------------------------
+Re 14 (second review)
+-----------------------------------------------------------------------
+
+  a. The spec already describes the mechanism: LsnTicketReads says an
+     asynchronous commit reaches the standby only after walwriter or a
+     synchronous commit flushes the primary's WAL. What is missing is
+     the cost. The fix in bug 14 needs no extra round trip: read both
+     LSNs in the pipelined statement
+     (`SELECT pg_current_wal_insert_lsn(), pg_current_wal_flush_lsn()`).
+
+  b. The bigger win is that the ticket is mount-wide, but read-your-
+     writes only needs the object being read to have replayed. Keep a
+     ticket per inode: the LSN of the last commit that touched it, with
+     the parent directory's ino for name operations and both parents
+     for rename. Evict an entry once the standby's replay LSN passes
+     it. Reads of anything this mount has not written recently then go
+     to the standby at once, even while other files are being written.
+
+
+=======================================================================
+Additional spec bugs found during the second review
+=======================================================================
+
+-----------------------------------------------------------------------
+15. Change-feed consumers are silently stranded by promote
+-----------------------------------------------------------------------
+
+Where:
+  spec/changefeed.py:79   ResumableCursors (`change_consumers(name,
+                          layer, watermark, updated_at)`: the consumer
+                          is bound to a layer)
+  spec/branch.py:403      PromotesBranch ("points TREE at BRANCH's
+                          layer")
+
+Scenario:
+  1. A consumer is registered with `pgfs changes register idx main`.
+     Its row stores main's layer L.
+  2. `pgfs branch main job`, edit job, `pgfs promote job main`.
+     main now points at layer L'.
+  3. The consumer keeps reading layer L, which is now frozen. No new
+     rows ever arrive, and nothing raises PF010, because nothing
+     expired. The feed has stopped and nobody is told.
+  4. Re-pointing the consumer to L' does not help on its own. The
+     branch's change rows are in L' with xids that may be below the
+     consumer's watermark (the branch was edited while the consumer
+     advanced on L), so they would be skipped.
+
+Why it matters:
+  Sync, indexing (offload.py:117) and cache coherence silently stop
+  following the tree after the workflow the branch feature exists for.
+
+Proposed fix:
+  - Bind consumers to the tree, not the layer.
+  - With fold-back (Re 3), the promote transaction writes the branch's
+    net delta into `changes` on TREE.layer under the promote's own xid
+    and seq: one row per touched inode, bounded like the fold.
+  - When the layer moves (`--force`, or a delta above the fold-back
+    limit), `changes_next` fails with a new SQLSTATE `PF011` ("tree
+    moved: resync from TREE@pre-promote-<ts>"), the same way PF010
+    handles expiry. Delivery never stops silently.
+
+Check:
+  ModelConformance should include a registered consumer across a
+  promote.
+
+
+-----------------------------------------------------------------------
+16. An owner-drained snapshot misses writes acknowledged during the drain
+-----------------------------------------------------------------------
+
+Where:
+  spec/branch.py:222   DrainsOwnerBeforeSnapshot (steps 1 and 2 are
+                       separate, and the workers keep accepting writes)
+  spec/branch.py:204   CreatesSnapshot postcondition ("that includes
+                       every write the daemon had acknowledged")
+
+Scenario:
+  1. Step 1 commits each worker's buffers, one worker after another.
+  2. Meanwhile an application writes to file `a`, which is owned by a
+     worker that has already drained. The write is buffered and
+     acknowledged.
+  3. Step 2 runs `pgfs.snapshot`. The write to `a` is not in the
+     snapshot, though it was acknowledged before the snapshot was
+     taken.
+  4. If the same application then writes `b` on a worker that has not
+     drained yet, the snapshot holds the later write to `b` and not the
+     earlier write to `a`.
+
+Why it matters:
+  The snapshot is still in the crash set (buffered writes count as
+  uncommitted), so it is as good as `--crash-consistent`, but it does
+  not keep the stronger promise. The Frangipani barrier cited in the
+  spec requires that new writes are stopped, not just that buffers are
+  flushed.
+
+Proposed fix:
+  Make it a real barrier. The daemon tells every worker to hold new
+  mutating requests (leave them unanswered in the FUSE queue, without
+  replying), each worker commits its buffer and confirms, the daemon
+  calls `pgfs.snapshot`, then it releases the workers. Bound the hold
+  by `--timeout`. When the request is cancelled (Re 9), release the
+  workers without taking the snapshot. Say explicitly that this hold
+  is a bounded, intended pause and not the queueing that
+  DatabaseStateMachine forbids.
+
+
+-----------------------------------------------------------------------
+Suggested order after the second review
+-----------------------------------------------------------------------
+
+  1. Bug 1 with Re 1a–1c (op_log continuity only), and bugs 8 and 13
+     as one "synchronous barrier" fix (Re 8a–8b, Re 13). They share a
+     function and a fault-injection test.
+  2. Bug 2 with Re 2b (recompute the flag when the base changes).
+  3. Bug 5 (per-inode buffer, errseq errors).
+  4. Bug 6 with Re 6a. Do not adopt the `(w_xid, w_seq)` watermark as
+     written, because it loses changes.
+  5. Bug 15 together with bug 3. Fold-back and consumer handling
+     change the same promote transaction.
+  6. Bugs 4, 16, 9, 12, 7, 10, 11, 14.
+
+
+=======================================================================
+Follow-up review: PG 17 checks and remaining edge cases (2026-10-29)
+=======================================================================
+
+This section confirms the four open "Check" items from the second
+review against PostgreSQL 17 internals and records five remaining
+interactions and spec gaps to close when applying the fixes.
+
+
+-----------------------------------------------------------------------
+Confirmation of the second review's "Check" items
+-----------------------------------------------------------------------
+
+  1. Re 7 — `PreCommit_Notify` lock scope:
+     Confirmed. `PreCommit_Notify` in `src/backend/commands/async.c`
+     calls `LockSharedObject(DatabaseRelationId, InvalidOid, 0,
+     AccessExclusiveLock)` on "database 0" (because the `pg_notify`
+     SLRU is cluster-wide) with the source comment `/* Lock "database 0"
+     to serialize listens and notifies across the whole cluster */`.
+     Every mutating `NOTIFY` serialises commits across the entire
+     Postgres instance, not only the `pgfs` database.
+
+  2. Re 8a — Sync-rep cancel warning detection:
+     Confirmed. In `SyncRepWaitForLSN`
+     (`src/backend/replication/syncrep.c`), `QueryCancelPending` omits
+     `errcode()` (defaulting to `01000`), `ProcDiePending` uses
+     `ERRCODE_ADMIN_SHUTDOWN` (`57P01`), and `lc_messages` has context
+     `PGC_SUSET` (superuser-only).
+     Note for external `pg_cancel_backend`: Postgres wire-protocol
+     `NoticeResponse` messages carry untranslated source-location
+     fields (`'F' = "syncrep.c"`, `'R' = "SyncRepWaitForLSN"`).
+     Checking the daemon's own cancel flag plus `routine =
+     "SyncRepWaitForLSN"` on the notice callback catches both
+     daemon-initiated and external cancels regardless of `lc_messages`.
+
+  3. Re 11b — Foreign keys across `LOGGED` and `UNLOGGED` tables:
+     Confirmed (`ATAddForeignKeyConstraint` in
+     `src/backend/commands/tablecmds.c` rejects `PERMANENT -> UNLOGGED`
+     with SQLSTATE `42P16`, while allowing `UNLOGGED -> UNLOGGED` and
+     `UNLOGGED -> PERMANENT`). With `{meta, trees, layers, snapshots,
+     mounts}` logged and the high-churn data/queue tables unlogged:
+     - `file_blocks.blob_id -> blobs.blob_id` (`storage.BlockMap`) is
+       `UNLOGGED -> UNLOGGED` (valid);
+     - `op_log -> mounts` is `UNLOGGED -> LOGGED` (valid);
+     - none of the logged tables may hold a foreign key into `inodes`
+       or `blobs`.
+
+  4. Re 13a — `pg_logical_emit_message` vs `op_log` update:
+     Confirmed. `pg_logical_emit_message` has `EXECUTE` revoked from
+     `PUBLIC` by default, and `RecordTransactionCommit`
+     (`src/backend/access/transam/xact.c`) calls `XLogFlush` and
+     `SyncRepWaitForLSN` only when `TransactionIdIsValid(xid) &&
+     wrote_xlog`. Updating the worker's `op_log` slot inside
+     `pgfs.fsync` satisfies both under `security.LeastPrivilegeRoles`.
+     Related detail: pre-inserting the `workers` rows `(mount_id,
+     worker_id, 0, NULL)` in `op_log` when acquiring the lease in
+     `consistency.ExclusiveTreeLease` guarantees that every subsequent
+     `op_log` write is an in-place HOT `UPDATE` (`space.TableTuning`)
+     and avoids missing-row ambiguity in Re 1b.
+
+
+-----------------------------------------------------------------------
+17. `pgfs.changes_next(name, limit)` drops events when a horizon window
+    exceeds `limit` (interacts with Re 6b)
+-----------------------------------------------------------------------
+
+Where:
+  spec/changefeed.py:55   HorizonOrderedDelivery ("fetches the rows
+                          with w <= xid < h, ordered by seq. Its new
+                          watermark is h")
+  spec/changefeed.py:79   ResumableCursors ("pgfs.changes_next(name,
+                          limit) returns the next batch, and
+                          pgfs.changes_ack(name, watermark) advances
+                          the watermark")
+  spec/offload.py:74      FallocatePunchHoleReq
+
+Scenario:
+  1. 5,000 changes commit in the window `[w, h)`.
+  2. A consumer calls `SELECT * FROM pgfs.changes_next('search-indexer',
+     1000)` (`spec/changefeed.py:239`), which returns the first 1,000
+     rows ordered by `seq`.
+  3. The consumer acknowledges the batch watermark (`h`).
+  4. The remaining 4,000 rows in `[w, h)` are skipped forever. Nor can
+     the batch watermark be set to the 1,000th row's `xid`, because
+     rows in `[w, h)` are ordered by `seq`, not `xid` (and batch
+     operations share one `xid`).
+
+  Adjacent gap: `offload.FallocatePunchHoleReq` mutates file data and
+  size but omits `changefeed.RecordsChanges` (unlike `CopyFileRangeReq`
+  and `TruncatesFiles`).
+
+Proposed fix:
+  Combine `limit` pagination with Re 6b's opaque watermark token by
+  encoding `(low_xid, high_xid, last_seq, held_back)`:
+  - When starting a new horizon window, set `high_xid = h` and compute
+    `s_cap`.
+  - Each `changes_next(name, limit)` call pages through the frozen
+    window (`held_back` union `[low_xid, high_xid)`) with `seq >
+    last_seq` and `(s_cap IS NULL OR seq < s_cap) LIMIT limit`,
+    advancing only `last_seq` while full pages remain.
+  - When the final page of `[low_xid, high_xid)` is reached, advance
+    `low_xid = high_xid`, reset `last_seq = 0`, and record any rows in
+    `[low_xid, high_xid)` with `seq >= s_cap` as the new `held_back`
+    set.
+  - Add `RecordsChanges` (`modify`) to `FallocatePunchHoleReq`.
+
+
+-----------------------------------------------------------------------
+Re 1b (follow-up). Contradiction between `MapsDatabaseErrors` and
+                   `IdempotentMutations` on connection drop during
+                   COMMIT
+-----------------------------------------------------------------------
+
+Where:
+  spec/failure.py:59    DatabaseStateMachine
+  spec/failure.py:97    RevalidatesAfterReconnect
+  spec/failure.py:119   IdempotentMutations ("none is reported as
+                        failed when it committed, across any number of
+                        reconnects or any outage duration")
+  spec/failure.py:237   MapsDatabaseErrors ("08*, 57P01–57P03 |
+                        connection lost, server shutdown | EIO |
+                        state -> Broken")
+
+Problem:
+  `MapsDatabaseErrors` says a connection loss (`08*`, `57P01`–`57P03`)
+  replies `EIO` and moves the connection to `Broken`, whereas
+  `IdempotentMutations` states that when a connection breaks during
+  `COMMIT`, on reconnect the mutating function checks `op_log` so that
+  no committed mutation is ever reported as failed.
+  If a worker immediately replies `EIO` to an in-flight metadata
+  mutation when its socket drops and does not resolve that `op_seq` on
+  reconnect:
+  1. If the transaction had already committed on the server before the
+     connection broke, the caller got `EIO` for a committed change
+     (breaking `IdempotentMutations`), and the daemon's metadata cache
+     disagrees with the database.
+  2. The database's `op_log` slot holds `op_seq = N`, while the
+     worker's `last_replied_op_seq` in Re 1b stayed at `N - 1`. If a
+     later crash loses `N` after another reader observed it, checking
+     `slot >= N - 1` misses the rollback of `N`.
+
+Proposed fix:
+  Distinguish new requests while disconnected from the single request
+  that was in flight on the connection when it broke:
+  - New incoming requests on a `Broken` / `Reconnecting` /
+    `Revalidating` connection fail fast with `EIO` without being
+    queued (`DatabaseStateMachine`).
+  - For the in-flight mutation whose `COMMIT` was interrupted by a
+    connection error, if the connection reconnects and passes
+    `RevalidatesAfterReconnect` within the request's timeout (and
+    before any FUSE `INTERRUPT`), the worker resolves it via
+    `IdempotentMutations` (`op_log`) and returns the committed result
+    (or re-executes if not in `op_log`).
+  - If the in-flight request timed out or was interrupted before
+    reconnect completed, `RevalidatesAfterReconnect` still inspects the
+    worker's `op_log` slot for `in_flight_op_seq` upon reconnecting: if
+    `slot.op_seq = in_flight_op_seq`, the daemon invalidates the
+    affected cache entries and advances its acknowledged `op_seq` to
+    `in_flight_op_seq`.
+
+
+-----------------------------------------------------------------------
+Re 3 (follow-up). Auto-created `main@branch-NEW` snapshots leak
+                  retained epochs, and `PromotesBranch` ignores branch
+                  snapshots
+-----------------------------------------------------------------------
+
+Where:
+  spec/branch.py:297    CreatesBranch ("A tree source first takes a
+                        snapshot named branch-NEW")
+  spec/branch.py:404    PromotesBranch
+  spec/branch.py:454    DeletesSnapshotsAndTrees
+  spec/branch.py:468    RetainedEpochs
+
+Problem:
+  1. When branching from a live tree (`pgfs branch main job`),
+     `CreatesBranch` inserts a named snapshot `main@branch-job` into
+     `snapshots`. Neither `pgfs promote job main` nor `pgfs tree delete
+     job` removes `main@branch-job`. Even with Re 3's fold-back keeping
+     `main` at `depth = 0`, every `branch -> edit -> promote` or
+     `branch -> delete` cycle leaves `main@branch-job` in `snapshots`
+     forever, pinning its epoch in `RetainedEpochs` so
+     `space.ReclaimsRetiredRows` can never reclaim overwritten rows on
+     `main`.
+  2. `PromotesBranch` checks that no child layer uses `BRANCH.layer` as
+     its base (`spec/branch.py:418`), but does not check whether
+     `BRANCH` has named snapshots in `snapshots(tree = BRANCH, ...)`.
+     Promoting `BRANCH` removes `BRANCH` from `trees`, leaving its
+     snapshots orphaned (and if fold-back deletes `BRANCH.layer`, their
+     layer disappears).
+
+Proposed fix:
+  - Because `RetainedEpochs` (`spec/branch.py:469-471`) already retains
+    "the base epochs of the layers that use it as a base", branching
+    from a live tree does not need to insert a `main@branch-NEW` row
+    into `snapshots`: advancing `SOURCE.layer.epoch` and setting
+    `NEW.layer.base_epoch` freezes the base view while `NEW` exists,
+    and automatically releases the epoch for `ReclaimsRetiredRows` as
+    soon as `NEW` is deleted or folded back on promote.
+  - In `PromotesBranch`, refuse with `EBUSY` if `BRANCH` has named
+    snapshots of its own (matching `FlattensBranch` and child-branch
+    checks).
+
+
+-----------------------------------------------------------------------
+Re 2 (follow-up). Three edge cases in `shadows_base`: O(1) fold-back,
+                  orphan release/reclaim, and `rmdir` child whiteouts
+-----------------------------------------------------------------------
+
+Where:
+  spec/branch.py:155    CopiesUpOnWrite
+  spec/app.py:208       UnlinksFiles
+  spec/app.py:272       RemovesDirectories
+  spec/posix.py:112     OpenAfterUnlink
+  spec/space.py:168     ReclaimsOrphans
+  spec/storage.py:99    DentryTable
+
+Details:
+  1. O(1) `shadows_base` recomputation during Re 3 fold-back (Re 2b):
+     When folding a branch row `r_branch` into a `TREE.layer` that
+     itself has a base (`depth > 0`), `TREE.layer` never needs to probe
+     its base chain to recompute `shadows_base`:
+     `new_shadows_base = COALESCE(r_tree.shadows_base,
+     r_branch.shadows_base)` is exact in O(1). If `TREE.layer` already
+     had a row `r_tree` for the key (live or whiteout),
+     `r_tree.shadows_base` already records whether `TREE.layer`'s base
+     can see the key; if `TREE.layer` had no row for the key,
+     `r_branch.shadows_base` looked through `TREE.layer` directly to
+     `TREE.layer`'s base.
+     For `file_blocks`, no `shadows_base` column is needed at all:
+     `block_no < inode.inherit_limit` is the exact predicate (and on
+     fold-back, `new_inherit_limit = LEAST(r_tree.inherit_limit,
+     r_branch.inherit_limit)`).
+
+  2. Orphan release and `ReclaimsOrphans` on a branch:
+     When an inherited file (`shadows_base = true`) is unlinked while
+     open, it becomes an orphan in `orphans`. When the last handle is
+     released (`OpenAfterUnlink`) or `ReclaimsOrphans` runs on the next
+     mount, deleting the `inodes` row would uncover the base layer's
+     inode. Both must obey the `shadows_base` rule: if `shadows_base =
+     true`, remove the `orphans` row and any `file_blocks` / `xattrs`
+     rows in the layer, and turn the `inodes` row into an inode
+     whiteout (`nlink = 0, size = 0, inherit_limit = 0, inline_data =
+     NULL`) rather than deleting it.
+
+  3. `rmdir` of an inherited directory on a branch:
+     When all inherited entries in directory `d` are unlinked in a
+     branch (writing child dentry whiteouts with `parent_ino = d`) and
+     `d` is then removed by `RemovesDirectories`, leaving those child
+     dentry whiteouts live (`died = ∞`) violates `DentryTable`'s
+     invariant ("Every live dentry ... `parent_ino` resolves to a live
+     directory", `spec/storage.py:106-108`) when `pgfs check` runs.
+     `RemovesDirectories` must delete or retire child dentry whiteouts
+     of `d` in the branch layer, and `LayeredLookup` / `PgfsCheck`
+     never resolves entries under a whited-out directory.
+
+
+-----------------------------------------------------------------------
+Re 4c (follow-up). Keeping cold-cache `unlink` and `rename` to one
+                   round trip when buffers are clean
+-----------------------------------------------------------------------
+
+Where:
+  spec/concurrency.py:49    InodeShardedWorkers
+  spec/consistency.py:201   OneRoundTripPerOperation
+
+Problem:
+  In Re 4c's verify-and-retry protocol, if the dentry is not in the
+  daemon's cache (`pre_flushed_inos = []`), `pgfs.unlink` or
+  `pgfs.rename` would return `"retry: actual inos = [...]"` on a cache
+  miss even when the mount has no dirty write buffers for that inode,
+  turning cold-cache `unlink`/`rename` into two database round trips.
+
+Proposed fix:
+  Every inode with dirty buffered writes is already tracked in the
+  daemon's in-memory state (`InodeShardedWorkers`). Have the daemon
+  pass the set of currently-dirty inodes (or pass `pre_flushed_inos =
+  NULL` when no inode on the mount has dirty buffered writes) so the
+  SQL function only asks for a retry when the resolved `source_ino` or
+  `target_ino` actually has uncommitted buffered data in the daemon.
+

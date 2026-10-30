@@ -1,92 +1,143 @@
 """
-Database-Native Kernel Offloading & Acceleration specifications for pgfs.
+Kernel offloading: operations the kernel hands to the filesystem as
+intent rather than bytes, executed inside PostgreSQL.
 
-Derived from POSIX kernel acceleration capabilities (copy_file_range, fallocate,
-reflink CoW, server-side search, and subtree cloning).
-
-These granular Requirement classes define how pgfs leverages PostgreSQL's relational
-engine to intercept standard file operations and execute them as set-based database
-mutations, eliminating userspace byte streaming and delivering near-instantaneous
-operation throughput.
+`copy_file_range` becomes block-map rows that share blobs, and
+`fallocate` becomes map-row deletes and hole rows, so no file data
+passes through the daemon. Content search through Postgres indexes is
+planned after the first release. Reflink copies and subtree clones are
+not separate requirements: the first is what `copy_file_range` does,
+and the second is a branch rooted at a directory
+(`branch.ViewsRootedAtDirectory`).
 """
 
 from .err import PARTIAL, Feat, Req, md
+from .changefeed import (
+    RecordsChanges,
+    ResumableCursors,
+)
+from .consistency import (
+    BoundedTransactions,
+)
+from .space import (
+    CollectsSharedBlobs,
+    FreesUnsharedBlobsInline,
+)
+from .storage import (
+    BlockMap,
+    ImmutableBlobs,
+)
 
 
 class CopyFileRangeReq(Req):
-    """Intercepts the FUSE `copy_file_range` callback triggered by `cp`, `sendfile`,
-    or `copy_file_range(2)` syscalls, executing server-side block duplication directly
-    inside PostgreSQL.
+    """The FUSE `copy_file_range` callback copies a byte range between
+    two files of the same tree inside PostgreSQL. `cp` (coreutils 9 and
+    later), `sendfile` and `copy_file_range(2)` reach it. Pending writes
+    of both files are committed first. Then, in one transaction, it:
 
-    Technical Details:
-    - Intercepts `copy_file_range(ino_in, off_in, ino_out, off_out, len, flags)`.
-    - Executes `INSERT INTO blocks SELECT ...` or CoW block ref-linking inside PostgreSQL
-      without streaming payload bytes through FUSE daemon memory buffers.
-    - Updates target entry size, `mtime`, and `ctime` metadata atomically in a single transaction."""
-    pass
+    - if either file still stores its content in `inline_data`
+      (`storage.InlinesSmallFiles`), updates `inline_data` in place when
+      the destination remains at most `inline_max`, or promotes
+      `inline_data` to block 0 first when the copy crosses `inline_max`
+      or shares blocks;
+    - maps each destination block that the range covers entirely, at
+      the same offset within the block as in the source, to the
+      source's blob, and marks that blob `shared`
+      (`space.CollectsSharedBlobs`). No data is copied. This is a
+      reflink in all but name; `cp --reflink=always` itself cannot reach
+      pgfs (`posix.DeclaresUnsupportedOps`);
+    - copies partly covered head and tail blocks, and ranges whose
+      offsets differ within a block, by read-modify-write into new
+      blobs, with the same rule as `WritesFiles`;
+    - leaves holes in the source as holes in the destination;
+    - updates the destination's size, mtime and ctime, and records the
+      change.
+
+    **Postcondition.** The destination range equals the source range
+    byte for byte. Bytes of the destination outside the range are
+    unchanged, as for `WritesFiles`.
+
+    **Crash.** All or nothing: one transaction, bounded by batching
+    (`consistency.BoundedTransactions`). A copy larger than one batch
+    replies with the bytes copied so far, which `copy_file_range(2)`
+    permits, and the caller continues.
+
+    **Errors.** EXDEV across trees. EINVAL for overlapping ranges in one
+    file. EISDIR, EBADF, EFBIG and ENOSPC as for writes.
+
+    **Sources.** BetrFS clones r55. The earlier backend ran two
+    statements outside a transaction, which
+    `consistency.OneOperationOneTransaction` forbids."""
+
+    deps = [ImmutableBlobs, CollectsSharedBlobs, BoundedTransactions]
 
 
 class FallocatePunchHoleReq(Req):
-    """Intercepts the FUSE `fallocate` callback for block allocation and sparse hole
-    punching (`FALLOC_FL_PUNCH_HOLE`).
+    """The FUSE `fallocate` callback implements these modes in one
+    transaction:
 
-    Technical Details:
-    - For `FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE`, deletes block records in the target
-      byte range `DELETE FROM blocks WHERE ino = $1 AND block_no >= $2 AND block_no <= $3`.
-    - For standard pre-allocation (`FALLOC_FL_KEEP_SIZE`), creates zero-filled block placeholders
-      or updates entry size metadata without physical byte copying."""
-    pass
+    - **default** (no flags): extends `size` to `offset + length` if that
+      is larger. pgfs does not reserve space, so later writes may still
+      fail with ENOSPC, which the documentation states.
+    - **`FALLOC_FL_KEEP_SIZE`**: changes nothing, because pgfs has no
+      preallocation.
+    - **`FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE`**: removes the map
+      rows of blocks inside the range, writing hole rows on a branch
+      (`branch.CopiesUpOnWrite`), and rewrites partly covered edge
+      blocks with the covered bytes zeroed.
+    - **`FALLOC_FL_ZERO_RANGE`**: as punch hole, and extends `size` unless
+      `KEEP_SIZE` is set.
 
+    On an inline file (`storage.InlinesSmallFiles`), punching or zeroing
+    within `inline_max` zeroes the slice in `inline_data`, and extending
+    past `inline_max` promotes `inline_data` to block 0 first. Any mode
+    that modifies data or `size` updates `mtime` and `ctime` and records
+    a `modify` row in `changes` (`changefeed.RecordsChanges`). Other
+    modes reply EOPNOTSUPP (`posix.DeclaresUnsupportedOps`).
 
-class ReflinkBlockSharingReq(Req):
-    """Implements reference-counted Copy-on-Write (CoW) block storage for instant file
-    cloning (`cp --reflink=always`).
+    **Postcondition.** Every byte in the range reads as zero. Bytes
+    outside it are unchanged. With `KEEP_SIZE` the size is unchanged.
+    Space for removed blocks is freed as in
+    `space.FreesUnsharedBlobsInline`.
 
-    Technical Details:
-    - Introduces a `block_id` and `ref_count` column or block reference mapping table.
-    - Offloaded file copies simply copy block references and increment `ref_count` in $O(1)$ time.
-    - Write operations on shared blocks perform lazy Copy-on-Write allocation (`write_block`),
-      allocating a private block copy only when modified."""
-    pass
+    **Errors.** EOPNOTSUPP for unsupported modes. EINVAL for a negative
+    or overflowing range. EROFS on a snapshot."""
 
-
-class CloneSubtreeReq(Req):
-    """Enables server-side recursive directory tree cloning via custom `ioctl` or extended
-    attribute (`xattr`) calls.
-
-    Technical Details:
-    - Intercepts subtree clone requests for a target directory inode.
-    - Executes recursive set-based `INSERT INTO entries SELECT ...` and `INSERT INTO blocks SELECT ...`
-      queries inside a single PostgreSQL transaction.
-    - Clones complex multi-gigabyte directory hierarchies in milliseconds."""
-    pass
+    deps = [BlockMap, FreesUnsharedBlobsInline, RecordsChanges]
 
 
 class ContentSearchOffloadReq(Req):
-    """Offloads file content searching (`grep`, `find`) to PostgreSQL GIN and `pg_trgm`
-    trigram indices.
+    """Planned after the first release. `pgfs search` and a `pgfs` SQL
+    function find files by content through a `pg_trgm` GIN index over
+    block content, or over text extracted from it, and return matching
+    paths without reading any file through FUSE.
 
-    Technical Details:
-    - Maintains GIN/trigram indices over `blocks.data` or extracted text.
-    - Exposes custom search queries (via `xattr` or virtual `/proc`/control paths) returning
-      matching inode lists or line offsets directly from database index scans, bypassing
-      full file reads over FUSE."""
-    pass
+    The design must settle these before it is built:
+
+    - Indexing each block on its own misses a match that crosses a block
+      boundary. The index either covers overlapping windows, or the
+      documentation states the limit.
+    - A change-feed consumer (`changefeed.ResumableCursors`) maintains
+      the index, not triggers on the write path, so writes do not pay
+      for it. Results lag by the consumer's delay.
+    - Queries may run on a standby, keeping the primary free (TiDB r34:
+      a learner for analytics).
+    """
+
+    deps = [ResumableCursors]
 
 
 # ── Features ──────────────────────────────────────────────────────────
 
 class KernelOffloadingAcceleration(Feat):
-    """pgfs incorporates Database-Native Kernel Offloading capabilities, utilizing
-    copy_file_range, fallocate, reflink CoW, and server-side search to eliminate
-    userspace byte streaming and deliver sub-millisecond execution for large-scale
-    file operations."""
+    """Copies and hole punching run inside PostgreSQL. `cp` shares blocks
+    instead of copying bytes, and `fallocate` punches holes and zeroes
+    ranges by changing block-map rows, so no file data passes through
+    the daemon. Content search through database indexes is planned."""
 
     deps = [
         CopyFileRangeReq,
         FallocatePunchHoleReq,
-        ReflinkBlockSharingReq,
-        CloneSubtreeReq,
         ContentSearchOffloadReq,
     ]
 
@@ -98,234 +149,150 @@ class KernelOffloadingAcceleration(Feat):
 
     def status_note(self):
         return (
-            "Server-side `copy_file_range` and `fallocate` are implemented in "
-            "the storage backend and unit-tested, but the FUSE layer does not "
-            "call them yet. On a mount, copies stream through the daemon and "
-            "`fallocate` fails with `EOPNOTSUPP`. Reflink, subtree clone and "
-            "content search are planned."
+            "`copy_file_range` maps whole blocks to the source's blobs "
+            "(shared, collected by GC) and copies only partial edge "
+            "blocks, in one bounded transaction; `fallocate` extends, "
+            "punches holes and zeroes ranges by changing map rows. "
+            "Content search is planned."
         )
 
     def tutorial(self):
         return md(r"""
-            The offloading callbacks are not connected to the mount yet,
-            but the idea behind them can be tried today with plain SQL. In
-            this tutorial we will copy a file without its bytes ever
-            leaving PostgreSQL, then run the unit test that exercises the
-            real implementation. We need a running mount (see [Your first
-            pgfs mount](projectlocalenvironment.md)).
+            In this tutorial we will copy a large file with `cp` and watch pgfs
+            share its blocks instead of copying them, then punch a hole in a file
+            and see the space go. We need a mounted filesystem (see
+            [Your first pgfs mount](projectlocalenvironment.md)).
 
-            ## Step 1: create a file through the mount
+            ## Step 1: make a file and copy it
 
             ```bash
-            mkdir testdata/mnt/offload
-            head -c 300000 /dev/urandom > testdata/mnt/offload/big.bin
-            ```
-
-            ## Step 2: copy it inside the database
-
-            One transaction copies the file's metadata row and its five
-            block rows. No data passes through pgfs or through `psql`:
-
-            ```bash
-            psql -h "$PWD/testdata" -d pgfs -v ON_ERROR_STOP=1 <<'SQL'
-            BEGIN;
-            INSERT INTO entries (parent, name, kind, size)
-              SELECT parent, 'clone.bin', kind, size FROM entries
-              WHERE parent = 'offload' AND name = 'big.bin';
-            INSERT INTO blocks (parent, name, block_no, data)
-              SELECT parent, 'clone.bin', block_no, data FROM blocks
-              WHERE parent = 'offload' AND name = 'big.bin';
-            COMMIT;
-            SQL
-            ```
-
-            ## Step 3: see the copy appear on the mount
-
-            Wait a second for the kernel's attribute cache to expire, then:
-
-            ```bash
-            ls -l testdata/mnt/offload
-            cmp testdata/mnt/offload/big.bin testdata/mnt/offload/clone.bin && echo identical
+            head -c 2000000 /dev/urandom > testdata/mnt/orig.bin
+            cp testdata/mnt/orig.bin testdata/mnt/copy.bin
+            cmp testdata/mnt/orig.bin testdata/mnt/copy.bin && echo identical
             ```
 
             ```text
-            -rw-r--r-- 1 alice alice 300000 Oct 26 17:13 big.bin
-            -rw-r--r-- 1 alice alice 300000 Oct 26 17:13 clone.bin
             identical
             ```
 
-            This is what `copy_file_range` offloading does on the
-            inode-keyed schema: one set-based `INSERT … SELECT` instead of
-            reading and rewriting every byte.
+            coreutils 9 `cp` calls `copy_file_range(2)`, which reaches pgfs's
+            `copy_file_range` callback. Whole blocks at the same offset become
+            references to the source's blobs.
 
-            ## Step 4: run the real implementation's test
+            ## Step 2: see the sharing
 
             ```bash
-            cargo test tests_offload
+            psql -h "$PWD/testdata" -d pgfs -c "SELECT count(*) AS shared_blobs FROM pgfs.blobs WHERE shared"
             ```
 
             ```text
-            test db::tests_offload::test_backend_offloaded_copy_file_range_and_fallocate ... ok
+             shared_blobs
+            --------------
+                       30
             ```
 
-            The test copies 128 KiB between two files with
-            `copy_file_range`, then punches it back out with `fallocate`.
+            Thirty 64 KiB blocks are referenced by both files; only the partly
+            covered last block was written again.
 
-            ## Step 5: clean up
+            ## Step 3: punch a hole
 
             ```bash
-            rm -r testdata/mnt/offload
+            fallocate --punch-hole --offset 65536 --length 655360 testdata/mnt/copy.bin
+            du -k testdata/mnt/copy.bin
             ```
+
+            The ten blocks in the range read as zero and no longer count in `du`.
 
             ## What we did
 
-            We copied a file entirely inside PostgreSQL and saw it through
-            the mount, then ran the backend code that will do the same for
-            `cp` once it is wired to FUSE. The
-            [explanation](../explanation/kerneloffloadingacceleration.md)
-            covers the rest of the plan.
+            We saw a copy that moved no data through the daemon, and a hole
+            punched by removing map rows. The
+            [explanation](../explanation/kerneloffloadingacceleration.md) says why
+            these run inside PostgreSQL.
         """)
 
     def how_to(self):
         return md(r"""
-            ## Copy a file
+            ## Copy without moving data
 
-            `cp` works and the copy is exact, but today every byte passes
-            through the daemon. `cp` calls `copy_file_range(2)`; pgfs does
-            not implement the FUSE callback, so the kernel falls back to
-            reading and writing.
+            Use any tool that calls `copy_file_range(2)`: `cp` from coreutils 9,
+            `sendfile`, or Python's `os.copy_file_range`. Whole blocks are shared
+            when the source and destination offsets are equal modulo the block
+            size; other bytes are copied by the daemon. A copy larger than 4 096
+            blocks replies with the bytes copied so far, and the caller continues.
 
-            ## Copy a large file or tree faster today
+            ## Punch holes and zero ranges
 
-            Copy inside the database, as in the tutorial, while nothing is
-            writing to the source:
-
-            ```sql
-            BEGIN;
-            INSERT INTO entries (parent, name, kind, size)
-              SELECT parent, 'copy.bin', kind, size FROM entries WHERE parent = 'dir' AND name = 'orig.bin';
-            INSERT INTO blocks (parent, name, block_no, data)
-              SELECT parent, 'copy.bin', block_no, data FROM blocks WHERE parent = 'dir' AND name = 'orig.bin';
-            COMMIT;
+            ```bash
+            fallocate --punch-hole --offset OFFSET --length LENGTH FILE
+            fallocate --zero-range --offset OFFSET --length LENGTH FILE
+            fallocate --length LENGTH FILE        # extend the size; no preallocation
             ```
 
-            The new file appears on the mount once the attribute cache
-            expires (`--attr-ttl`, default 1 s).
+            `FALLOC_FL_COLLAPSE_RANGE` and `FALLOC_FL_INSERT_RANGE` reply
+            EOPNOTSUPP.
 
-            ## Preallocate or punch holes
-
-            Not available on a mount: `fallocate` fails with
-            `Operation not supported`. To make a file sparse, truncate it
-            and rewrite the parts you need, or extend it with
-            `truncate -s`, which never stores the new bytes.
-
-            ## Clone with `cp --reflink`
-
-            Not available: `cp --reflink=always` fails with
-            `Operation not supported`. Plain `cp` (or
-            `cp --reflink=auto`) works.
-
-            ## Search file contents in the database
-
-            Not available as a filesystem interface. For text files you
-            can query blocks directly:
+            ## See how much is shared
 
             ```sql
-            SELECT DISTINCT parent || '/' || name FROM blocks
-            WHERE position(convert_to('needle', 'UTF8') in data) > 0;
+            SELECT count(*) FILTER (WHERE shared) AS shared, count(*) AS blobs FROM pgfs.blobs;
+            SELECT gc_queue FROM pgfs.backlog();
             ```
 
-            This scans every block, and it misses matches that span a
-            block boundary.
+            Shared blobs are freed by the background collector once no map row
+            references them (`space.CollectsSharedBlobs`).
         """)
 
     def reference(self):
         return md(r"""
-            ## Requirement status
+            ## `copy_file_range`
 
-            | Requirement | Status | Behaviour on a mount today |
-            |---|---|---|
-            | `CopyFileRangeReq` | backend only (`Db` as `PgfsBackend`) | `copy_file_range` is not a FUSE callback in pgfs; the kernel falls back to read/write |
-            | `FallocatePunchHoleReq` | backend only | `fallocate` replies `EOPNOTSUPP` |
-            | `ReflinkBlockSharingReq` | planned | `cp --reflink=always` fails with `EOPNOTSUPP` |
-            | `CloneSubtreeReq` | planned | not available |
-            | `ContentSearchOffloadReq` | planned | not available |
-
-            ## Backend `copy_file_range`
-
-            `copy_file_range(ino_in, off_in, ino_out, off_out, len) -> u64`
-
-            | Case | Behaviour |
+            | Case | What happens |
             |---|---|
-            | `len == 0` | returns 0 |
-            | `off_in`, `off_out` and `len` all multiples of 131 072 | one `INSERT INTO blocks … SELECT … FROM blocks WHERE ino = ino_in` with `ON CONFLICT DO UPDATE`, then `UPDATE entries SET size = GREATEST(size, off_out + len), mtime = now()`; returns `len` |
-            | otherwise | block-by-block `read_block` / `write_block`; returns bytes copied; source blocks with no row are skipped |
+            | destination blocks fully covered, `off_in ≡ off_out (mod block size)` | the destination map rows point at the source's blobs, which are marked `shared` |
+            | partly covered head and tail blocks, or misaligned offsets | read, modify and written as new blobs by the daemon |
+            | holes in the source | holes in the destination |
+            | either file inline | the inline bytes move to block 0 when the copy crosses `inline_max` |
+            | ranges overlapping in one file | EINVAL |
+            | more than 4 096 blocks | one batch per call; the reply is the bytes copied |
 
-            The two statements of the aligned path are not wrapped in one
-            transaction.
+            Pending writes of both files are committed first, and the whole call
+            is one transaction (`pgfs.copy_range`).
 
-            ## Backend `fallocate`
+            ## `fallocate`
 
-            `fallocate(ino, offset, length, mode)`
-
-            | `mode` bits | Behaviour |
+            | Mode | Effect |
             |---|---|
-            | `FALLOC_FL_PUNCH_HOLE` (0x02) | `DELETE FROM blocks WHERE ino = $1 AND block_no BETWEEN first AND last`, covering every 128 KiB block the range touches, including partially covered ones |
-            | without `FALLOC_FL_KEEP_SIZE` (0x01) | `size = GREATEST(size, offset + length)`; no blocks are written |
-            | `FALLOC_FL_KEEP_SIZE` only | no change |
+            | `0` | `size = max(size, offset + length)`; nothing is reserved, so a later write can still fail with ENOSPC |
+            | `FALLOC_FL_KEEP_SIZE` | nothing |
+            | `FALLOC_FL_PUNCH_HOLE \| FALLOC_FL_KEEP_SIZE` | map rows inside the range removed (hole rows on a branch), edge blocks rewritten with the range zeroed |
+            | `FALLOC_FL_ZERO_RANGE` (± `KEEP_SIZE`) | as punch hole, and extends the size unless `KEEP_SIZE` |
+            | anything else | EOPNOTSUPP |
 
-            ## Block granularity
+            ## Content search
 
-            The backend implementation uses 131 072-byte blocks; the
-            running FUSE path uses 65 536-byte blocks (see
-            [Dual-Interface Architecture](dualinterfacearchitecture.md)).
+            Planned (`ContentSearchOffloadReq`).
         """)
 
     def explanation(self):
         return md(r"""
-            ## Moving work to where the data is
+            ## Why copies and holes run in the database
 
-            In a normal copy, a program reads a file into its own memory
-            and writes it back out. On pgfs, that means every byte travels
-            from PostgreSQL to the daemon, up to the program through the
-            kernel, back down through the kernel to the daemon, and into
-            PostgreSQL again: four copies to produce data the database
-            already has.
+            A FUSE copy normally reads every byte into the kernel, then into the
+            daemon, then into the database, and back out to write it. pgfs stores
+            file data as immutable blobs behind a block map, so a copy of whole
+            blocks is a set of new map rows pointing at the same blobs: no data
+            moves, and the copy costs a few rows per megabyte. This is a reflink
+            in all but name. `cp --reflink=always` itself cannot reach pgfs
+            because FUSE cannot pass `FICLONE` through, but `copy_file_range`
+            gets the same result.
 
-            Linux provides calls that describe intent instead of moving
-            bytes. `copy_file_range` means "make this range of that file
-            appear here". `fallocate` means "reserve this space" or "this
-            range is now empty". A filesystem that understands them can do
-            the work where the data lives. For pgfs that is the query
-            engine: a copy becomes one `INSERT … SELECT` over block rows,
-            and punching a hole becomes one `DELETE`.
+            Sharing has a cost: a blob with two references can no longer be freed
+            when one of them goes. Shared blobs are marked once and collected in
+            the background after a reference check, so the common path (files
+            never copied) still frees space at once.
 
-            ## The roadmap
-
-            The same idea extends further. With reference-counted blocks,
-            a reflink copy (`cp --reflink`) would copy only references,
-            and blocks would be duplicated lazily on the first write.
-            Cloning a whole directory tree could be one transaction of
-            set-based inserts. Content search could use PostgreSQL's
-            trigram indexes instead of reading every file through FUSE.
-            Each of these is specified as a requirement; none is built
-            yet.
-
-            ## Why it is not wired in yet
-
-            The offloading code is written against the inode-keyed
-            storage interface, the future of pgfs storage. The mount still
-            runs on the path-keyed layout. Exposing the callbacks before
-            the FUSE layer moves to the new interface would mean
-            implementing them twice, against two schemas and two block
-            sizes. The [Dual-Interface Architecture](dualinterfacearchitecture.md)
-            page describes that migration.
-
-            ## Correctness before speed
-
-            Offloaded operations must be indistinguishable from the slow
-            path: same bytes, same sizes, same holes. That is why the
-            backend falls back to block-by-block copying whenever ranges
-            are not block-aligned. A fast path that changed results would
-            be worse than no fast path.
+            A hole is the absence of a map row, so punching one is deleting rows,
+            and zeroing a range is the same plus rewriting the partly covered
+            edges.
         """)

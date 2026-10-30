@@ -1,7 +1,7 @@
 # Tutorial: Directory Trees
 
 !!! success "Status: Stable"
-    `mkdir`, `rmdir`, `readdir` and nested paths of any depth are implemented and covered by `test_dirs.sh`. Directory timestamps are not tracked.
+    `mkdir`, `rmdir`, `readdir` and `readdirplus` keep link counts and directory times, page by name with keyset cookies, and check emptiness in the same transaction as the delete. Covered by `tests/storage.rs`, the model-conformance suite and `test_dirs.sh`.
 
 > Users can create nested directories, list their contents, and remove empty directories through standard POSIX directory operations.
 
@@ -9,14 +9,8 @@
 
 ---
 
-In this tutorial we will build a small directory tree, walk it
-with standard tools, see how it is stored, and take it apart
-again. We will also meet the one rule directories enforce:
-they must be empty before they can be removed.
-
-We need a running mount; see [Your first pgfs
-mount](projectlocalenvironment.md) if `./scripts/pgfs.sh
-status` does not say `mount: active`.
+In this tutorial we will build a small project tree, list it, and see
+how directories are stored. We need a mount.
 
 ## Step 1: build a tree
 
@@ -24,94 +18,32 @@ status` does not say `mount: active`.
 cd testdata/mnt
 mkdir -p project/src/util project/docs
 touch project/src/main.rs project/src/util/strings.rs project/docs/README.md
-```
-
-## Step 2: walk it
-
-```bash
-find project | sort
-```
-
-```text
-project
-project/docs
-project/docs/README.md
-project/src
-project/src/main.rs
-project/src/util
-project/src/util/strings.rs
-```
-
-```bash
 ls -la project/src
 ```
 
-The listing starts with the `.` and `..` entries, followed by
-`main.rs` and `util`.
+## Step 2: see the link counts
+
+```bash
+stat -c '%n %h' project project/src
+```
+
+A directory's link count is 2 plus its subdirectories.
 
 ## Step 3: see how the tree is stored
 
-From the repository root, in a second terminal:
-
 ```bash
-psql -h "$PWD/testdata" -d pgfs -c \
-  "SELECT parent, name, kind FROM entries
-   WHERE parent = 'project' OR starts_with(parent, 'project/')
-      OR (parent = '' AND name = 'project')
-   ORDER BY parent, name"
+psql -h "$OLDPWD/testdata" -d pgfs -c \
+  "SELECT path, kind FROM pgfs.files WHERE tree = 'main' AND path LIKE '/project%' ORDER BY path"
 ```
 
-```text
-      parent       |    name    | kind
--------------------+------------+------
-                   | project    | dir
- project           | docs       | dir
- project           | src        | dir
- project/docs      | README.md  | file
- project/src       | main.rs    | file
- project/src       | util       | dir
- project/src/util  | strings.rs | file
-```
+Each name is a `dentries` row `(parent_ino, name) -> ino`; no row
+stores a path.
 
-Every row names the directory it lives in. `project` itself
-lives at the top of the mount, where `parent` is empty.
-
-## Step 4: try to remove a directory that is not empty
-
-```bash
-rmdir project/src
-```
-
-```text
-rmdir: failed to remove 'project/src': Directory not empty
-```
-
-## Step 5: take the tree apart
-
-Empty the directory from the bottom up, and `rmdir` succeeds:
-
-```bash
-rm project/src/util/strings.rs
-rmdir project/src/util
-rm project/src/main.rs
-rmdir project/src
-```
-
-Remove the rest in one go:
+## Step 4: remove it
 
 ```bash
 rm -r project
-ls
 ```
-
-`project` no longer appears.
-
-## What we did
-
-We created nested directories, listed them, saw that each
-entry stores the path of its containing directory, and learned
-that `rmdir` only removes empty directories. Next, [Atomic
-Rename](atomicrename.md) moves whole trees in one step.
 
 ---
 

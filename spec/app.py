@@ -3,146 +3,534 @@ pgfs requirements — granular, single-responsibility, testable.
 
 Each class specifies one capability of the PostgreSQL-backed FUSE
 filesystem. Every Requirement and Feature inherits the Rust-idiomatic
-error-handling (err.py) and observability (observe.py) contexts.
+error-handling and specification contract contexts (err.py); the
+observability and profiling contexts live in observe.py.
 """
 
-from .err import STABLE, Feat, Req, md
+from .err import STABLE, PARTIAL, Feat, Req, md
+from .concurrency import (
+    LockOrder,
+    RenameSerialisationPoint,
+)
+from .consistency import (
+    BoundedTransactions,
+    DrainsBuffersBeforeExternalising,
+    ExclusiveTreeLease,
+    KernelCacheContract,
+    OneOperationOneTransaction,
+)
+from .durability import (
+    ChecksServerDurability,
+    FlushesBeforeNaming,
+    FlushesOnShutdown,
+    FsyncIsDurable,
+    SyncHandles,
+)
+from .integrity import (
+    BlobChecksums,
+)
+from .ops import (
+    RefusesUnformattedDatabase,
+    SupportedPostgresVersions,
+)
+from .optimize import (
+    BufferedWriteFlushReq,
+)
+from .posix import (
+    ErrnoCatalogue,
+    ExclusiveCreate,
+    LinkCounts,
+    OpenAfterUnlink,
+    RenameFlags,
+    SetsAttributes,
+)
+from .security import (
+    EnforcesPermissions,
+    OwnershipFromCaller,
+    RedactsSecrets,
+)
+from .space import (
+    FreesUnsharedBlobsInline,
+)
+from .storage import (
+    BlockMap,
+    DentryTable,
+    ForgetsInodes,
+    ImmutableBlobs,
+    InlinesSmallFiles,
+    PersistentInodes,
+)
+from .verify import (
+    CheckAfterEveryTest,
+)
+from .failure import (
+    BoundsEveryWait,
+    DatabaseStateMachine,
+    HonoursInterrupt,
+    IdempotentMutations,
+    InFlightAgeWatchdog,
+    MapsDatabaseErrors,
+    PreservesBuffersAcrossReconnect,
+    ReconnectsWithBackoff,
+    RetriesSerializationFailures,
+    RevalidatesAfterReconnect,
+    SlowDatabaseSignal,
+)
 
 
 class ConnectsToPostgres(Req):
-    """The daemon connects to a Postgres database via a libpq connection
-    string. On first connect it creates the `entries` table (ino, parent_ino,
-    parent, name, kind, size, mode, uid, gid, atime, mtime, ctime) and
-    `blocks` table (ino, parent, name, block_no, data) if they do not
-    already exist. Connection failure produces a full error story
-    including the connection string and the root cause."""
-    pass
+    """The daemon connects to Postgres with a libpq connection string
+    from `--conn` or `PGFS_CONN`, with the timeouts and keepalives of
+    `failure.BoundsEveryWait`, and requires session-mode connections
+    (`failure.RevalidatesAfterReconnect`). Before mounting, in one round
+    trip, it checks:
+
+    - the server version (`ops.SupportedPostgresVersions`);
+    - the server's durability settings
+      (`durability.ChecksServerDurability`);
+    - the schema version (`storage.SchemaVersion`).
+
+    It never creates or alters tables (`ops.RefusesUnformattedDatabase`;
+    on a scratch filesystem whose unlogged tables were wiped by a crash,
+    it calls `pgfs.scratch_reset()`, `durability.ScratchMode`). Then it
+    registers its mount session or acquires the tree's lease
+    (`consistency.ExclusiveTreeLease`).
+
+    **Errors.** A connection failure exits with status 2 and a full
+    error chain: the operation, the host and database, and the root
+    cause. The connection string is redacted (`security.RedactsSecrets`).
+
+    The schema is `storage.StorageLayout`. The first schema, the
+    path-keyed `entries` and `blocks` tables created implicitly at
+    mount, is retired.
+    """
+
+    deps = [
+        RefusesUnformattedDatabase,
+        SupportedPostgresVersions,
+        ChecksServerDurability,
+        ExclusiveTreeLease,
+        BoundsEveryWait,
+        RedactsSecrets,
+    ]
 
 
 class CreatesFiles(Req):
-    """A FUSE `create` (O_CREAT) inserts a row with kind='file', empty
-    data, size=0, and the current timestamp. If the entry already exists
-    the kernel receives EEXIST. The reply includes a valid inode and
-    file attributes with 0644 permissions."""
-    pass
+    """A FUSE `create` (or `mknod` of a regular file) calls
+    `pgfs.create`, which in one transaction following
+    `concurrency.LockOrder`:
+
+    - allocates the new `ino` and a 63-bit random `gen`
+      (`storage.PersistentInodes`), locks the parent directory's inode
+      row, and updates the parent's mtime and ctime;
+    - inserts the new inode (`shadows_base = false`), with the caller's
+      owner (`security.OwnershipFromCaller`) and the requested mode
+      after umask;
+    - inserts the dentry with `INSERT … ON CONFLICT DO NOTHING
+      RETURNING` (or replaces an existing whiteout with
+      `shadows_base = true`, `branch.EpochVersionedRows`);
+    - records the change (`changefeed.RecordsChanges`).
+
+    The reply carries the new inode's attributes (`ino` and `gen`) and a
+    handle.
+
+    **Postcondition.** The name resolves to a new empty regular file
+    whose `(ino, gen)` has never been used.
+
+    **Crash.** The name, the inode and the parent's times appear
+    together or not at all.
+
+    **Concurrency.** The unique index decides EEXIST inside the
+    statement, with no prior existence read (Lockify r41,
+    `posix.ExclusiveCreate`).
+
+    **Errors.** EEXIST if the name exists. ENOENT if the parent was
+    removed. ENOTDIR if the parent is not a directory. ENAMETOOLONG or
+    EINVAL for a bad name (`storage.ByteExactNames`). ENOSPC at capacity.
+    EROFS on a snapshot.
+
+    **Bounds.** One round trip. Two rows inserted and one updated.
+    """
+
+    deps = [PersistentInodes, OneOperationOneTransaction, ExclusiveCreate, OwnershipFromCaller]
 
 
 class ReadsFiles(Req):
-    """A FUSE `read` on a regular-file inode returns the byte range
-    from the file's stored block chunks. Offset and size are clamped to
-    the stored file length. Missing inodes reply ENOENT."""
-    pass
+    """A FUSE `read` returns bytes `[offset, min(offset + size,
+    file size))` of a regular file. It first merges the inode's pending
+    write buffer over the committed content
+    (`consistency.DrainsBuffersBeforeExternalising`). It reads inline
+    data, or the blobs mapped to the touched blocks, resolving layers on
+    a branch (`branch.LayeredLookup`), and verifies every blob's
+    checksum (`integrity.BlobChecksums`).
+
+    **Postcondition.** Every byte returned is the last byte written at
+    that offset, through any handle on the mount, or zero for a hole.
+    A read at or past the end returns no bytes.
+
+    **Errors.** EISDIR for a directory. EIO for a checksum mismatch.
+    ESTALE if the inode was deleted or its `gen` does not match the
+    handle (`storage.PersistentInodes`). ENOENT never: the kernel holds
+    a reference to the inode.
+
+    **Bounds.** One round trip, fetching only the touched blocks.
+
+    Replica reads of file data follow `replica.LsnTicketReads`.
+    """
+
+    deps = [BlockMap, InlinesSmallFiles, DrainsBuffersBeforeExternalising, BlobChecksums]
 
 
 class WritesFiles(Req):
-    """A FUSE `write` updates touched block chunks or buffers dirty blocks
-    per open file handle, persisting them to PostgreSQL. The write extends
-    the file if the offset+length exceeds the current size."""
-    pass
+    """A FUSE `write` places `data` at `offset` in a regular file. Small
+    or unaligned writes go to the inode's write buffer
+    (`BufferedWriteFlushReq`). Writes on `O_SYNC`, `O_DSYNC` or
+    `O_DIRECT` handles commit at once (`durability.SyncHandles`).
+    Committing a block that is only partly covered by new data reads the
+    current block, overlays the new bytes, and stores the result as a
+    new blob (`storage.ImmutableBlobs`). A block that did not exist
+    starts as zeros.
+
+    **Postcondition.** For every byte `b` outside
+    `[offset, offset + len)`, `content′(b) = content(b)`. The written
+    range holds `data`. `size′ = max(size, offset + len)`, and bytes in
+    any gap between the old size and `offset` read as zero
+    (`posix.SparseFiles`). mtime and ctime are set (`posix.Timestamps`),
+    and set-id bits are cleared as `security.ClearsSetIdBits` requires.
+
+    **Durability.** None at reply. See `durability.DurabilityPoints`. A
+    successful `write()` does not mean the data is in the database, and
+    a daemon crash loses acknowledged writes that were not yet
+    committed.
+
+    **Errors.** EBADF for a read-only handle (from the kernel). EFBIG
+    past the maximum size. ENOSPC at capacity. EROFS on a snapshot. EIO
+    when a needed buffer commit fails.
+
+    The first postcondition is the clause whose absence let Bug 1 ship:
+    a buffered partial-block write zeroed the bytes it did not touch.
+    """
+
+    deps = [BufferedWriteFlushReq, ImmutableBlobs, SyncHandles]
 
 
 class UnlinksFiles(Req):
-    """A FUSE `unlink` deletes the row and removes the inode from the
-    in-memory path map."""
-    pass
+    """A FUSE `unlink` calls `pgfs.unlink`, which in one transaction
+    following the discover-sort-lock-revalidate protocol of
+    `concurrency.LockOrder`:
+
+    - discovers `child_ino`, locks `parent_ino` and `child_ino` in
+      ascending `ino` order, and updates the parent's mtime and ctime;
+    - decrements the child inode's `nlink` (in a subtree branch, drops
+      `nlink` to 0 if no remaining live dentry is reachable from
+      `trees.root_ino`, `branch.ViewsRootedAtDirectory`);
+    - removes the dentry, or writes a whiteout when `shadows_base = true`
+      (`branch.CopiesUpOnWrite`);
+    - records the change.
+
+    If `nlink` reaches 0, the inode is deleted (or kept as an inode
+    whiteout with `nlink = 0, size = 0, inherit_limit = 0,
+    inline_data = NULL, shadows_base = true` when `shadows_base = true`,
+    `branch.CopiesUpOnWrite`) together with its block map and xattrs in
+    the layer and unshared blobs (`space.FreesUnsharedBlobsInline`),
+    unless a handle is open, in which case it becomes an orphan
+    (`posix.OpenAfterUnlink`). Pending writes of the file are committed
+    first (`durability.FlushesBeforeNaming`, verified against the
+    mount's dirty-inode set via `concurrency.InodeShardedWorkers`).
+
+    **Postcondition.** The name no longer resolves. Other names of the
+    inode, and open handles, are unaffected.
+
+    **Crash.** All or nothing.
+
+    **Errors.** ENOENT if the name does not exist. EISDIR for a
+    directory. EROFS on a snapshot.
+
+    **Bounds.** Constant work in the transaction. The blocks of a file
+    larger than one batch go to the reclaimer
+    (`consistency.BoundedTransactions`).
+    """
+
+    deps = [OpenAfterUnlink, FreesUnsharedBlobsInline, FlushesBeforeNaming]
 
 
 class CreatesDirectories(Req):
-    """A FUSE `mkdir` inserts a row with kind='dir'. If the entry exists
-    the kernel receives EEXIST. The reply includes a directory inode
-    with 0755 permissions and nlink=2."""
-    pass
+    """A FUSE `mkdir` calls `pgfs.mkdir`, which in one transaction
+    following `concurrency.LockOrder`:
+
+    - allocates the new `ino` and a 63-bit random `gen`
+      (`storage.PersistentInodes`), locks the parent directory's inode
+      row, increments the parent's `nlink`, and updates the parent's
+      mtime and ctime;
+    - inserts a directory inode (`shadows_base = false`), with the
+      requested mode after umask and the caller's owner (set-group-id
+      inherited, `security.OwnershipFromCaller`);
+    - inserts its dentry, with `ON CONFLICT DO NOTHING` (or replaces an
+      existing whiteout with `shadows_base = true`,
+      `branch.EpochVersionedRows`);
+    - records the change.
+
+    **Postcondition.** The name resolves to an empty directory with
+    `nlink = 2`, and the parent's `nlink` grew by one (`posix.LinkCounts`).
+
+    **Crash.** All or nothing.
+
+    **Errors.** EEXIST, ENOENT, ENOTDIR, ENAMETOOLONG, EINVAL, ENOSPC,
+    EROFS, as for `CreatesFiles`.
+    """
+
+    deps = [PersistentInodes, LinkCounts]
 
 
 class RemovesDirectories(Req):
-    """A FUSE `rmdir` deletes the directory row only if the directory is
-    empty (no child rows with matching parent path). If children exist
-    the kernel receives ENOTEMPTY. If the entry does not exist the
-    kernel receives ENOENT."""
-    pass
+    """A FUSE `rmdir` calls `pgfs.rmdir`. In one transaction following
+    the discover-sort-lock-revalidate protocol of
+    `concurrency.LockOrder`, it discovers the directory's `ino`, locks
+    `parent_ino` and the directory's `ino` in ascending `ino` order,
+    checks that no live dentry names the directory as its parent, and
+    then:
+
+    - decrements the parent's `nlink` and updates the parent's mtime
+      and ctime;
+    - deletes or retires any child dentry whiteouts under the directory
+      in this layer so no live child row remains under a whited-out
+      directory (`storage.DentryTable`);
+    - deletes the directory's inode (or turns it into an inode whiteout
+      when `shadows_base = true`, `branch.CopiesUpOnWrite`);
+    - removes the directory's dentry, or writes a whiteout when
+      `shadows_base = true`;
+    - records the change.
+
+    On a branch, the emptiness check sees the merged view, so a
+    directory whose inherited entries are all whited out is empty.
+
+    **Concurrency.** A create in the directory locks the same inode row
+    (`concurrency.LockOrder`), so no create can land between the check
+    and the delete.
+
+    **Crash.** All or nothing.
+
+    **Errors.** ENOTEMPTY if any entry remains. ENOENT if absent.
+    ENOTDIR if not a directory. EBUSY for the root of a view. EROFS on a
+    snapshot.
+    """
+
+    deps = [LockOrder, LinkCounts]
 
 
 class ListsDirectories(Req):
-    """A FUSE `readdir` returns '.' and '..' followed by every child of
-    the directory inode, each with the correct inode number and file
-    type. Offsets are synthetic (1-based index); the reply stops when
-    the kernel's buffer is full and resumes on the next call."""
-    pass
+    """A FUSE `readdir` or `readdirplus` returns `.` and `..` and then
+    the directory's entries in byte order of name. Each entry has its
+    inode number and type, and readdirplus also returns attributes. The
+    offset of each entry is a cookie that the directory handle maps to
+    the entry's name (a 64-bit offset cannot hold a 255-byte name). The
+    next call resumes with `name > cookie`, using keyset pagination over
+    the `(layer, parent_ino, name)` index. On a branch, the merged view of
+    `branch.LayeredLookup` is paginated the same way.
+
+    **Postcondition.** Every entry that exists for the whole listing is
+    returned exactly once. An entry created or removed during the
+    listing may or may not appear, never twice.
+
+    **Bounds.** Each call costs one indexed range scan of at most the
+    number of entries that fit the kernel's buffer. Listing a directory
+    of `n` entries is O(n) in total.
+
+    **Sources.** ScaleCheck r57, HMFS r131, TableFS r07. The first
+    implementation re-ran the full listing on every call and indexed
+    into it, which is O(n²) and skips or repeats entries under
+    concurrent change.
+    """
+
+    deps = [DentryTable]
 
 
 class LooksUpEntries(Req):
-    """A FUSE `lookup` on a (parent inode, name) pair returns the
-    entry's inode and attributes, or ENOENT if absent. Lookup allocates
-    a stable inode number for the entry's full path."""
-    pass
+    """A FUSE `lookup` of `(parent ino, name)` returns the child's
+    persistent inode number (`ino`), generation (`inodes.gen`,
+    `storage.PersistentInodes`) and attributes, and increments the
+    kernel lookup count that `forget` later decrements
+    (`storage.ForgetsInodes`). A miss replies ENOENT with an entry TTL,
+    so the kernel caches the negative result
+    (`consistency.KernelCacheContract`).
+
+    **Postcondition.** The same name resolves to the same `(ino, gen)`
+    across lookups, restarts and remounts, until it is unlinked or
+    renamed.
+
+    **Bounds.** One index probe per layer of the view, in one round
+    trip, or none on a daemon cache hit.
+    """
+
+    deps = [PersistentInodes, ForgetsInodes, KernelCacheContract]
 
 
 class ReportsAttributes(Req):
-    """A FUSE `getattr` returns size, kind, permissions, timestamps,
-    and nlink for any inode. The root inode (ino=1) is always a
-    directory."""
-    pass
+    """A FUSE `getattr` returns kind, mode, nlink, uid, gid, rdev, size,
+    `blocks` (512-byte units of stored data, holes excluded), `blksize`
+    (the block size), and atime, mtime, ctime and birth time in
+    nanoseconds. Size and mtime include writes still buffered on the
+    mount (`consistency.DrainsBuffersBeforeExternalising`). The reply's
+    TTL follows `consistency.KernelCacheContract`. Inode 1 is the root
+    directory of the mounted view.
+
+    **Postcondition.** The values reflect every operation that replied
+    before the request.
+    """
+
+    deps = [DrainsBuffersBeforeExternalising, KernelCacheContract]
 
 
 class TruncatesFiles(Req):
-    """A FUSE `setattr` with a size parameter truncates or extends a
-    regular file to the given size (zero-filled extension, deleting
-    trailing block chunks in PostgreSQL). Size changes on directories
-    reply EISDIR."""
-    pass
+    """A FUSE `setattr` with a size truncates or extends a regular file.
+    Pending buffered writes in the inode's write buffer past the new
+    size are discarded first, so that no later flush brings them back,
+    and any remaining buffered writes below the new size are committed
+    (`durability.FlushesBeforeNaming`). Then, in one transaction, it:
+
+    - sets `size`, and on a downward truncate in a branch lowers
+      `inherit_limit` to `min(inherit_limit, floor(new / block_size))`
+      (`branch.CopiesUpOnWrite`);
+    - for an inline file (`storage.InlinesSmallFiles`), slices or
+      zero-pads `inline_data` in place when `new ≤ inline_max`, or moves
+      `inline_data` into block 0 and clears `inline_data` when `new >
+      inline_max`;
+    - deletes or retires map rows in the layer at or past the new end;
+    - stores a new blob with its tail zeroed when the new end falls
+      inside a block (copying up from the base layer if inherited);
+    - sets mtime and ctime, clears set-id bits
+      (`security.ClearsSetIdBits`), and records the change
+      (`changefeed.RecordsChanges`).
+
+    Extending past `inline_max` creates a hole.
+
+    **Postcondition.** Bytes in `[0, min(old, new))` are unchanged. Bytes
+    in `[min(old, new), new)` read as zero, including after any later
+    extension.
+
+    **Crash.** All or nothing. A truncate larger than one batch commits
+    the new size and hands the remaining map rows to the reclaimer,
+    which cannot expose them, because they lie past the size
+    (`consistency.BoundedTransactions`).
+
+    **Errors.** EISDIR for a directory. EFBIG past the maximum size.
+    EROFS on a snapshot.
+    """
+
+    deps = [BlockMap, BoundedTransactions]
 
 
 class RenamesEntries(Req):
-    """A FUSE `rename` moves an entry from one (parent, name) to
-    another. It follows POSIX semantics:
+    """A FUSE `rename` calls `pgfs.rename`, which moves one dentry from
+    `(old parent, old name)` to `(new parent, new name)`. It follows
+    POSIX semantics:
 
-    - If the target exists and is a file, it is atomically replaced.
-    - If the target exists and is an empty directory, it is atomically
-      replaced.
-    - If the target is a non-empty directory, the kernel receives
-      ENOTEMPTY.
-    - If source is a file and target is a directory, the kernel receives
-      EISDIR.
-    - If source is a directory and target is a file, the kernel receives
-      ENOTDIR.
-    - Renaming a directory cascades: every descendant's `parent` path
-      is rewritten in the same database transaction.
-    - The in-memory inode<->path maps are re-keyed for the entire
-      subtree."""
-    pass
+    - If the target exists and is a non-directory, it is replaced
+      atomically. Its `nlink` drops, and it is deleted or orphaned as in
+      `UnlinksFiles`.
+    - If the target is an empty directory, it is replaced atomically.
+    - If the target is a non-empty directory, it replies ENOTEMPTY.
+    - If the source is a non-directory and the target a directory, it
+      replies EISDIR.
+    - If the source is a directory and the target a non-directory, it
+      replies ENOTDIR.
+    - A directory keeps its inode and its descendants. Only its dentry
+      row moves (preserving `shadows_base` on the old and new keys,
+      `branch.EpochVersionedRows`), and the parents' `nlink`, mtime and
+      ctime change. The renamed inode's ctime is set, and the change is
+      recorded (`changefeed.RecordsChanges`).
+
+    **Invariant.** Exactly one dentry changes, plus at most one replaced
+    target. No other row is touched, and no name matching of any kind is
+    involved. This is what makes Bug 2 impossible: the old rename
+    matched descendants with `LIKE`, so `_` and `%` acted as wildcards.
+
+    **Crash.** All or nothing: after a crash, the source name or the
+    target name resolves to the inode, never both and never neither.
+
+    **Concurrency.** Pending writes of the source and of a replaced
+    target are committed first (`durability.FlushesBeforeNaming`,
+    verified against the mount's dirty-inode set via
+    `concurrency.InodeShardedWorkers`). That is Bug 3: rename lost
+    buffered writes. A directory moving to a different parent takes the
+    rename lock (`concurrency.RenameSerialisationPoint`). Rows lock in
+    the order of `concurrency.LockOrder`.
+
+    **Errors.** ENOENT if the source is missing. EXDEV across trees.
+    EROFS on a snapshot. EBUSY for the root of a view.
+
+    **Bounds.** Constant work, whatever the size of the subtree (Oracle
+    FSS r91, InfiniFS r16).
+    """
+
+    deps = [RenameSerialisationPoint, FlushesBeforeNaming]
 
 
 class RejectsInvalidRenames(Req):
-    """A FUSE `rename` with non-zero flags replies EINVAL. Renaming a
-    directory into one of its own descendants replies EINVAL. Renaming
-    an entry onto itself is a no-op."""
-    pass
+    """`rename` validates before it changes anything:
+
+    - moving a directory into itself or one of its descendants replies
+      EINVAL, checked under the rename lock;
+    - renaming a name onto a name of the same inode succeeds and does
+      nothing, as POSIX requires;
+    - `RENAME_NOREPLACE` and `RENAME_EXCHANGE` are supported
+      (`posix.RenameFlags`);
+    - `RENAME_WHITEOUT` and unknown flags reply EINVAL;
+    - `.` and `..` as either name reply EINVAL (the kernel also checks).
+    """
+
+    deps = [RenamesEntries, RenameFlags]
 
 
 class MountsCleanly(Req):
-    """The daemon mounts a FUSE filesystem at the given mountpoint using
-    AutoUnmount so the kernel removes the mount if the process exits
-    for any reason. The mountpoint must be an existing, empty directory
-    not already mounted."""
-    pass
+    """`pgfs mount VIEW MOUNTPOINT` mounts with `AutoUnmount`, so the
+    kernel removes the mount if the process exits for any reason. It
+    also sets `default_permissions` (`security.EnforcesPermissions`) and
+    names the mount `pgfs-<first 8 hex digits of fs_uuid>` in
+    `/proc/mounts`; FUSE's statfs reply has no field for a filesystem
+    id. If `AutoUnmount` is refused,
+    for example when `/etc/fuse.conf` lacks `user_allow_other`, the
+    daemon mounts without it and logs a WARN saying a crashed daemon
+    will leave a stale mount.
+
+    The mountpoint must be an existing, empty directory that is not
+    already mounted. The mount session or tree lease is registered in
+    `mounts` (`consistency.ExclusiveTreeLease`) before the mount
+    appears, and released only after the unmount, so no other mount can
+    write the tree while this mount's kernel caches still exist.
+
+    **Errors.** EBUSY if the tree is mounted read-write elsewhere. The
+    error names the holder.
+    """
+
+    deps = [ExclusiveTreeLease, EnforcesPermissions]
 
 
 class HandlesShutdownSignals(Req):
-    """SIGINT, SIGTERM, and SIGHUP trigger a clean unmount via
-    `session.unmount()`. If the clean unmount fails, AutoUnmount
-    guarantees the kernel still removes the mount. Signal handling
-    uses a dedicated `sigwait` thread so it never blocks FUSE
-    dispatch."""
-    pass
+    """SIGINT, SIGTERM and SIGHUP start a clean shutdown on a dedicated
+    `sigwait` thread, which never blocks dispatch. The shutdown commits
+    every buffer and runs `pgfs.sync_barrier` so every earlier
+    asynchronous commit is flushed to WAL (`durability.FlushesOnShutdown`),
+    calls `session.unmount()`, and then releases the mount session or
+    lease synchronously (`synchronous_commit = on`, `MountsCleanly`). If
+    the unmount fails, the lease is not released: `AutoUnmount` removes
+    the mount when the process exits, and the lease expires on its own.
+    """
+
+    deps = [FlushesOnShutdown]
 
 
 class DistinguishesExpectedErrors(Req):
-    """Expected conditions (ENOENT, EEXIST, ENOTEMPTY, EISDIR, ENOTDIR,
-    EINVAL) are replied directly to the kernel without logging.
-    Unexpected failures (database errors, invariant violations) are
-    logged in full via `log_and_reply!` with the complete error chain
-    and replied as EIO."""
-    pass
+    """Expected conditions reply their errno to the kernel and are logged
+    at DEBUG at most. These are the errnos in `posix.ErrnoCatalogue`
+    other than EIO. Unexpected failures are logged in full through
+    `log_and_reply!`: database errors that map to EIO, checksum
+    failures, invariant violations and fencing. Database errors are
+    classified by SQLSTATE in one table (`failure.MapsDatabaseErrors`),
+    never by matching message text.
+    """
+
+    deps = [ErrnoCatalogue, MapsDatabaseErrors]
 
 
 class ReportsCrashes(Req):
@@ -151,7 +539,6 @@ class ReportsCrashes(Req):
     file:line location, a symbolized backtrace, and OS/Rust metadata.
     In release builds, `panic = \"abort\"` prevents a broken daemon from
     lingering."""
-    pass
 
 
 class UsesStructuredTracing(Req):
@@ -160,46 +547,73 @@ class UsesStructuredTracing(Req):
     initialized before any other work. `RUST_LOG` controls filter levels
     with the same syntax as `env_logger`; `RUST_LOG_FORMAT=json` switches
     to machine-parseable JSON output."""
-    pass
 
 
 class InstrumentsFuseCallbacks(Req):
-    """Every `Filesystem` callback (`lookup`, `getattr`, `read`, `write`,
-    `create`, `mkdir`, `unlink`, `rmdir`, `rename`, `readdir`, `setattr`,
-    `open`, `flush`, `fsync`, `copy_file_range`, `fallocate`) opens a
-    `tracing::info_span!` recording `ino` and `name` (where applicable).
-    The span is entered for the duration of the callback so nested DB
-    operations are automatically attributed."""
-    pass
+    """Every `Filesystem` callback the daemon implements opens a
+    `tracing::info_span!` recording `ino`, `name` where there is one,
+    the worker, and the view. The span is entered for the duration of
+    the callback, so nested database operations are attributed to it.
+    The callbacks are those listed in `posix.PosixCompatibility`, plus
+    `init`, `destroy`, `forget`, `batch_forget`, `statfs`, `interrupt`
+    and the open and release calls. The list is checked by a test
+    against the `Filesystem` impl, so it cannot drift from the code.
+    """
 
 
 class InstrumentsDbOperations(Req):
-    """Every `Db` method (`getattr`, `read`, `write`, `create`, `mkdir`,
-    `unlink`, `rmdir`, `rename`, `list`) opens a `tracing::debug_span!`
-    recording the (parent, name) key. The span is entered for the
-    duration of the database round-trip."""
-    pass
+    """Every database call opens a `tracing::debug_span!` recording the
+    `pgfs` function or prepared statement name, the `ino` it concerns,
+    the backend pid, and the round-trip time. A slow span can therefore
+    be matched to its row in `pg_stat_activity` (Fail-Slow at Scale
+    r122).
+    """
 
 
 class SupportsGitInit(Req):
-    """Running `git init` inside the mounted filesystem succeeds without
-    errors. This exercises the full rename-overwrite path: git creates
-    `.git/config`, then uses lock+rename to set config values, which
-    triggers rename-overwrite with POSIX semantics."""
-    pass
+    """Git works on a mount, as a regression workload for the POSIX
+    details it depends on. On a mounted tree, `git init`, `git clone`
+    of a pinned repository, `git status`, `git commit`, `git gc` and
+    `git checkout` of another branch all succeed, and `git fsck` passes.
+    This exercises:
+
+    - rename-over for lockfiles;
+    - `O_EXCL` creates of `*.lock` (`posix.ExclusiveCreate`);
+    - `chmod +x` on hooks (`posix.SetsAttributes`);
+    - `fsync` of objects and refs under `core.fsync`
+      (`durability.FsyncIsDurable`);
+    - hard links and open-after-unlink during `gc`.
+
+    The same workload is a benchmark (`perf.BenchmarkSuite`).
+
+    **Sources.** Bento r53 (git through FUSE as the yardstick), ALICE
+    r118.
+    """
+
+    deps = [RenamesEntries, SetsAttributes, ExclusiveCreate, FsyncIsDurable]
 
 
 # ── Development environment ──────────────────────────────────────────
 
 class ProvidesProjectLocalCluster(Req):
     """`scripts/init_db.sh` creates a PostgreSQL cluster at
-    `testdata/pgdata` (`initdb --auth=trust --no-locale --encoding=UTF8`)
-    and starts it with its Unix socket in `testdata/` and a TCP listener on
-    127.0.0.1 only. It ensures a superuser role named after the invoking OS
-    user and a database named `pgfs` exist, and prints the connection
-    string. `scripts/ensure_db.sh` is the idempotent wrapper used by
-    `make test`: it exits immediately when the cluster already answers.
-    Nothing is written outside the project's `testdata/` directory."""
+    `testdata/pgdata`, with
+    `initdb --auth=trust --no-locale --encoding=UTF8 --data-checksums`.
+    It starts the cluster with its Unix socket in `testdata/` and a TCP
+    listener on 127.0.0.1 only, and checks that `fsync` and
+    `full_page_writes` are on. It ensures that a superuser role named
+    after the invoking OS user and a database named `pgfs` exist, runs
+    `pgfs mkfs` if the database is unformatted, and prints the
+    connection string.
+
+    `scripts/ensure_db.sh` is the idempotent wrapper used by
+    `make test`: it exits at once when the cluster already answers.
+    `init_db.sh --lazyfs` puts the data directory on LazyFS, so that
+    crash conformance can run locally (`verify.CrashConformance`).
+    Nothing is written outside the project's `testdata/` directory.
+
+    **Sources.** LazyFS r135, protocol-aware recovery r94.
+    """
 
 
 class ProvidesLifecycleScript(Req):
@@ -220,29 +634,58 @@ class RunsIntegrationSuite(Req):
     isolation under a 300 s timeout, writing each test's output to
     `testdata/<test>.log`. After every test it kills any leftover daemon
     and lazily unmounts `testdata/mnt` so the next test starts clean. It
-    prints PASS/FAIL per test and exits non-zero if any test failed."""
+    then runs `pgfs check`, and a violation fails the test
+    (`verify.CheckAfterEveryTest`). It prints PASS or FAIL per test and
+    exits non-zero if any test failed. This shell layer is the base. The
+    model, crash and fault suites in `verify.py` find the bug classes it
+    cannot."""
+
+    deps = [CheckAfterEveryTest]
 
 
 # ── Observability requirements ───────────────────────────────────────
 
 class ExportsPeriodicMetrics(Req):
-    """A background thread logs five INFO lines every 60 s:
+    """A background thread logs nine INFO lines every 60 s:
     `metrics|ops|…` (per-callback counters), `metrics|errors|…` (EIO and
-    per-errno counters), `metrics|replica|reads=… fallbacks=…`,
-    `metrics|latency|fuse=…` and `metrics|latency|db=…`. Counters are
+    per-errno counters),
+    `metrics|replica|reads=… fallbacks=… lag_bytes=… lag_ms=… ticket_waits=…`
+    (`replica.ReplicaObservability`), `metrics|latency|fuse=…` and
+    `metrics|latency|db=…`. Counters are
     lifetime totals and never reset. Latency histograms bucket wall-clock
     durations at ≤10µs, ≤100µs, ≤1ms, ≤10ms, ≤100ms, ≤1s and >1s and
     report p50/p95/p99 as the upper bound of the bucket that contains the
-    percentile."""
+    percentile.
+
+    Further lines report:
+
+    - `metrics|db|state=… reconnects=… fenced=… slow_db=…`;
+    - `metrics|inflight|oldest_ms=…`;
+    - `metrics|space|…` (`space.ReportsSpace`);
+    - `metrics|integrity|checksum_failures=…`.
+
+    Every per-errno counter is incremented where its errno is replied,
+    or removed. None stays at zero by omission."""
 
 
 class DumpsStateOnSigusr1(Req):
-    """SIGUSR1 sets a flag on the signal-waiter thread. The next FUSE
-    callback clears it and logs, at INFO, `state|ino_cache=… next_ino=…
-    db=connected (replica none|fresh|stale or unreachable) uptime_secs=…`
-    followed by the FUSE and DB latency summaries. The dump never runs on
-    the signal thread and never blocks dispatch; on an idle mount it
-    appears with the next filesystem access."""
+    """SIGUSR1 makes the signal thread itself write a state dump at INFO.
+    It does not wait for the next callback, so the dump appears even
+    when every worker is stuck. The dump reads only atomics and
+    `try_lock` snapshots, and prints `locked` for any state it cannot
+    take at once. It contains:
+
+    - the mount, view, fence and connection states;
+    - the in-flight request of each worker, with its age and backend
+      pid;
+    - cache, handle and buffer sizes;
+    - the replica state;
+    - the latency summaries.
+
+    **Sources.** Gray Failure r124. The first design ran the dump on the
+    next callback, which on a stuck mount never comes."""
+
+    deps = [InFlightAgeWatchdog]
 
 
 class WritesHealthFiles(Req):
@@ -252,16 +695,6 @@ class WritesHealthFiles(Req):
     `/tmp/pgfs-<hash>.ready` containing `ready`. `<hash>` is 16 hex digits
     derived from the mountpoint argument exactly as given. Both files are
     removed when `run()` returns."""
-
-
-class DetectsDeadlock(Req):
-    """A liveness thread increments a counter every 10 s. Every FUSE
-    callback checks it on entry; if the counter has not advanced for 30 s
-    the callback logs ERROR, replies EIO and flags a watchdog thread. The
-    watchdog unmounts cleanly, retrying up to 5 times 500 ms apart, and
-    exits the process if every attempt fails so that AutoUnmount removes
-    the mount. The check uses a monotonic clock, so wall-clock jumps never
-    cause false positives."""
 
 
 # ── Features (user-visible capabilities) ─────────────────────────────
@@ -283,39 +716,24 @@ class ProjectLocalEnvironment(Feat):
         return "Project-Local Development Environment"
 
     def status(self):
-        return STABLE
+        return PARTIAL
 
     def status_note(self):
         return (
-            "Everything on this page ships today: `scripts/init_db.sh`, "
+            "`scripts/init_db.sh` creates the cluster with "
+            "`--data-checksums`, checks `fsync` and `full_page_writes`, "
+            "and formats the `pgfs` database with `pgfs mkfs`; "
             "`scripts/pgfs.sh`, the Makefile targets and the integration "
-            "suite in `scripts/test_*.sh`."
+            "suite drive the mount, and `run_tests.sh` runs `pgfs check` "
+            "after every test. The `--lazyfs` mode needs LazyFS installed "
+            "and is not yet exercised by the suite."
         )
 
     def tutorial(self):
         return md(r"""
-            In this tutorial we will go from a fresh checkout to a mounted
-            pgfs filesystem, store a file in it, find that file as rows in
-            PostgreSQL, and take everything down again. It takes about five
-            minutes, most of which is the first compile.
-
-            All commands run from the root of the repository.
-
-            ## Before we start
-
-            pgfs asks the kernel to remove its mount automatically if the
-            daemon ever dies. Unprivileged users may only do that when
-            `/etc/fuse.conf` allows it. Check:
-
-            ```bash
-            grep '^user_allow_other' /etc/fuse.conf
-            ```
-
-            If that prints nothing, enable it once:
-
-            ```bash
-            sudo sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf
-            ```
+            In this tutorial we will go from a fresh clone to a mounted pgfs
+            filesystem, write a file, find it in PostgreSQL, and take everything
+            down again. Everything lives under `testdata/`.
 
             ## Step 1: enter the development shell
 
@@ -323,37 +741,18 @@ class ProjectLocalEnvironment(Feat):
             nix develop
             ```
 
-            The shell prints a banner with the Rust, PostgreSQL and FUSE
-            versions it provides. Everything that follows uses those tools.
-
-            ## Step 2: bring the filesystem up
+            ## Step 2: bring it up
 
             ```bash
             ./scripts/pgfs.sh up
             ```
 
-            The first run creates a PostgreSQL cluster in `testdata/pgdata`,
-            compiles pgfs, and mounts it. The last lines look like this:
+            This creates the cluster in `testdata/pgdata` (with data checksums),
+            starts it on a Unix socket in `testdata/` and on 127.0.0.1, formats the
+            `pgfs` database with `pgfs mkfs`, builds the binary and mounts the tree
+            `main` at `testdata/mnt`.
 
-            ```text
-            pgfs:      starting (log: /path/to/pgfs/testdata/pgfs.log)
-            mounted:   /path/to/pgfs/testdata/mnt
-            postgres:  PostgreSQL 17.10 on
-            ```
-
-            Ask the script what is running:
-
-            ```bash
-            ./scripts/pgfs.sh status
-            ```
-
-            ```text
-            mount:     active
-            daemon:    running (pid 1519591)
-            postgres:  running
-            ```
-
-            ## Step 3: store a file
+            ## Step 3: write a file
 
             ```bash
             mkdir testdata/mnt/tutorial
@@ -367,32 +766,20 @@ class ProjectLocalEnvironment(Feat):
 
             ## Step 4: find the file in PostgreSQL
 
-            The file we just wrote is a row in the `entries` table:
-
             ```bash
             psql -h "$PWD/testdata" -d pgfs -c \
-              "SELECT parent, name, kind, size FROM entries WHERE parent = 'tutorial'"
+              "SELECT path, ino, kind, size FROM pgfs.files WHERE tree = 'main' AND path LIKE '/tutorial%'"
             ```
 
             ```text
-              parent  |   name    | kind | size
-            ----------+-----------+------+------
-             tutorial | hello.txt | file |   22
+                    path         | ino | kind | size
+            ---------------------+-----+------+------
+             /tutorial           |   2 | d    |    0
+             /tutorial/hello.txt |   3 | f    |   22
             ```
 
-            Its 22 bytes of content are a row in the `blocks` table:
-
-            ```bash
-            psql -h "$PWD/testdata" -d pgfs -c \
-              "SELECT name, block_no, convert_from(data, 'UTF8') FROM blocks WHERE parent = 'tutorial'"
-            ```
-
-            ```text
-               name    | block_no |     convert_from
-            -----------+----------+-----------------------
-             hello.txt |        0 | hello from a database+
-                       |          |
-            ```
+            A file this small lives inside its inode row
+            ([Storage Layout](storagelayout.md)).
 
             ## Step 5: take it down
 
@@ -408,289 +795,94 @@ class ProjectLocalEnvironment(Feat):
             postgres:  running
             ```
 
-            PostgreSQL keeps running so the next `up` is quick.
-
             ## What we did
 
-            We built pgfs, mounted it, wrote a file through the ordinary
-            filesystem interface, and saw the same data as rows in two SQL
-            tables. Next, the [Regular Files](flat_filesystem.md) tutorial
-            explores reading, writing and truncating files in more depth.
+            We built a private PostgreSQL, formatted it, mounted it, and saw a file
+            become rows. `rm -rf testdata` undoes all of it.
         """)
 
     def how_to(self):
         return md(r"""
-            ## Run the Rust unit tests
-
-            Inside the Nix shell:
+            ## Start from scratch
 
             ```bash
-            make test
+            pg_ctl -D testdata/pgdata stop; rm -rf testdata
+            ./scripts/pgfs.sh up
             ```
 
-            This starts the project-local cluster if it is down
-            (`scripts/ensure_db.sh`) and then runs `cargo test`. Most
-            tests in `src/db.rs` talk to the live database. Outside the
-            Nix shell, `make` refuses to run (`PGFS_ROOT` is unset); run
-            `./scripts/ensure_db.sh && cargo test` instead.
-
-            ## Run the integration suite
+            ## Run the tests
 
             ```bash
-            ./scripts/pgfs.sh down        # the suite mounts testdata/mnt itself
-            make test-integration
-            ```
-
-            Each `scripts/test_*.sh` prints `PASS` or `FAIL`. A failing
-            test prints the tail of its log; the full output is in
-            `testdata/<test>.log`. `test_replica.sh` needs Docker.
-
-            To run a single test:
-
-            ```bash
-            bash scripts/test_rename.sh
+            make test               # cargo test: unit, storage and model-conformance tests
+            make test-integration   # scripts/test_*.sh, each followed by pgfs check
             ```
 
             ## Run the daemon in the foreground
 
             ```bash
-            RUST_LOG=pgfs=debug ./scripts/pgfs.sh run
+            ./scripts/pgfs.sh run
             ```
 
-            Logs go to the terminal. Ctrl+C unmounts cleanly.
-
-            ## Mount somewhere other than `testdata/mnt`
+            ## Mount somewhere else
 
             ```bash
-            PGFS_MOUNT=/tmp/pgfs-demo ./scripts/pgfs.sh up
-            PGFS_MOUNT=/tmp/pgfs-demo ./scripts/pgfs.sh down
+            PGFS_MOUNT=/tmp/pgfs ./scripts/pgfs.sh up
             ```
 
-            Pass the same `PGFS_MOUNT` to every `pgfs.sh` command.
-
-            ## Use a PostgreSQL server other than the project-local one
-
-            Run the binary directly and give it a libpq connection string:
+            ## Put the cluster on LazyFS for crash tests
 
             ```bash
-            cargo build
-            ./target/debug/pgfs --conn "host=db.internal port=5432 dbname=pgfs user=alice" /mnt/pgfs
+            ./scripts/init_db.sh --lazyfs
             ```
 
-            The role needs permission to create tables in that database
-            the first time; pgfs creates its schema on startup.
-
-            ## Inspect the database directly
-
-            ```bash
-            psql -h "$PWD/testdata" -d pgfs
-            ```
-
-            ## Stop PostgreSQL
-
-            ```bash
-            ./scripts/pgfs.sh down
-            make db-stop
-            ```
-
-            Unmount first. A running daemon does not reconnect after
-            PostgreSQL comes back, so every operation fails with
-            `Input/output error` until the daemon is restarted.
-
-            ## Reset everything
-
-            ```bash
-            ./scripts/pgfs.sh down
-            make db-stop
-            rm -rf testdata
-            ```
-
-            The next `./scripts/pgfs.sh up` creates a fresh cluster.
-
-            ## Rebuild this documentation
-
-            ```bash
-            uv run python scripts/build_docs.py
-            uv run mkdocs serve
-            ```
-
-            The pages are generated from the Diátaxis methods of the
-            Feature classes in `spec/`; edit those, not `docs/`.
-
-            ## Check the specification for drift
-
-            ```bash
-            uv run libspec diff
-            ```
+            This needs [LazyFS](https://github.com/dsrhaslab/lazyfs) installed.
         """)
 
     def reference(self):
         return md(r"""
-            ## Toolchain
-
-            | Tool | Provided by `nix develop` | Used for |
-            |---|---|---|
-            | `rustc`, `cargo`, `clippy`, `rustfmt` | yes | building and checking the daemon |
-            | PostgreSQL server binaries (`initdb`, `pg_ctl`, `psql`, `createdb`) | yes (PostgreSQL 17) | the project-local cluster |
-            | FUSE 3 (`fusermount3`, headers, `pkg-config`) | yes | mounting |
-            | Docker | no | replicated mode only (`scripts/replica_db.sh`) |
-            | `uv` | no | the libspec specification and this documentation |
-
-            ## `testdata/` layout
-
-            | Path | Contents |
-            |---|---|
-            | `testdata/pgdata/` | PostgreSQL cluster created by `init_db.sh` |
-            | `testdata/.s.PGSQL.5432` | PostgreSQL Unix socket |
-            | `testdata/postgres.log` | PostgreSQL server log |
-            | `testdata/mnt/` | default mount point |
-            | `testdata/pgfs.pid` | PID of the daemon started by `pgfs.sh up` |
-            | `testdata/pgfs.log` | daemon stdout and stderr (appended) |
-            | `testdata/<test>.log` | output of each integration test |
-            | `testdata/bench-pgfs.log`, `testdata/bench.pid` | `bench_profile.sh` daemon log and PID |
-
-            `testdata/` is git-ignored.
-
-            ## Project-local cluster
-
-            | Setting | Value |
-            |---|---|
-            | Data directory | `testdata/pgdata` |
-            | `initdb` flags | `--auth=trust --no-locale --encoding=UTF8` |
-            | Listen addresses | Unix socket in `testdata/`; TCP `127.0.0.1:5432` |
-            | Authentication | `trust` for local and loopback connections |
-            | Roles | bootstrap superuser (owner of `pgdata`); a `SUPERUSER` role named after the invoking OS user if different |
-            | Database | `pgfs` |
-            | Daemon default `--conn` | `host=<current working directory>/testdata dbname=pgfs` |
-
-            The default `--conn` is derived from the daemon's working
-            directory. Started from anywhere other than the repository
-            root, it needs an explicit `--conn`.
-
             ## Scripts
 
-            | Script | Purpose |
+            | Script | Does |
             |---|---|
-            | `scripts/init_db.sh` | create (if absent) and start the cluster; create role and database |
-            | `scripts/ensure_db.sh` | exit 0 if the cluster answers, otherwise run `init_db.sh` |
-            | `scripts/pgfs.sh up` | start Postgres if needed, `cargo build`, sweep a stale mount, start the daemon, wait up to 10 s for the mount |
-            | `scripts/pgfs.sh down` | SIGTERM the daemon, wait up to 10 s, then `fusermount3 -u`, then report holders and lazy-unmount |
-            | `scripts/pgfs.sh status` | report mount, daemon and Postgres state; warn about ghost mounts |
-            | `scripts/pgfs.sh run` | build and exec the daemon in the foreground |
-            | `scripts/run_tests.sh` | run every integration test in isolation (300 s timeout each) |
-            | `scripts/test_*.sh` | individual integration tests; `test_lib.sh` is the shared harness |
-            | `scripts/replica_db.sh` | manage the Docker streaming standby (see [Replicated Storage](replicated_filesystem.md)) |
-            | `scripts/bench_profile.sh` | profiled benchmark (see [On-Demand Profiling](ondemandprofiling.md)) |
-            | `scripts/build_docs.py` | regenerate `docs/` and the `mkdocs.yml` navigation from `spec/` |
+            | `scripts/init_db.sh [--lazyfs]` | create and start the cluster in `testdata/pgdata` (`--data-checksums`, socket in `testdata/`, TCP on 127.0.0.1), check `fsync` and `full_page_writes`, create and `pgfs mkfs` the `pgfs` database, print the connection string |
+            | `scripts/ensure_db.sh` | `init_db.sh` unless the cluster already answers |
+            | `scripts/pgfs.sh up\|down\|status\|run` | mount lifecycle, with stale-mount sweeping and escalating unmount |
+            | `scripts/run_tests.sh` | every `scripts/test_*.sh` under a 300 s timeout, then `pgfs check` |
 
-            ## Integration tests
+            ## Files
 
-            | Test | Covers |
+            | Path | Holds |
             |---|---|
-            | `test_append.sh` | `O_APPEND` offset and size correctness |
-            | `test_copy_performance.sh` | end-to-end copy throughput |
-            | `test_dirs.sh` | deep nesting, listing, `rmdir` semantics |
-            | `test_git_init.sh` | `git init` inside the mount |
-            | `test_integrity.sh` | create/write/unlink chains |
-            | `test_rename.sh` | rename-overwrite with POSIX semantics |
-            | `test_replica.sh` | replicated mode end to end |
-            | `test_truncate.sh` | truncate and extend semantics |
+            | `testdata/pgdata` | the cluster |
+            | `testdata/postgres.log` | the server log |
+            | `testdata/mnt` | the default mount point |
+            | `testdata/pgfs.log` | the daemon log from `pgfs.sh up` |
+            | `testdata/<test>.log` | each integration test's output |
 
-            ## Make targets
+            ## Environment
 
-            | Target | Action |
+            | Variable | Default |
             |---|---|
-            | `make up` / `down` / `status` / `run` | `scripts/pgfs.sh` equivalents |
-            | `make build` / `check` / `clippy` / `fmt` | `cargo build` / `check` / `clippy` / `fmt` |
-            | `make test` | `ensure_db.sh`, then `cargo test` |
-            | `make test-integration` | `scripts/run_tests.sh` |
-            | `make init-db` | `scripts/init_db.sh` |
-            | `make db-stop` | `pg_ctl -D testdata/pgdata stop` |
-            | `make shell` | `nix develop` |
-            | `make clean` | `cargo clean` |
-
-            Every target except `down`, `status`, `db-stop`, `shell` and
-            `clean` requires the Nix shell (`PGFS_ROOT` set).
-
-            ## Environment variables
-
-            | Variable | Read by | Effect |
-            |---|---|---|
-            | `PGFS_MOUNT` | `pgfs.sh` | mount point (default `testdata/mnt`) |
-            | `PGFS_ROOT` | `Makefile` | set by the Nix shell; `make` refuses to run without it |
-            | `RUST_LOG` | daemon | log filter, e.g. `pgfs=debug` (default `pgfs=info`) |
-            | `RUST_LOG_FORMAT` | daemon | `json` for newline-delimited JSON logs |
-            | `RUST_BACKTRACE` | daemon | backtrace detail in crash reports |
+            | `PGFS_CONN` | `host=<repo>/testdata dbname=pgfs` |
+            | `PGFS_MOUNT` | `testdata/mnt` |
         """)
 
     def explanation(self):
         return md(r"""
-            ## Why everything lives in `testdata/`
+            ## Why everything lives in the repository
 
-            A filesystem backed by a database needs a database, and the
-            usual way to get one is to install a system PostgreSQL service
-            and administer it. pgfs deliberately avoids that. The cluster,
-            its socket, its logs, the mount point and the daemon's
-            bookkeeping all live in one git-ignored directory inside the
-            checkout.
+            A development filesystem that depends on a system-wide PostgreSQL
+            leaks state between projects and between people. Keeping the cluster,
+            the socket, the mount point and the logs under `testdata/` makes a
+            reset one command, and makes the tests reproducible.
 
-            That buys three things. Nothing on the machine changes outside
-            the project, so it is safe to experiment. Two checkouts never
-            interfere with each other. And recovery from any mess is one
-            command, `rm -rf testdata`, because there is no state anywhere
-            else.
+            ## Why checksums and durability checks at setup
 
-            ## Trust authentication, and its limits
-
-            The cluster uses `trust` authentication: any connection that
-            reaches it is accepted without a password. The Unix socket sits
-            in a directory only the developer can enter, so for socket
-            connections that is no weaker than file permissions. The TCP
-            listener is different. It only binds 127.0.0.1, but any user on
-            the same machine can reach loopback. On a single-user
-            development machine that is acceptable. On a shared host it is
-            not, and the cluster should not be run there as is.
-
-            TCP exists at all because physical replication needs it:
-            `pg_basebackup` and the standby's WAL receiver connect to the
-            primary over the network (see [Replicated
-            Storage](../explanation/replicated_filesystem.md)).
-
-            ## Why a lifecycle script instead of raw commands
-
-            A FUSE mount has more states than "up" and "down". The daemon
-            can be dead while the kernel still shows the mount. The mount
-            can be busy because a shell has its working directory inside
-            it. Postgres can be stopped while the daemon is starting.
-            `pgfs.sh` treats `/proc/mounts` as the source of truth and
-            escalates through progressively stronger actions (signal, then
-            `fusermount3 -u`, then a lazy unmount), so the common failure
-            states resolve themselves. The reasoning behind clean unmounts
-            is covered in [Reliable Mount](../explanation/reliablemount.md).
-
-            `pgfs.sh` builds and runs the debug binary. Compiles are faster,
-            and in debug builds a panic unwinds and prints a full report
-            rather than aborting.
-
-            ## Why the Makefile insists on the Nix shell
-
-            pgfs links against libfuse and talks to a specific PostgreSQL
-            major version. A build against the wrong libfuse headers, or an
-            `initdb` from a different major version than the server, fails
-            in confusing ways. The `check-nix` guard turns that into one
-            clear message with a fix.
-
-            ## Where the documentation comes from
-
-            These pages are generated. Every user-visible capability of
-            pgfs is a `Feature` class in `spec/` that inherits
-            `libspec.diataxis.Diataxis` and must implement four methods,
-            one per documentation quadrant. `scripts/build_docs.py` renders
-            them, together with each feature's requirement classes, into
-            this site. Documentation that lives next to the specification
-            is reviewed in the same change as the behaviour it describes.
+            pgfs promises that fsync means durable. That is only true on a server
+            with `fsync` and `full_page_writes` on, and silent corruption is only
+            detectable with page checksums, so the local cluster is set up the way
+            pgfs asks production servers to be.
         """)
-
 
 class FlatFilesystem(Feat):
     """Users can create, read, write, and delete files through standard
@@ -716,426 +908,120 @@ class FlatFilesystem(Feat):
 
     def status_note(self):
         return (
-            "Create, read, write, append, truncate and delete are implemented "
-            "and covered by unit and integration tests. Permissions, "
-            "ownership and timestamps are reported but not settable (see "
-            "Reference)."
+            "Create, read, write, append, truncate and delete run on the "
+            "inode-keyed schema: persistent inode numbers with "
+            "generations, buffered writes visible to every handle on the "
+            "mount, read-modify-write of partial blocks (Bug 1), "
+            "single-transaction unlink and checksummed immutable blocks. "
+            "Covered by `tests/storage.rs`, the model-conformance suite "
+            "and `scripts/test_*.sh`."
         )
 
     def tutorial(self):
         return md(r"""
-            In this tutorial we will create a file, read it, add to it, cut
-            it short, grow it again, and then look at how its bytes are laid
-            out in PostgreSQL. By the end we will have seen every basic file
-            operation pgfs supports.
+            In this tutorial we will create, write, append to, truncate and delete
+            a file, and look at its inode in PostgreSQL. We need a mount (see
+            [Your first pgfs mount](projectlocalenvironment.md)).
 
-            We need a running mount. If `./scripts/pgfs.sh status` does not
-            say `mount: active`, follow [Your first pgfs
-            mount](projectlocalenvironment.md) first, up to Step 2.
-
-            ## Step 1: make a workspace
+            ## Step 1: create and write
 
             ```bash
-            mkdir testdata/mnt/files
-            cd testdata/mnt/files
+            cd testdata/mnt
+            echo "first line" > notes.txt
+            echo "second line" >> notes.txt
+            cat notes.txt
+            ls -i notes.txt
             ```
 
-            ## Step 2: create and read a file
+            The inode number `ls -i` prints is the file's `ino` in the database,
+            and stays the same across remounts.
+
+            ## Step 2: look at the inode
 
             ```bash
-            echo 'Hello pgfs' > demo.txt
-            cat demo.txt
+            psql -h "$OLDPWD/testdata" -d pgfs -c \
+              "SELECT ino, size, convert_from(inline_data, 'UTF8') FROM pgfs.inodes
+               WHERE ino = $(stat -c %i notes.txt) AND died = 9223372036854775807"
             ```
 
-            ```text
-            Hello pgfs
-            ```
+            The 23 bytes are inside the inode row.
 
-            ## Step 3: append to it
+            ## Step 3: truncate and delete
 
             ```bash
-            echo 'More content' >> demo.txt
-            cat demo.txt
-            wc -c demo.txt
-            ```
-
-            ```text
-            Hello pgfs
-            More content
-            24 demo.txt
-            ```
-
-            ## Step 4: cut it short, then grow it
-
-            ```bash
-            truncate -s 5 demo.txt
-            cat demo.txt; echo
-            ```
-
-            ```text
-            Hello
-            ```
-
-            Now grow the file to 10 bytes. The new bytes read back as
-            zeros:
-
-            ```bash
-            truncate -s 10 demo.txt
-            od -c demo.txt
-            ```
-
-            ```text
-            0000000   H   e   l   l   o  \0  \0  \0  \0  \0
-            0000012
-            ```
-
-            ## Step 5: write something bigger
-
-            ```bash
-            head -c 200000 /dev/urandom > big.bin
-            cp big.bin copy.bin
-            cmp big.bin copy.bin && echo identical
-            ```
-
-            ```text
-            identical
-            ```
-
-            ## Step 6: look at the bytes in PostgreSQL
-
-            From the repository root, in a second terminal:
-
-            ```bash
-            psql -h "$PWD/testdata" -d pgfs -c \
-              "SELECT name, block_no, length(data) FROM blocks WHERE parent = 'files' ORDER BY name, block_no"
-            ```
-
-            ```text
-               name   | block_no | length
-            ----------+----------+--------
-             big.bin  |        0 |  65536
-             big.bin  |        1 |  65536
-             big.bin  |        2 |  65536
-             big.bin  |        3 |   3392
-             copy.bin |        0 |  65536
-             ...
-             demo.txt |        0 |      5
-            ```
-
-            `big.bin` is four rows: three full 64 KiB blocks and a short
-            last one. `demo.txt` is a single 5-byte block. Its declared
-            size is 10, and the five missing bytes are the zeros we saw in
-            Step 4.
-
-            ## Step 7: clean up
-
-            ```bash
-            cd ../../..
-            rm -r testdata/mnt/files
+            truncate -s 5 notes.txt && cat notes.txt; echo
+            rm notes.txt
             ```
 
             ## What we did
 
-            We used ordinary shell tools to exercise create, read, write,
-            append, truncate and delete, and saw that a file's contents are
-            stored as fixed-size blocks. To learn why it is built this
-            way, read the [explanation](../explanation/flat_filesystem.md).
-            Next, [Directory Trees](hierarchicaldirectories.md).
+            We used ordinary tools on a pgfs file, and saw that a file is an inode
+            row with a permanent number.
         """)
 
     def how_to(self):
         return md(r"""
-            All paths below are inside a mounted pgfs filesystem.
+            ## Make sure data is durable
 
-            ## Create an empty file
+            `write` returns once the data is buffered in the daemon. `close`
+            commits it (visible to everyone, durable within the asynchronous commit
+            window); `fsync` makes it durable before returning
+            ([Durability and Crash Safety](durablestorage.md)).
 
-            ```bash
-            touch notes.txt
-            ```
-
-            ## Replace a file's contents
-
-            ```bash
-            printf 'new contents\n' > notes.txt
-            ```
-
-            To replace contents so that readers see either the old or the
-            new version and never a partial one, write a temporary file and
-            rename it over the target (see [Atomic
-            Rename](atomicrename.md)):
-
-            ```bash
-            printf 'new contents\n' > .notes.txt.tmp && mv .notes.txt.tmp notes.txt
-            ```
-
-            ## Append
-
-            ```bash
-            echo 'another line' >> notes.txt
-            ```
-
-            ## Overwrite bytes in the middle of a file
-
-            ```bash
-            printf 'XY' | dd of=notes.txt bs=1 seek=4 conv=notrunc
-            ```
-
-            ## Make written data visible outside the mount
-
-            Writes are held in memory per open file and committed to
-            PostgreSQL when the file is closed, flushed or fsynced.
-            Processes reading through the same mount always see their own
-            and each other's writes, because a read flushes pending writes
-            first. A SQL client, or a second pgfs daemon on the same
-            database, sees the data once the writer closes the file or
-            calls `fsync`.
-
-            ## Truncate or extend a file
-
-            ```bash
-            truncate -s 0 notes.txt      # empty it
-            truncate -s 1M notes.txt     # extend with zeros
-            ```
-
-            ## Create a sparse file
-
-            ```bash
-            truncate -s 1G sparse.img
-            ```
-
-            Ranges that were never written have no block rows and read as
-            zeros, so this costs one row in `entries` and nothing in
-            `blocks`.
-
-            ## Delete a file
-
-            ```bash
-            rm notes.txt
-            ```
-
-            ## Find a file's rows in PostgreSQL
-
-            A file at `docs/sub/notes.txt` has `parent = 'docs/sub'` and
-            `name = 'notes.txt'`:
+            ## Find a file's rows
 
             ```sql
-            SELECT kind, size, mtime FROM entries WHERE parent = 'docs/sub' AND name = 'notes.txt';
-            SELECT block_no, length(data) FROM blocks WHERE parent = 'docs/sub' AND name = 'notes.txt' ORDER BY block_no;
+            SELECT path, ino, size FROM pgfs.files WHERE tree = 'main' AND path = '/docs/notes.txt';
+            SELECT block_no, blob_id FROM pgfs.file_blocks
+            WHERE ino = 1001 AND died = 9223372036854775807 ORDER BY block_no;
             ```
-
-            Files at the top of the mount have `parent = ''`.
 
             ## Diagnose an `Input/output error`
 
-            EIO means something unexpected failed, usually the database.
-            The full error chain is in the daemon log:
-
-            ```bash
-            grep ERROR testdata/pgfs.log | tail -5
-            ```
-
-            Each entry names the operation, the source location and the
-            root cause; see [Observability](observabledaemon.md).
+            EIO means something unexpected failed. The daemon log has the full
+            error chain; `grep ERROR` it. A `checksum mismatch` names the inode,
+            block and blob ([Integrity and Backup](dataintegrity.md)).
         """)
 
     def reference(self):
         return md(r"""
             ## FUSE operations
 
-            | Operation | Triggered by | Behaviour | Errors |
-            |---|---|---|---|
-            | `lookup` | path resolution | reads the entry's attributes; assigns an inode number on first sight | `ENOENT` (absent, or name not valid UTF-8) |
-            | `getattr` | `stat`, `ls -l` | reads attributes; the root (inode 1) is synthesised | `ENOENT` |
-            | `create` | `open(O_CREAT)` | checks the primary for an existing entry, inserts a `file` row with size 0, opens a write handle | `EEXIST` |
-            | `open` | `open` | allocates a handle with an empty dirty-block buffer; flags and permissions are not checked | `ENOENT` |
-            | `read` | `read`, `pread` | flushes the handle's pending writes, then fetches only the blocks covering the range; the range is clamped to the file size; holes read as zeros | `ENOENT` |
-            | `write` | `write`, `pwrite` | with an open handle, buffers the bytes in memory and returns immediately; without one, writes the touched blocks in one transaction; extends the size if the write ends past it | `ENOENT` |
-            | `flush`, `fsync`, `release` | `close`, `fsync` | writes the handle's dirty blocks and new size in one transaction | `EIO` |
-            | `setattr` | `truncate`, `ftruncate`, `open(O_TRUNC)` | size changes truncate or extend in one transaction; mode, owner and time changes are accepted and ignored | `EISDIR` (size change on a directory), `ENOENT` |
-            | `unlink` | `rm` | deletes the entry row, then its block rows; forgets the inode mapping | `EIO` |
+            | Operation | SQL | Errors |
+            |---|---|---|
+            | `create`, `mknod` (regular) | `pgfs.create` | EEXIST, ENOENT, ENOTDIR, ENAMETOOLONG, EINVAL, ENOSPC, EROFS |
+            | `lookup` | `pgfs.lookup` (negative results are cached by the kernel) | ENOENT |
+            | `getattr` | `pgfs.getattr`, or the daemon's cache | ESTALE |
+            | `read` | `pgfs.read_blocks`, with buffered writes overlaid | EISDIR, EIO (checksum), ESTALE |
+            | `write` | buffered; committed by `pgfs.write_blocks` | EBADF, EFBIG, ENOSPC, EROFS, EIO |
+            | `setattr` with a size | `pgfs.setattr` | EISDIR, EFBIG, EROFS |
+            | `unlink` | `pgfs.unlink` | ENOENT, EISDIR, EROFS |
 
-            ## Storage schema
+            ## Limits
 
-            ```sql
-            CREATE TABLE entries (
-                ino        bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                parent_ino bigint NOT NULL DEFAULT 1,
-                parent     text   NOT NULL DEFAULT '',
-                name       text   NOT NULL,
-                kind       text   NOT NULL DEFAULT 'file',   -- 'file' | 'dir'
-                data       bytea  NOT NULL DEFAULT '',       -- legacy, always empty
-                size       bigint NOT NULL DEFAULT 0,
-                mode       integer NOT NULL DEFAULT 33188,
-                uid        integer NOT NULL DEFAULT 1000,
-                gid        integer NOT NULL DEFAULT 1000,
-                atime      timestamptz NOT NULL DEFAULT now(),
-                mtime      timestamptz NOT NULL DEFAULT now(),
-                ctime      timestamptz NOT NULL DEFAULT now(),
-                CONSTRAINT unique_parent_name UNIQUE (parent, name)
-            );
-
-            CREATE TABLE blocks (
-                ino      bigint  NOT NULL DEFAULT 1,
-                parent   text    NOT NULL DEFAULT '',
-                name     text    NOT NULL DEFAULT '',
-                block_no integer NOT NULL,
-                data     bytea   NOT NULL,
-                PRIMARY KEY (parent, name, block_no)
-            );
-            ```
-
-            Indexes: `entries(parent_ino)`, `entries(parent)`,
-            `blocks(ino, block_no)`. The schema is created on first
-            connect with `CREATE TABLE IF NOT EXISTS`, inside one
-            transaction that also inserts the root row
-            (`ino = 1, parent = '', name = ''`, `kind = 'dir'`).
-
-            | Property | Value |
+            | Limit | Value |
             |---|---|
-            | Block size | 65 536 bytes (`BLOCK_SIZE`) |
-            | Block number | `offset / 65536` |
-            | Last block | may be shorter than 65 536 bytes |
-            | Holes | blocks with no row; read as zeros |
-            | Source of truth for size | `entries.size` |
-            | `entries.ino`, `parent_ino`, `mode`, `uid`, `gid`, `atime`, `ctime` | written with defaults; not read by the FUSE path |
-
-            ## Reported attributes
-
-            | Attribute | Regular file |
-            |---|---|
-            | `perm` | `0644` |
-            | `nlink` | 1 |
-            | `uid`, `gid` | the daemon's own uid and gid |
-            | `size` | `entries.size` |
-            | `blocks` | `ceil(size / 512)` |
-            | `blksize` | 4096 |
-            | `atime`, `mtime`, `ctime`, `crtime` | all equal to `entries.mtime` |
-
-            Attribute and entry replies carry the TTL set by `--attr-ttl`
-            (default 1 s).
-
-            ## Inode numbers
-
-            Inode numbers are assigned in memory, per mount, the first time
-            the kernel sees a path. They start at 2, increase by one, are
-            never reused within a mount, and survive renames. They are not
-            persisted: a remount assigns new numbers. They are unrelated to
-            `entries.ino`.
-
-            ## Durability
-
-            Every connection runs `SET synchronous_commit = off`. A
-            transaction is acknowledged once it is in PostgreSQL's WAL
-            buffers, before the WAL is flushed to disk. `fsync` on a pgfs
-            file waits for the commit, not for the disk flush. If
-            PostgreSQL crashes, the most recently acknowledged commits can
-            be lost; with default settings that window is under one second.
-            Committed data is never partially applied. Buffered writes that
-            have not reached `flush`, `fsync` or `close` are lost if the
-            daemon dies.
-
-            ## Error mapping
-
-            | errno | Meaning |
-            |---|---|
-            | `ENOENT` | the entry, or the inode's path, does not exist |
-            | `EEXIST` | `O_CREAT|O_EXCL` on an existing name |
-            | `EISDIR` | size change requested on a directory |
-            | `EIO` | unexpected failure (database error, invariant violation); the full error chain is logged at ERROR |
-
-            ## Not supported
-
-            | Operation | Result |
-            |---|---|
-            | symbolic links (`symlink`) | `EPERM` from `ln -s` (operation not implemented) |
-            | hard links (`link`) | `EPERM` from `ln` (operation not implemented) |
-            | FIFOs, sockets, device nodes (`mknod`) | `ENOSYS` |
-            | extended attributes | not implemented |
-            | `chmod`, `chown`, `utimes`, `touch -d` | succeed but have no effect |
-            | `statfs` (`df`) | reports zero size and zero free space |
-            | `fallocate` | `EOPNOTSUPP` (see [Kernel Offloading](kerneloffloadingacceleration.md)) |
-            | reflink clone (`cp --reflink=always`) | `EOPNOTSUPP` |
+            | file size | 2^63 − 1 bytes |
+            | name | 1 – 255 bytes |
         """)
 
     def explanation(self):
         return md(r"""
-            ## A file is a handful of rows
+            ## A file is an inode row
 
-            pgfs stores each file as one row in `entries`, which holds its
-            name, kind, size and modification time, plus zero or more rows
-            in `blocks`, each holding up to 64 KiB of its contents. Both
-            are keyed by the file's location: the path of the directory
-            that contains it (`parent`) and its own `name`. A file at
-            `docs/sub/notes.txt` is the row `('docs/sub', 'notes.txt')`.
+            Every file has a permanent inode number and a random generation. The
+            kernel holds `(ino, gen)`, and every operation checks it, so a number
+            reused after a database restore is caught as ESTALE rather than
+            silently reading another file.
 
-            Path-based keys make the tables readable by a person with
-            `psql`. Ordinary SQL answers
-            questions like "which files under `docs/` changed today". The
-            cost of path keys appears when a directory is renamed, which is
-            discussed in [Atomic Rename](atomicrename.md).
+            ## Why writes are buffered
 
-            ## Why blocks
-
-            The first version of pgfs stored a whole file in one `bytea`
-            column; `entries.data` is the remnant. Every write then meant
-            reading the whole file, changing a few bytes, and writing the
-            whole file back. Appending a line to a 100 MB log rewrote
-            100 MB.
-
-            Fixed-size blocks bound that work. A write touches only the
-            blocks it overlaps, and a read fetches only the blocks it
-            covers. The block size is a trade-off. Smaller blocks mean less
-            rewriting for small writes but more rows and more per-row
-            overhead for large files. 64 KiB keeps the row count low while
-            keeping a partial-block rewrite cheap. PostgreSQL compresses
-            and moves values of that size out of line through TOAST on its
-            own.
-
-            Blocks that were never written simply do not exist, so sparse
-            files are free. A read fills the gaps with zeros, which is
-            exactly what POSIX requires of a hole.
-
-            ## Why writes are buffered per open file
-
-            The kernel delivers a large `write` to FUSE in pieces. Turning
-            each piece into its own PostgreSQL transaction would make the
-            commit round-trip, not the data, the bottleneck. pgfs instead
-            collects writes in memory, per open file, as a set of dirty
-            blocks, and commits them all in one transaction when the file
-            is flushed, fsynced or closed.
-
-            This is close-to-open consistency, the model NFS uses. A writer
-            and anything that opens the file after the writer closes it see
-            the same bytes. Readers using the same mount see the data even
-            sooner, because a read first flushes that file's pending
-            writes.
-
-            ## Durability is a deliberate trade
-
-            pgfs turns off PostgreSQL's `synchronous_commit`. Commits
-            return without waiting for the WAL to reach disk, which removes
-            the largest fixed cost from every metadata operation. In
-            exchange, a PostgreSQL crash can lose the last fraction of a
-            second of acknowledged work. This is similar to how a local
-            filesystem's page cache behaves without `fsync`, except that
-            here even `fsync` does not close the gap. Transactions remain
-            atomic: a lost commit disappears entirely and never leaves a
-            half-written file. [Performance
-            Optimizations](optimizationroadmap.md) covers this and the
-            other trade-offs in more depth.
-
-            ## What the prototype does not model
-
-            pgfs reports fixed permissions (`0644` for files) and the
-            daemon's own uid and gid, and ignores `chmod`, `chown` and
-            explicit timestamps. It has no symbolic or hard links.
-            Inode numbers live only in memory. These are scoping
-            decisions, not accidents. The schema already carries `mode`,
-            `uid`, `gid` and a persistent `ino` column for the planned
-            inode-keyed storage engine described in [Dual-Interface
-            Architecture](dualinterfacearchitecture.md).
+            Each database round trip costs far more than copying a few kilobytes.
+            Writes collect in a per-inode buffer and commit as whole blocks at
+            close, fsync or under memory pressure. A partly written block is read
+            and overlaid before it is stored, so untouched bytes are never zeroed
+            (Bug 1), and every read on the mount sees the buffered bytes.
         """)
-
 
 class HierarchicalDirectories(Feat):
     """Users can create nested directories, list their contents, and
@@ -1158,21 +1044,17 @@ class HierarchicalDirectories(Feat):
 
     def status_note(self):
         return (
-            "`mkdir`, `rmdir`, `readdir` and nested paths of any depth are "
-            "implemented and covered by `test_dirs.sh`. Directory "
-            "timestamps are not tracked."
+            "`mkdir`, `rmdir`, `readdir` and `readdirplus` keep link "
+            "counts and directory times, page by name with keyset "
+            "cookies, and check emptiness in the same transaction as the "
+            "delete. Covered by `tests/storage.rs`, the model-conformance "
+            "suite and `test_dirs.sh`."
         )
 
     def tutorial(self):
         return md(r"""
-            In this tutorial we will build a small directory tree, walk it
-            with standard tools, see how it is stored, and take it apart
-            again. We will also meet the one rule directories enforce:
-            they must be empty before they can be removed.
-
-            We need a running mount; see [Your first pgfs
-            mount](projectlocalenvironment.md) if `./scripts/pgfs.sh
-            status` does not say `mount: active`.
+            In this tutorial we will build a small project tree, list it, and see
+            how directories are stored. We need a mount.
 
             ## Step 1: build a tree
 
@@ -1180,154 +1062,56 @@ class HierarchicalDirectories(Feat):
             cd testdata/mnt
             mkdir -p project/src/util project/docs
             touch project/src/main.rs project/src/util/strings.rs project/docs/README.md
-            ```
-
-            ## Step 2: walk it
-
-            ```bash
-            find project | sort
-            ```
-
-            ```text
-            project
-            project/docs
-            project/docs/README.md
-            project/src
-            project/src/main.rs
-            project/src/util
-            project/src/util/strings.rs
-            ```
-
-            ```bash
             ls -la project/src
             ```
 
-            The listing starts with the `.` and `..` entries, followed by
-            `main.rs` and `util`.
+            ## Step 2: see the link counts
+
+            ```bash
+            stat -c '%n %h' project project/src
+            ```
+
+            A directory's link count is 2 plus its subdirectories.
 
             ## Step 3: see how the tree is stored
 
-            From the repository root, in a second terminal:
-
             ```bash
-            psql -h "$PWD/testdata" -d pgfs -c \
-              "SELECT parent, name, kind FROM entries
-               WHERE parent = 'project' OR starts_with(parent, 'project/')
-                  OR (parent = '' AND name = 'project')
-               ORDER BY parent, name"
+            psql -h "$OLDPWD/testdata" -d pgfs -c \
+              "SELECT path, kind FROM pgfs.files WHERE tree = 'main' AND path LIKE '/project%' ORDER BY path"
             ```
 
-            ```text
-                  parent       |    name    | kind
-            -------------------+------------+------
-                               | project    | dir
-             project           | docs       | dir
-             project           | src        | dir
-             project/docs      | README.md  | file
-             project/src       | main.rs    | file
-             project/src       | util       | dir
-             project/src/util  | strings.rs | file
-            ```
+            Each name is a `dentries` row `(parent_ino, name) -> ino`; no row
+            stores a path.
 
-            Every row names the directory it lives in. `project` itself
-            lives at the top of the mount, where `parent` is empty.
-
-            ## Step 4: try to remove a directory that is not empty
-
-            ```bash
-            rmdir project/src
-            ```
-
-            ```text
-            rmdir: failed to remove 'project/src': Directory not empty
-            ```
-
-            ## Step 5: take the tree apart
-
-            Empty the directory from the bottom up, and `rmdir` succeeds:
-
-            ```bash
-            rm project/src/util/strings.rs
-            rmdir project/src/util
-            rm project/src/main.rs
-            rmdir project/src
-            ```
-
-            Remove the rest in one go:
+            ## Step 4: remove it
 
             ```bash
             rm -r project
-            ls
             ```
-
-            `project` no longer appears.
-
-            ## What we did
-
-            We created nested directories, listed them, saw that each
-            entry stores the path of its containing directory, and learned
-            that `rmdir` only removes empty directories. Next, [Atomic
-            Rename](atomicrename.md) moves whole trees in one step.
         """)
 
     def how_to(self):
         return md(r"""
-            ## Create nested directories
+            ## List a large directory
 
-            ```bash
-            mkdir -p a/b/c
-            ```
-
-            ## List a directory, including hidden entries
-
-            ```bash
-            ls -la a
-            ```
-
-            ## Remove an empty directory
-
-            ```bash
-            rmdir a/b/c
-            ```
-
-            ## Remove a directory and everything in it
-
-            ```bash
-            rm -r a
-            ```
-
-            ## Find out why `rmdir` says "Directory not empty"
-
-            Hidden files count. List everything:
-
-            ```bash
-            ls -A a/b
-            ```
-
-            Or ask the database directly; the result is the full path of
-            every child of `a/b`:
-
-            ```sql
-            SELECT parent || '/' || name FROM entries WHERE parent = 'a/b';
-            ```
+            `ls` and `find` page through it 256 names at a time, resuming after
+            the last name returned, so a listing costs O(n) whatever the size and
+            never repeats an entry.
 
             ## Count everything below a directory
 
             ```sql
-            SELECT kind, count(*) FROM entries
-            WHERE parent = 'a' OR starts_with(parent, 'a/')
+            SELECT kind, count(*) FROM pgfs.files
+            WHERE tree = 'main' AND starts_with(path, '/a/')
             GROUP BY kind;
             ```
 
-            Use `starts_with` rather than `LIKE 'a/%'`. In a `LIKE`
-            pattern, `_` and `%` in directory names act as wildcards.
-
-            ## Find the largest directories by total file size
+            ## Find the largest directories
 
             ```sql
-            SELECT parent, sum(size) AS bytes, count(*) AS files
-            FROM entries WHERE kind = 'file'
-            GROUP BY parent ORDER BY bytes DESC LIMIT 10;
+            SELECT regexp_replace(path, '/[^/]*$', '') AS dir, sum(size) AS bytes
+            FROM pgfs.files WHERE tree = 'main' AND kind = 'f'
+            GROUP BY dir ORDER BY bytes DESC LIMIT 10;
             ```
         """)
 
@@ -1335,106 +1119,36 @@ class HierarchicalDirectories(Feat):
         return md(r"""
             ## FUSE operations
 
-            | Operation | Behaviour | Errors |
+            | Operation | SQL | Errors |
             |---|---|---|
-            | `mkdir` | checks the primary for an existing entry, then inserts a `dir` row | `EEXIST`, `ENOENT` (parent unknown), `EIO` |
-            | `rmdir` | checks the primary that the entry exists, then that no row has it as `parent`, then deletes it | `ENOENT`, `ENOTEMPTY`, `EIO` |
-            | `readdir` | returns `.`, `..`, then every child ordered by name | `ENOENT`, `EIO` |
-            | `lookup` | resolves `(parent inode, name)` to attributes | `ENOENT` |
+            | `mkdir` | `pgfs.mkdir` | EEXIST, ENOENT, ENOTDIR, ENAMETOOLONG, EINVAL, ENOSPC, EROFS |
+            | `rmdir` | `pgfs.rmdir` | ENOTEMPTY, ENOENT, ENOTDIR, EBUSY (root of the view), EROFS |
+            | `readdir`, `readdirplus` | `pgfs.readdir`, `pgfs.readdirplus`, 256 names per page | ENOTDIR |
 
-            The emptiness check and the delete in `rmdir` are separate
-            statements, not one transaction.
+            ## Attributes
 
-            ## `readdir` offsets
-
-            Entries are numbered from 1 in the order returned: `.` is 1,
-            `..` is 2, and children follow sorted by name. The kernel
-            resumes a partial listing by passing back the last number it
-            received. Offsets index the current list, so if the directory
-            changes between two calls of one listing, entries can be
-            skipped or repeated.
-
-            ## Directory attributes
-
-            | Attribute | Value |
+            | Field | Value |
             |---|---|
-            | `perm` | `0755` |
-            | `nlink` | 2, regardless of the number of subdirectories |
-            | `size`, `blocks` | 0 |
-            | `uid`, `gid` | the daemon's own uid and gid |
-            | `atime`, `mtime`, `ctime`, `crtime` | the Unix epoch (shown as 1970-01-01, or 1969-12-31 west of UTC) |
-
-            ## Root directory
-
-            | Property | Value |
-            |---|---|
-            | Inode | 1 |
-            | Path | `''` (empty string) |
-            | Row | `parent = ''`, `name = ''`, `kind = 'dir'`, inserted at schema creation |
-            | Attributes | always synthesised; never read from the database |
-            | Listing | excludes the root's own row |
-
-            ## Paths and names
-
-            | Rule | Detail |
-            |---|---|
-            | Key | `(parent, name)`, unique |
-            | Full path | `parent || '/' || name`, or `name` when `parent = ''` |
-            | Valid names | any UTF-8 string without `/` or NUL; non-UTF-8 names are rejected with `ENOENT` |
-            | Depth | not limited by pgfs. The unique index on `(parent, name)` limits one key to about 2.7 kB, so a longer combined path fails with `EIO`. |
-            | Index used by listings | `entries(parent)` |
+            | `nlink` | 2 + subdirectories |
+            | `mtime`, `ctime` | updated by every create, remove and rename in the directory |
         """)
 
     def explanation(self):
         return md(r"""
-            ## Directories are rows too
+            ## Names point at inodes
 
-            A directory is an `entries` row with `kind = 'dir'` and no
-            blocks. What makes the tree a tree is the `parent` column:
-            every row stores the full path of the directory that contains
-            it. Listing a directory is a single indexed query,
-            `WHERE parent = 'project/src'`, and finding everything below a
-            directory is a prefix match on that column.
+            A directory entry is a row `(parent_ino, name) -> ino`. A lookup is one
+            index probe, a listing is one range scan in byte order of name, and a
+            rename changes one row whatever the size of the subtree. The first pgfs
+            schema keyed rows by path, which made a directory rename rewrite every
+            descendant.
 
-            This is the materialised-path pattern. Reading is easy:
-            listings, subtree queries and path lookups are each one
-            indexed query, and the rows are readable on their own. Moving
-            things is harder, because a directory's path is copied into
-            every descendant row, so renaming the directory rewrites them
-            all. [Atomic Rename](../explanation/atomicrename.md) explains
-            how pgfs keeps that atomic, and [Performance
-            Optimizations](../explanation/optimizationroadmap.md) describes
-            the planned inode-keyed layout that would make it
-            constant-time.
+            ## Why emptiness is checked inside the transaction
 
-            ## The root
-
-            The root has no parent, so it is stored as the row with an
-            empty `parent` and an empty `name`, created together with the
-            schema and pinned to inode 1, which FUSE requires. Its
-            attributes are synthesised and never fetched, so the root can
-            always be listed, even when the database is unreachable.
-
-            ## What directories do not track
-
-            On a local filesystem a directory's link count is two plus its
-            number of subdirectories, and its modification time changes
-            whenever an entry is added or removed. pgfs reports a fixed
-            link count of 2 and the epoch as every timestamp. Tracking
-            either would mean updating the parent's row on every create,
-            delete and rename, adding a write to operations that are
-            currently a single statement. Few programs depend on these
-            values; tools that do (backup software comparing directory
-            mtimes, for example) treat every pgfs directory as unchanged.
-
-            ## Why `rmdir` refuses non-empty directories
-
-            POSIX requires it, and it is a safety feature. `rm -r` is the
-            explicit way to delete a subtree, and it walks the tree
-            bottom-up, removing each entry through the normal unlink and
-            rmdir paths.
+            `rmdir` locks the directory's inode row before checking that it is
+            empty, and a create in that directory locks the same row, so no create
+            can slip in between the check and the delete.
         """)
-
 
 class AtomicRename(Feat):
     """Users can rename (move) files and directories with standard
@@ -1451,166 +1165,70 @@ class AtomicRename(Feat):
 
     def status_note(self):
         return (
-            "File and directory renames, overwrite semantics and the full "
-            "POSIX error matrix are implemented and covered by "
-            "`test_rename.sh` and `test_git_init.sh`. `renameat2` flags "
-            "(`RENAME_NOREPLACE`, `RENAME_EXCHANGE`) are rejected."
+            "A rename moves one dentry in constant time with no name "
+            "matching (Bug 2), commits the source's buffered writes first "
+            "(Bug 3), takes the rename lock for directory moves, and "
+            "honours `RENAME_NOREPLACE` and `RENAME_EXCHANGE`. Covered by "
+            "`tests/storage.rs`, the model-conformance suite, "
+            "`test_rename.sh`, `test_posix.sh` and the git workload."
         )
 
     def tutorial(self):
         return md(r"""
-            In this tutorial we will rename files and whole directory
-            trees, overwrite a file atomically, see which renames pgfs
-            refuses, and finish by running git (which depends on atomic
-            rename) inside the mount.
+            In this tutorial we will replace a file atomically the way editors and
+            package managers do, swap two names, and move a directory. We need a
+            mount.
 
-            We need a running mount; see [Your first pgfs
-            mount](projectlocalenvironment.md).
-
-            ## Step 1: rename over an existing file
+            ## Step 1: write-then-rename
 
             ```bash
-            mkdir testdata/mnt/rename && cd testdata/mnt/rename
-            echo v1 > a.txt
-            echo v2 > b.txt
-            mv a.txt b.txt
-            cat b.txt
-            ls
+            cd testdata/mnt
+            echo "version 1" > config
+            echo "version 2" > config.tmp
+            mv config.tmp config
+            cat config
             ```
 
-            ```text
-            v1
-            b.txt
-            ```
+            Readers see either version 1 or version 2, never a mix; after a crash
+            the new name never points at a file missing its writes.
 
-            `b.txt` now holds what `a.txt` held, and `a.txt` is gone.
-
-            ## Step 2: move a directory with everything in it
+            ## Step 2: swap two names
 
             ```bash
-            mkdir -p old/inner
-            echo deep > old/inner/file.txt
-            mv old new
-            cat new/inner/file.txt
+            echo a > left; echo b > right
+            mv --exchange left right
+            cat left right
             ```
 
-            ```text
-            deep
-            ```
-
-            ## Step 3: see what pgfs refuses
-
-            A directory cannot move inside itself:
+            ## Step 3: move a large directory
 
             ```bash
-            mv new new/inner/x
+            mkdir -p big/sub && for i in $(seq 1 1000); do : > big/sub/f$i; done
+            time mv big moved
             ```
 
-            ```text
-            mv: cannot move 'new' to a subdirectory of itself, 'new/inner/x'
-            ```
-
-            A directory cannot replace a non-empty directory:
-
-            ```bash
-            mkdir -p full && touch full/f
-            mkdir empty
-            mv -T empty full
-            ```
-
-            ```text
-            mv: cannot overwrite 'full': Directory not empty
-            ```
-
-            ## Step 4: run git
-
-            Git takes a lock by creating `config.lock`, writes the new
-            configuration into it, and renames it over `config`. Each
-            commit does the same with branch references.
-
-            ```bash
-            git init -q repo && cd repo
-            echo hello > README
-            git add README
-            git -c user.name=Tutorial -c user.email=tutorial@example.com commit -qm "first commit"
-            git log --oneline
-            ```
-
-            ```text
-            511658a first commit
-            ```
-
-            Your commit hash will differ.
-
-            ## Step 5: clean up
-
-            ```bash
-            cd ../../../..
-            rm -rf testdata/mnt/rename
-            ```
-
-            ## What we did
-
-            We replaced a file by renaming over it, moved a populated
-            directory in one step, saw the two renames POSIX forbids, and
-            ran a git workflow that depends on all of it. The
-            [explanation](../explanation/atomicrename.md) describes how one
-            database transaction makes this atomic.
+            The move changes one row, so it takes as long as moving an empty
+            directory.
         """)
 
     def how_to(self):
         return md(r"""
-            ## Replace a file without exposing a partial write
+            ## Replace a file atomically
 
-            Write to a temporary name in the same directory, close it, then
-            rename:
+            Write a temporary file in the same directory and `rename` it over the
+            target. No fsync is needed for atomicity: pgfs commits the temporary
+            file's writes before the rename.
 
-            ```bash
-            generate-report > .report.tmp && mv .report.tmp report.txt
-            ```
-
-            Readers see the old `report.txt` or the new one, never a mix.
-            Close the temporary file before renaming it; see Reference for
-            why.
-
-            ## Move a directory tree
+            ## Refuse to replace
 
             ```bash
-            mv projects/2024 archive/2024
+            mv --no-clobber src dst       # RENAME_NOREPLACE: fails if dst exists
             ```
-
-            The whole subtree moves in one transaction, however many
-            entries it contains. Large trees take time proportional to
-            their size.
-
-            ## Replace an empty directory with another directory
-
-            ```bash
-            mv -T staging live      # `live` must be empty
-            ```
-
-            ## Rename without overwriting
-
-            ```bash
-            mv -n draft.txt final.txt
-            ```
-
-            GNU `mv -n` first tries `renameat2(RENAME_NOREPLACE)`. pgfs
-            rejects that flag with `EINVAL`, and `mv` falls back to
-            checking for the target itself. The result is correct but not
-            atomic against a concurrent creator.
 
             ## Swap two entries
 
-            `mv --exchange` (`RENAME_EXCHANGE`) is not supported and fails
-            with `Invalid argument`. Use three renames through a temporary
-            name.
-
-            ## Check that a rename landed in the database
-
-            ```sql
-            SELECT parent, name, kind FROM entries
-            WHERE parent = 'archive' AND name = '2024';
+            ```bash
+            mv --exchange a b             # RENAME_EXCHANGE
             ```
         """)
 
@@ -1621,122 +1239,46 @@ class AtomicRename(Feat):
             | Source | Target | Result |
             |---|---|---|
             | file | absent | moved |
-            | file | file | target atomically replaced |
-            | file | directory | `EISDIR` |
-            | directory | absent | moved with all descendants |
+            | file | file | target atomically replaced (deleted, or orphaned if open) |
+            | file | directory | EISDIR |
+            | directory | absent | moved, descendants untouched |
             | directory | empty directory | target atomically replaced |
-            | directory | non-empty directory | `ENOTEMPTY` |
-            | directory | file | `ENOTDIR` |
-            | directory | inside its own subtree | `EINVAL` |
-            | any | itself | success, no change |
-            | absent | any | `ENOENT` |
-            | any, with `renameat2` flags ≠ 0 | any | `EINVAL` |
+            | directory | non-empty directory | ENOTEMPTY |
+            | directory | inside itself | EINVAL |
+            | either | the same inode | success, nothing changes |
 
-            ## Transaction
+            ## Flags
 
-            Every check that decides the outcome reads the primary
-            database, never a replica. A successful rename is one
-            transaction:
-
-            1. If the target exists, delete its `entries` row and its
-               `blocks` rows.
-            2. If the source is a directory, rewrite `parent` in every
-               `entries` and `blocks` row below it, replacing the old path
-               prefix with the new one.
-            3. Update the source's `entries` row to the new
-               `(parent, name)` and set its `mtime`.
-            4. Move the source's `blocks` rows to the new `(parent, name)`.
-            5. Commit. If no row moved, roll back and reply `EIO`.
-
-            After the commit, the in-memory path ↔ inode maps are re-keyed
-            for the entry and its whole subtree, so inode numbers the
-            kernel already holds stay valid.
-
-            ## Cost
-
-            | Rename | Rows written |
+            | Flag | Behaviour |
             |---|---|
-            | file | 1 entry + its blocks |
-            | directory | 1 entry + every descendant entry + every descendant block |
-
-            ## Open files
-
-            Pending writes in an open file's buffer are tied to the path
-            the file had when it was opened. Close or `fsync` a file
-            before renaming it, otherwise those writes are not carried
-            over to the new name.
-
-            ## Isolation
-
-            Concurrent SQL readers, and other pgfs daemons on the same
-            database, see the tree either entirely before or entirely
-            after the rename (PostgreSQL `READ COMMITTED`).
+            | `RENAME_NOREPLACE` | EEXIST if the target exists |
+            | `RENAME_EXCHANGE` | swap; ENOENT if either is missing |
+            | `RENAME_WHITEOUT`, unknown | EINVAL |
         """)
 
     def explanation(self):
         return md(r"""
-            ## Why rename has to be atomic
+            ## One row, no patterns
 
-            Rename is how Unix programs publish changes safely. An editor
-            saves by writing a temporary file and renaming it over the
-            original. Package managers install files the same way. Git
-            guards every configuration change and every branch update with
-            a lock file that is renamed into place. All of them rely on one
-            guarantee: at every instant the target name refers to a
-            complete file, either the old one or the new one.
+            A rename moves one dentry row and, at most, removes one replaced
+            target. No name matching is involved, which is what makes Bug 2
+            impossible: the first schema found descendants with `LIKE`, so `_` and
+            `%` in names acted as wildcards.
 
-            A filesystem that implemented rename as "delete the target,
-            then move the source" would open a window in which the name
-            refers to nothing. A crash in that window loses the file. So
-            rename was the first pgfs feature that had to be transactional
-            rather than merely correct.
+            ## Why buffered writes go first
 
-            ## One transaction, every row
+            A program that writes a file and renames it expects the new name to
+            show the writes. pgfs commits the file's pending writes before the
+            rename's own transaction, and PostgreSQL's WAL keeps that order through
+            a crash (Bug 3 was a rename that lost them).
 
-            In pgfs every entry stores the full path of its parent
-            directory. Moving a file therefore changes one `entries` row
-            and its blocks. Moving a directory changes every row beneath
-            it, because every one of those rows has the old path baked in.
+            ## Why directory moves take a lock
 
-            pgfs does all of it, including deleting an overwritten target,
-            in a single PostgreSQL transaction. PostgreSQL then supplies
-            the guarantees. Atomicity: after a crash the rename either
-            happened completely or not at all. Isolation: any other
-            connection sees the tree only before or after the move. The
-            daemon's own in-memory inode map is updated only after the
-            commit succeeds, so a failed rename leaves no trace.
-
-            ## The price of materialised paths
-
-            Rewriting every descendant makes the cost of a directory rename
-            proportional to the size of its subtree. Renaming a directory
-            holding a million files rewrites a million rows. Local
-            filesystems avoid this by naming directories with inode numbers
-            instead of paths, which makes a move a single pointer update.
-            The schema already carries `ino` and `parent_ino` columns for
-            exactly that change, described as `InoBasedRekeyingReq` in
-            [Performance Optimizations](optimizationroadmap.md).
-
-            ## Why `git` is the test
-
-            `git init` exercises rename-overwrite immediately: it creates
-            `config`, then rewrites it several times through
-            `config.lock`. It was also the first real program run against
-            pgfs, and it failed until directories were implemented.
-            Git's workflow, made of lock files, renames and readers that
-            expect complete files, is a compact stand-in for the guarantees
-            real applications need, so `test_git_init.sh` is part of the
-            integration suite.
-
-            ## Why `renameat2` flags are refused
-
-            `RENAME_NOREPLACE` and `RENAME_EXCHANGE` need their own atomic
-            implementations: "fail if the target exists" and "swap two
-            entries". Rather than approximate them, pgfs rejects them with
-            `EINVAL`, which well-behaved tools such as GNU `mv` already
-            handle by falling back to plain rename.
+            Two concurrent moves of directories into each other could form a
+            cycle. A move to a different parent takes a per-layer lock and checks
+            that the destination is not inside the source, in the same
+            transaction.
         """)
-
 
 class ReliableMount(Feat):
     """The filesystem mounts and unmounts cleanly. Crashing or killing
@@ -1745,335 +1287,167 @@ class ReliableMount(Feat):
     deps = [
         MountsCleanly,
         HandlesShutdownSignals,
-        DetectsDeadlock,
         WritesHealthFiles,
         ProvidesLifecycleScript,
+        BoundsEveryWait,
+        DatabaseStateMachine,
+        ReconnectsWithBackoff,
+        RevalidatesAfterReconnect,
+        IdempotentMutations,
+        PreservesBuffersAcrossReconnect,
+        RetriesSerializationFailures,
+        HonoursInterrupt,
+        InFlightAgeWatchdog,
+        SlowDatabaseSignal,
+        MapsDatabaseErrors,
     ]
 
     def title(self):
         return "Reliable Mount & Shutdown"
 
     def status(self):
-        return STABLE
+        return PARTIAL
 
     def status_note(self):
         return (
-            "AutoUnmount, signal-driven clean unmount, the deadlock "
-            "watchdog, health files and the `pgfs.sh` escalation path are "
-            "all implemented."
+            "AutoUnmount, clean shutdown that commits every buffer and "
+            "runs the synchronous barrier, health files, bounded waits, "
+            "the connection state machine with reconnect and revalidation "
+            "(Bug 5), op_log idempotency, serialization retries, the "
+            "in-flight watchdog, the slow-database signal and the "
+            "SQLSTATE table are built and tested. The fuser 0.14 crate "
+            "never delivers FUSE_INTERRUPT to the filesystem, so "
+            "`failure.HonoursInterrupt` is limited to the watchdog's "
+            "cancels."
         )
 
     def tutorial(self):
         return md(r"""
-            In this tutorial we will start pgfs, find its health files,
-            stop it politely, then kill it without warning and see that
-            the mount still disappears. Along the way we will see the three
-            layers that keep a mount from becoming a ghost.
+            In this tutorial we will stop the database under a mounted filesystem
+            and watch the mount recover, then shut it down cleanly. We need a mount
+            started with `./scripts/pgfs.sh up`.
 
-            ## Step 1: start the daemon and find its health files
+            ## Step 1: write something
 
             ```bash
-            ./scripts/pgfs.sh up
-            grep 'health pid file' testdata/pgfs.log | tail -1
+            echo before > testdata/mnt/f
+            ```
+
+            ## Step 2: restart PostgreSQL
+
+            ```bash
+            pg_ctl -D testdata/pgdata -m fast restart -l testdata/postgres.log -o "-k $PWD/testdata -h 127.0.0.1"
+            echo after >> testdata/mnt/f
+            cat testdata/mnt/f
+            grep 'database state' testdata/pgfs.log | tail -4
             ```
 
             ```text
-            health pid file: /tmp/pgfs-5049eced64c2821d.pid
+            INFO pgfs::health: database state Connected -> Broken: ...
+            INFO pgfs::health: database state Broken -> Reconnecting
+            INFO pgfs::health: database state Reconnecting -> Revalidating
+            INFO pgfs::health: database state Revalidating -> Connected: revalidation passed
             ```
 
-            The hash in the name is derived from the mount point. Next to
-            the PID file is a readiness file:
+            The append that found the connection broken waited for the mount to
+            reconnect and revalidate, then committed.
 
-            ```bash
-            ls /tmp/pgfs-*.pid /tmp/pgfs-*.ready
-            cat /tmp/pgfs-*.pid
-            ```
-
-            The PID it contains matches `./scripts/pgfs.sh status`.
-
-            ## Step 2: stop it politely
+            ## Step 3: shut down cleanly
 
             ```bash
             ./scripts/pgfs.sh down
+            grep -E 'committing buffers|flushed to WAL|session released' testdata/pgfs.log | tail -3
             ```
 
-            ```text
-            pgfs:      stopping (pid 1519591)
-            unmounted:  /path/to/pgfs/testdata/mnt
-            ```
-
-            The script sent SIGTERM. The daemon unmounted itself, removed
-            its health files and exited:
-
-            ```bash
-            grep 'received signal' testdata/pgfs.log | tail -1
-            ls /tmp/pgfs-*.pid 2>/dev/null || echo "no health files"
-            ```
-
-            ## Step 3: kill it without warning
-
-            ```bash
-            ./scripts/pgfs.sh up
-            kill -9 "$(cat testdata/pgfs.pid)"
-            sleep 1
-            grep testdata/mnt /proc/mounts || echo "mount is gone"
-            ```
-
-            ```text
-            mount is gone
-            ```
-
-            SIGKILL cannot be caught, so the daemon got no chance to clean
-            up. The kernel removed the mount anyway, because pgfs asked for
-            AutoUnmount when it mounted.
-
-            ## Step 4: confirm the state is clean
-
-            ```bash
-            ./scripts/pgfs.sh status
-            ```
-
-            ```text
-            mount:     none
-            daemon:    not running
-            postgres:  running
-            ```
-
-            Because the daemon was killed, its `/tmp` health files are
-            still there. They are harmless and are overwritten on the next
-            start.
-
-            ## What we did
-
-            We saw a clean, signal-driven shutdown and an uncatchable kill,
-            and both ended with no mount left behind. The
-            [explanation](../explanation/reliablemount.md) describes why
-            each layer exists.
+            SIGTERM commits every buffer, runs the synchronous barrier, unmounts,
+            and releases the lease.
         """)
 
     def how_to(self):
         return md(r"""
-            ## Stop the daemon cleanly
+            ## Take over a tree from a crashed daemon
 
             ```bash
-            ./scripts/pgfs.sh down
+            pgfs mount --takeover main /srv/pgfs
             ```
 
-            Or signal it directly; SIGINT, SIGTERM and SIGHUP all unmount
-            cleanly:
+            The new mount waits for the old lease to expire (`--lease`, default
+            30 s), then acquires it and reclaims the old mount's orphans.
 
-            ```bash
-            kill -TERM "$(cat testdata/pgfs.pid)"
-            ```
+            ## Find a stuck request
 
-            ## Wait for the mount to be ready (supervisors, scripts)
+            The watchdog logs a WARN past `--stall-warn` (5 s) naming the worker,
+            operation, inode and backend pid, and past `--stall-error` (60 s)
+            writes a state dump and cancels the query. Match the pid in
+            `pg_stat_activity`.
 
-            Poll for the readiness file. Its name is printed at startup
-            next to the PID file:
+            ## Run under systemd
 
-            ```bash
-            until [ -e /tmp/pgfs-<hash>.ready ]; do sleep 0.1; done
-            ```
-
-            Or poll `/proc/mounts` for the mount point, which is what
-            `pgfs.sh up` does.
-
-            ## Fix "Device or resource busy" on unmount
-
-            A process has its working directory or an open file inside the
-            mount. `pgfs.sh down` lists the holders and then lazy-unmounts.
-            To find them yourself:
-
-            ```bash
-            fuser -vm testdata/mnt
-            ```
-
-            ## Fix "Transport endpoint is not connected"
-
-            The daemon died and the mount was not removed, which happens
-            only if it was started without AutoUnmount (see the
-            `user_allow_other` warning below). Sweep it:
-
-            ```bash
-            ./scripts/pgfs.sh down
-            ```
-
-            or `fusermount3 -u -z testdata/mnt`.
-
-            ## Make AutoUnmount available
-
-            If the log shows
-            `mount with AutoUnmount failed (...); retrying without AutoUnmount`,
-            enable `user_allow_other`:
-
-            ```bash
-            sudo sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf
-            ```
-
-            ## Run pgfs under systemd
-
-            Use `Type=simple`, start the binary directly with an explicit
-            `--conn`, and let systemd stop it with SIGTERM:
-
-            ```ini
-            [Service]
-            Type=simple
-            ExecStart=/opt/pgfs/pgfs --conn "host=/run/postgresql dbname=pgfs" /srv/pgfs
-            KillSignal=SIGTERM
-            Restart=on-failure
-            ```
-
-            Services that need the mount should wait for the `.ready`
-            file, or for the mount point to appear in `/proc/mounts`.
+            Install `contrib/pgfs@.service`; the daemon sends `READY=1`,
+            `STOPPING=1` and `WATCHDOG=1` while no request is stalled.
         """)
 
     def reference(self):
         return md(r"""
-            ## Mount options
+            ## Startup
 
-            | Option | Value |
+            1. Connect with the bounded waits below; check the server version,
+               durability settings and schema version.
+            2. On a scratch filesystem emptied by a crash, run
+               `pgfs.scratch_reset()`.
+            3. Acquire the lease (read-write) or register the session (read-only).
+            4. Reclaim orphans; open one connection per worker; mount with
+               `AutoUnmount` and `default_permissions`.
+            5. Write the pid and ready files; notify systemd.
+
+            ## Bounded waits
+
+            | Setting | Value |
             |---|---|
-            | `fsname` | `pgfs` |
-            | `auto_unmount` | requested; if the mount fails with it, pgfs logs a WARN and retries without it |
-            | Kernel capability negotiated in `init` | `FUSE_BIG_WRITES` |
+            | `connect_timeout` | 5 s |
+            | `statement_timeout` | 30 s (housekeeping 60 s) |
+            | `lock_timeout` | 5 s |
+            | `idle_in_transaction_session_timeout` | 60 s |
+            | TCP keepalives | 10 s idle, 5 s interval, 3 probes; `tcp_user_timeout` 30 s |
 
-            ## Startup sequence
+            ## Connection states
 
-            1. Initialise logging; install the panic hook.
-            2. Block SIGINT, SIGTERM, SIGHUP, SIGUSR1 and SIGUSR2 in every
-               thread, so a signal that arrives during startup waits
-               instead of killing the process.
-            3. Connect to PostgreSQL and create the schema if needed.
-            4. Write `/tmp/pgfs-<hash>.pid`; print and log its path.
-            5. Create the FUSE session (mount).
-            6. Write `/tmp/pgfs-<hash>.ready`.
-            7. Start the liveness, metrics, deadlock-watchdog and
-               signal-waiter threads.
-            8. Serve FUSE requests until unmounted.
-
-            ## Signals
-
-            | Signal | Effect |
+            | State | New requests |
             |---|---|
-            | SIGINT, SIGTERM, SIGHUP | clean unmount; the daemon exits with status 0 |
-            | SIGUSR1 | state dump on the next FUSE callback (see [Observability](observabledaemon.md)) |
-            | SIGUSR2 | toggle CPU profiling (see [On-Demand Profiling](ondemandprofiling.md)) |
-            | SIGKILL, crash, OOM kill | the kernel removes the mount (AutoUnmount); health files remain |
-
-            Signals are received with `sigwait` on a dedicated
-            `signal-waiter` thread, never in an asynchronous handler.
-
-            ## Health files
-
-            | File | Written | Contents | Removed |
-            |---|---|---|---|
-            | `/tmp/pgfs-<hash>.pid` | after the database connection succeeds | daemon PID | on clean exit |
-            | `/tmp/pgfs-<hash>.ready` | after the mount is created | `ready` | on clean exit |
-
-            `<hash>` is 16 hex digits computed from the mountpoint argument
-            exactly as given, so `./mnt` and `/abs/path/mnt` produce
-            different names.
-
-            ## Deadlock watchdog
-
-            | Parameter | Value |
-            |---|---|
-            | Heartbeat period | 10 s |
-            | Stall threshold | 30 s without a heartbeat, observed by a FUSE callback |
-            | Action | ERROR log; the callback replies `EIO`; the watchdog unmounts |
-            | Unmount retries | 5, 500 ms apart; then the process exits with status 1 |
-
-            ## Database connection lifetime
-
-            The daemon acquires one primary connection (and one standby
-            connection with `--replica`) at startup and keeps it until
-            exit. It does not reconnect. If PostgreSQL restarts or the
-            connection drops, every operation that reaches the database
-            replies `EIO` until the daemon is restarted. The mount itself
-            stays up and still unmounts cleanly.
-
-            ## Panics
-
-            | Build | Behaviour |
-            |---|---|
-            | debug | the panic hook writes the crash report, then the panic unwinds |
-            | release | the panic hook writes the crash report, then the process aborts (`panic = "abort"`) and the kernel removes the mount |
+            | Connected | served |
+            | Broken, Reconnecting, Revalidating | EIO at once; the in-flight request waits for revalidation |
+            | Fenced | EIO until remount |
 
             ## Exit status
 
-            | Status | Cause |
+            | Status | Meaning |
             |---|---|
-            | 0 | clean unmount |
-            | 1 | startup failure (error chain printed as `pgfs: …`), or the deadlock watchdog gave up |
+            | 0 | clean unmount, every buffer committed |
+            | 1 | the run ended but some buffered data could not be committed |
+            | 2 | could not start (error chain printed as `pgfs: …`) |
         """)
 
     def explanation(self):
         return md(r"""
-            ## What a ghost mount is
+            ## Fail fast, recover by revalidating
 
-            A FUSE filesystem is a contract between the kernel and a user
-            process: the kernel forwards every operation on the mount to
-            the process and waits for an answer. If the process disappears
-            and nobody tells the kernel, the mount stays. Every access to
-            it fails with "Transport endpoint is not connected", and tools
-            that walk the filesystem tree, such as `df`, `find /` and
-            backup jobs, hit the dead mount and stall or fail. That is a
-            ghost mount, and avoiding them shaped how pgfs starts and
-            stops.
+            When the database goes away, a mount that queues requests builds a
+            backlog that keeps it overloaded after the database returns. pgfs
+            fails new requests at once with EIO, lets only the request in flight
+            wait, and reconnects with jittered backoff. Before serving again it
+            checks that the database is the same one with the same history: the
+            system identifier, the timeline, the schema and `fs_uuid`, its own
+            lease row, and that every worker's op_log slot holds at least the last
+            mutation it acknowledged. If an acknowledged commit was lost, the
+            mount fences itself rather than serve a rewound filesystem.
 
-            ## Three layers, weakest to strongest
+            ## A watchdog that can see a stuck worker
 
-            **The lifecycle script** treats `/proc/mounts` as the source
-            of truth rather than trusting PID files. If a mount exists
-            with no live daemon behind it, `pgfs.sh up` sweeps it before
-            mounting again. `pgfs.sh down` escalates from a polite signal
-            to `fusermount3 -u` to a lazy unmount, and on the way it names
-            the processes holding the mount busy, because "device busy"
-            with no explanation is the most common frustration.
-
-            **Signal handling** turns the polite signals into a clean
-            unmount. pgfs blocks the signals it cares about in every
-            thread and receives them with `sigwait` on one dedicated
-            thread. That thread can safely take locks and call the
-            unmount routine, which an asynchronous signal handler cannot.
-            The signals are blocked before anything else happens, so a
-            Ctrl+C during startup is queued rather than killing a
-            half-initialised daemon.
-
-            **AutoUnmount** is the layer that cannot fail. With it, the
-            kernel itself watches the daemon process and removes the mount
-            when the process exits for any reason: a clean return, a
-            panic, SIGKILL or the OOM killer. Every other layer is a
-            courtesy that produces a cleaner shutdown and clearer logs.
-            AutoUnmount is the guarantee.
-
-            ## Why release builds abort on panic
-
-            A panic in a FUSE daemon usually means an invariant has broken.
-            Unwinding can leave the process alive in an inconsistent state
-            and still answering kernel requests. In release builds, pgfs
-            aborts instead. The panic hook writes a crash report first,
-            and AutoUnmount turns the abort into a clean disappearance.
-
-            ## Why a deadlock unmounts the filesystem
-
-            A wedged daemon is worse than a dead one. The kernel keeps
-            waiting on it, and every process that touches the mount hangs
-            in uninterruptible sleep. The liveness heartbeat detects this:
-            a thread that cannot make progress stops advancing a counter,
-            and the next request to arrive replies with an error and
-            triggers an unmount. This converts a hang into an error, which
-            processes can handle.
-
-            ## Health files
-
-            Supervisors need a cheap way to ask "is it up yet?" without
-            parsing logs. The PID file appears once the database is
-            reachable, and the readiness file appears once the mount
-            exists. Both are keyed by a hash of the mount point, so several
-            pgfs mounts on one machine do not collide.
+            A heartbeat thread can only notice that the heartbeat thread is stuck.
+            pgfs records each worker's in-flight request in an atomic slot, and a
+            separate thread watches the slots' ages, so a worker stuck in a query
+            is reported, dumped and cancelled, never turned into a lost mount.
         """)
-
 
 class ObservableDaemon(Feat):
     """Operators can see what the daemon is doing, how fast it is doing
@@ -2100,389 +1474,130 @@ class ObservableDaemon(Feat):
 
     def status_note(self):
         return (
-            "Tracing, the 60-second metrics, the SIGUSR1 state dump, error "
-            "chains and crash reports all ship today. Of the per-errno "
-            "counters, only `eio` and `enoent` are incremented yet."
+            "Tracing with spans per callback (worker and view included) "
+            "and per database call (statement, inode, backend pid, round "
+            "trip), the nine 60-second metrics lines with every errno "
+            "counted where it is replied, the SIGUSR1 dump written by the "
+            "signal thread from atomics, and crash reports all ship. A "
+            "test keeps the instrumented callback list in step with the "
+            "`Filesystem` impl."
         )
 
     def tutorial(self):
         return md(r"""
-            In this tutorial we will watch pgfs work: follow its log, ask a
-            running daemon for a state dump, read a metrics report, and
-            then break the database on purpose to see what a real failure
-            looks like. We need a terminal for the daemon and a second one
-            for commands.
+            In this tutorial we will read the daemon's log, metrics and state dump
+            while it works. We need a mount started with `./scripts/pgfs.sh up`.
 
-            ## Step 1: run the daemon in the foreground
-
-            In the first terminal:
+            ## Step 1: watch spans
 
             ```bash
-            ./scripts/pgfs.sh run
+            pkill -f 'pgfs mount main' ; RUST_LOG=pgfs=debug ./target/debug/pgfs mount main testdata/mnt 2> testdata/obs.log &
+            sleep 1; ls testdata/mnt > /dev/null
+            grep 'fuse{op="getattr"' testdata/obs.log | head -2
             ```
 
-            The startup lines show the replica mode, the health file and
-            the negotiated FUSE capability:
+            Every callback runs in a `fuse` span with its operation, inode, worker
+            and view; database calls nest inside it as `db` spans with the
+            statement, backend pid and round-trip time.
 
-            ```text
-            INFO pgfs: replica mode: off (single primary)
-            health pid file: /tmp/pgfs-5049eced64c2821d.pid
-            INFO init: pgfs::fs: FUSE init: negotiated FUSE_BIG_WRITES
-            ```
-
-            ## Step 2: see that normal misses are quiet
-
-            In the second terminal:
+            ## Step 2: ask for a state dump
 
             ```bash
-            cat testdata/mnt/does-not-exist
+            kill -USR1 "$(pgrep -f 'pgfs mount main testdata/mnt')"
+            grep 'state|' testdata/obs.log | tail -12
             ```
 
-            `cat` reports "No such file or directory", and the daemon's log
-            stays silent. A missing file is an expected answer, not a
-            failure, so pgfs does not log it.
+            The signal thread writes the dump itself, so it appears even when
+            every worker is stuck.
 
-            ## Step 3: ask for a state dump
+            ## Step 3: read the metrics
 
-            ```bash
-            kill -USR1 "$(pgrep -f 'target/debug/pgfs')"
-            ls testdata/mnt > /dev/null
-            ```
-
-            The dump is written by the next filesystem operation, here the
-            `ls`:
-
-            ```text
-            INFO pgfs: SIGUSR1 received; state dump will appear on next FUSE callback
-            INFO getattr{ino=1}: pgfs::fs: state|ino_cache=3 next_ino=4 db=connected (replica none) uptime_secs=41
-            state|fuse_latency=fuse total=12 p50=<=1kµs p95=<=10kµs p99=<=10kµs
-            state|db_latency=db total=15 p50=<=1kµs p95=<=1kµs p99=<=10kµs
-            ```
-
-            ## Step 4: read a metrics report
-
-            Do some work, then wait for the minute to turn over:
-
-            ```bash
-            for i in $(seq 1 50); do echo $i > testdata/mnt/m$i; done
-            rm testdata/mnt/m*
-            ```
-
-            Within 60 seconds, five `metrics|` lines appear. The
-            `metrics|ops` line counts the 50 creates and 50 unlinks among
-            the other operations.
-
-            ## Step 5: break the database
-
-            Stop PostgreSQL underneath the running mount, then touch a name
-            the kernel has not cached:
-
-            ```bash
-            make db-stop
-            ls testdata/mnt/after-stop
-            ```
-
-            ```text
-            ls: cannot access 'testdata/mnt/after-stop': Input/output error
-            ```
-
-            This time the first terminal shows an ERROR. Read it left to
-            right: the FUSE operation and its arguments (the span), what
-            pgfs was doing and where (`src/db.rs:453`), and the root cause
-            reported by PostgreSQL:
-
-            ```text
-            ERROR lookup{parent=1 name=after-stop}: pgfs::fs: get attributes of entry "after-stop" in "" (at src/db.rs:453): db error: FATAL: terminating connection due to administrator command
-            ```
-
-            ## Step 6: recover
-
-            Start PostgreSQL again, then restart the daemon. pgfs holds a
-            single database connection for its whole lifetime and does not
-            reconnect, so it needs the restart:
-
-            ```bash
-            ./scripts/init_db.sh
-            ```
-
-            Press Ctrl+C in the first terminal. The daemon logs
-            `received signal 2; unmounting cleanly` and exits. Run
-            `./scripts/pgfs.sh run` again, and `ls testdata/mnt` works.
-
-            ## What we did
-
-            We saw that expected misses stay out of the log, pulled live
-            state out of a running daemon, read its periodic metrics, and
-            followed a real failure from the kernel's bare `EIO` to its
-            root cause. The [reference](../reference/observabledaemon.md)
-            lists every field; the [explanation](../explanation/observabledaemon.md)
-            covers the design.
+            Every 60 s the daemon logs nine `metrics|…` lines: operations, errnos,
+            replica, FUSE latency, database latency, connection state, in-flight
+            age, space and integrity.
         """)
 
     def how_to(self):
         return md(r"""
-            ## Change the log level
+            ## Get JSON logs
 
             ```bash
-            RUST_LOG=pgfs=debug ./scripts/pgfs.sh run              # every DB query
-            RUST_LOG=pgfs::fs=debug,pgfs::db=info ./scripts/pgfs.sh run
+            RUST_LOG_FORMAT=json pgfs mount main /srv/pgfs 2> pgfs.jsonl
             ```
 
-            The default is `pgfs=info`. The level is read at startup, so
-            changing it requires a restart.
-
-            ## Get JSON logs for a log pipeline
+            ## Turn up one module
 
             ```bash
-            RUST_LOG_FORMAT=json ./target/debug/pgfs testdata/mnt 2> pgfs.jsonl
-            jq -c 'select(.level == "ERROR")' pgfs.jsonl
+            RUST_LOG=pgfs=info,pgfs::pg=debug pgfs mount main /srv/pgfs
             ```
 
-            ## Find out why an operation returned "Input/output error"
+            ## Match a slow span to the database
 
-            ```bash
-            grep ' ERROR ' testdata/pgfs.log | tail -5
-            ```
-
-            Read each line left to right: the FUSE span that failed, then
-            each layer's context with its `file:line`, then the root cause
-            after the last `: `.
-
-            ## Recover from "Input/output error" on every operation
-
-            If every access fails and the log shows connection errors, the
-            daemon's database connection is gone. pgfs does not reconnect.
-            Make sure PostgreSQL is running, then restart the daemon:
-
-            ```bash
-            ./scripts/ensure_db.sh
-            ./scripts/pgfs.sh down && ./scripts/pgfs.sh up
-            ```
-
-            ## Take a snapshot of a running daemon
-
-            ```bash
-            kill -USR1 <pid>
-            ls <mountpoint> > /dev/null     # any access triggers the dump
-            ```
-
-            ## Extract metrics from the log
-
-            ```bash
-            grep -o 'metrics|ops|.*' testdata/pgfs.log | tail -1
-            grep -o 'metrics|latency|.*' testdata/pgfs.log | tail -2
-            ```
-
-            ## Check that the daemon is alive from a script
-
-            ```bash
-            pid=$(cat /tmp/pgfs-<hash>.pid) && kill -0 "$pid" && test -e /tmp/pgfs-<hash>.ready
-            ```
-
-            ## Get a useful crash report
-
-            Run with `RUST_BACKTRACE=1` (or `full`) so the report includes a
-            symbolised backtrace. The report is printed to stderr and
-            logged at ERROR, so it ends up in `testdata/pgfs.log` when the
-            daemon was started by `pgfs.sh`.
+            The `db` span records the backend pid; look it up in
+            `pg_stat_activity`.
         """)
 
     def reference(self):
         return md(r"""
-            ## Logging
-
-            | Setting | Values | Default |
-            |---|---|---|
-            | `RUST_LOG` | `tracing-subscriber` `EnvFilter` syntax | `pgfs=info` |
-            | `RUST_LOG_FORMAT` | `json` for newline-delimited JSON; anything else for text | text |
-            | Destination | stderr | |
-
             ## Log levels
 
             | Level | Used for |
             |---|---|
-            | ERROR | unexpected failures (with the full error chain), crash reports, deadlock detection |
-            | WARN | degraded but working: replica fallback, AutoUnmount unavailable, health file write failures |
-            | INFO | lifecycle (startup, mount, signals, shutdown), metrics, state dumps, profiling |
-            | DEBUG | FUSE callback and database spans, reads served from the primary |
+            | ERROR | unexpected failures with their full chain, fencing, crash reports, checksum mismatches |
+            | WARN | degraded but working: retries, timeouts with their thresholds, slow database, standby fallbacks |
+            | INFO | lifecycle, state transitions, metrics, state dumps |
+            | DEBUG | expected errnos, per-operation detail |
 
-            Expected conditions (`ENOENT`, `EEXIST`, `ENOTEMPTY`, `EISDIR`,
-            `ENOTDIR`, `EINVAL`) are replied without logging.
+            ## Metrics lines (every 60 s)
 
-            ## Spans
-
-            | Span | Level | Fields |
-            |---|---|---|
-            | `lookup`, `create`, `mkdir`, `unlink`, `rmdir` | INFO | `parent`, `name` |
-            | `getattr`, `open`, `readdir` | INFO | `ino` (`readdir`: + `offset`) |
-            | `read`, `write` | INFO | `ino`, `fh`, `offset`, `size`/`len` |
-            | `setattr` | INFO | `ino`, `size` |
-            | `fsync` | INFO | `fh` |
-            | `rename` | INFO | `parent`, `name`, `newparent`, `newname`, `flags` |
-            | `db::getattr`, `db::list`, `db::create`, `db::mkdir`, `db::unlink`, `db::rmdir` | DEBUG | `parent`, `name` |
-            | `db::read_range`, `db::write_range` | DEBUG | `parent`, `name`, `offset`, `len` |
-            | `db::truncate` | DEBUG | `parent`, `name`, `new_size` |
-            | `db::write_blocks_batch` | DEBUG | `parent`, `name`, `count`, `new_size` |
-            | `db::rename` | DEBUG | `old_parent`, `old_name`, `new_parent`, `new_name` |
-
-            ## Periodic metrics
-
-            Logged at INFO every 60 s by the `metrics-export` thread:
-
-            ```text
-            metrics|ops|lookup=N getattr=N setattr=N read=N write=N create=N mkdir=N unlink=N rmdir=N rename=N readdir=N open=N fsync=N
-            metrics|errors|eio=N enoent=N eexist=N enotempty=N eisdir=N enotdir=N einval=N
-            metrics|replica|reads=N fallbacks=N
-            metrics|latency|fuse=fuse total=N p50=<=Xµs p95=<=Xµs p99=<=Xµs
-            metrics|latency|db=db total=N p50=<=Xµs p95=<=Xµs p99=<=Xµs
-            ```
-
-            | Counter | Incremented when |
+            | Line | Fields |
             |---|---|
-            | `ops` fields | the corresponding FUSE callback runs (`flush` and `release` are not counted) |
-            | `eio` | an unexpected failure is logged and replied as `EIO` |
-            | `enoent` | `lookup` cannot resolve its parent inode or name |
-            | `eexist`, `enotempty`, `eisdir`, `enotdir`, `einval` | declared; not yet incremented |
-            | `replica reads` | a `getattr`, `lookup` or `readdir` is served by the standby |
-            | `replica fallbacks` | a read goes to the primary while a standby is configured |
-
-            All counters are totals since startup.
-
-            ## Latency histograms
-
-            | Histogram | Records |
-            |---|---|
-            | `fuse` | wall-clock time of every instrumented FUSE callback |
-            | `db` | wall-clock time of every `Db` method |
-
-            Buckets: `<=10`, `<=100`, `<=1k`, `<=10k`, `<=100k`, `<=1M`,
-            `>1M` microseconds. Each percentile is reported as the upper
-            bound of the bucket that contains it.
+            | `metrics\|ops\|…` | one counter per callback |
+            | `metrics\|errors\|…` | one counter per errno in the catalogue |
+            | `metrics\|replica\|…` | reads, fallbacks, lag_bytes, lag_ms, ticket_waits |
+            | `metrics\|latency\|fuse=…` | p50 / p95 / p99 of callbacks |
+            | `metrics\|latency\|db=…` | p50 / p95 / p99 of database calls |
+            | `metrics\|db\|…` | state, reconnects, fenced, slow_db |
+            | `metrics\|inflight\|oldest_ms=…` | age of the oldest in-flight request |
+            | `metrics\|space\|…` | live, physical, inline and snapshot-only bytes; backlog; dead tuples; WAL per user byte |
+            | `metrics\|integrity\|checksum_failures=…` | checksum failures |
 
             ## State dump (SIGUSR1)
 
-            ```text
-            state|ino_cache=N next_ino=N db=connected (replica none|fresh|stale or unreachable) uptime_secs=N
-            state|fuse_latency=fuse total=N p50=… p95=… p99=…
-            state|db_latency=db total=N p50=… p95=… p99=…
-            ```
+            `state|mount=… view=… fence=… layer=… db=… uptime_secs=…`, one
+            `state|worker=N` line per worker (operation, inode, age, backend pid),
+            `state|cache=… handles=… buffered_bytes=…`, the replica line, and the
+            latency summaries. Any lock that cannot be taken at once prints
+            `locked`.
 
-            | Field | Meaning |
-            |---|---|
-            | `ino_cache` | paths with an assigned inode number |
-            | `next_ino` | next inode number to be assigned |
-            | `replica` | `none` without `--replica`; otherwise the cached freshness verdict |
-            | `uptime_secs` | seconds since the mount was created |
-
-            A final dump is logged on clean shutdown.
-
-            ## Error chain format
-
-            Unexpected failures are logged at ERROR as one line, the
-            `anyhow` alternate (`{:#}`) rendering of the chain, inside the
-            span of the FUSE callback that failed:
-
-            ```text
-            ERROR <callback>{<span fields>}: pgfs::fs: <what was attempted> (at src/<file>.rs:<line>): <deeper context> (at …): <root cause>
-            ```
-
-            Example:
-
-            ```text
-            ERROR lookup{parent=1 name=after-stop}: pgfs::fs: get attributes of entry "after-stop" in "" (at src/db.rs:453): db error: FATAL: terminating connection due to administrator command
-            ```
-
-            Startup failures are printed to stderr in the same form,
-            prefixed `pgfs: `, and the process exits with status 1.
-
-            ## Crash report
-
-            Written to stderr and logged at ERROR before the process
-            unwinds or aborts:
-
-            ```text
-            panic at <file>:<line>: <message>
-            pgfs v<version> on <os>/<arch>, built with <rustc version>, RUST_BACKTRACE=<value>
-            Backtrace:
-            <backtrace>
-            ```
-
-            ## Background threads
+            ## Threads
 
             | Thread | Role |
             |---|---|
-            | `signal-waiter` | receives SIGINT, SIGTERM, SIGHUP, SIGUSR1, SIGUSR2 |
-            | `metrics-export` | logs metrics every 60 s |
-            | `liveness` | heartbeat every 10 s |
-            | `deadlock-watchdog` | unmounts when a stall is detected |
+            | `worker-N` | dispatch workers, one database connection each |
+            | `renewer` | lease renewal and self-fencing |
+            | `reconnector` | reconnect and revalidation |
+            | `housekeeping` | usage folding, reclaim, GC, change pruning and notifications, auto-flatten |
+            | `control` | owner-drained snapshots and branches |
+            | `watchdog` | in-flight ages, stall warnings and cancels, systemd watchdog |
+            | `signal-waiter` | SIGINT/SIGTERM/SIGHUP shutdown, SIGUSR1 dump, SIGUSR2 profiling |
+            | `metrics-export` | the 60 s metrics lines |
         """)
 
     def explanation(self):
         return md(r"""
-            ## The kernel only hears an errno
+            ## Everything an operator needs is in the log
 
-            When something fails inside a FUSE callback, the kernel can be
-            told exactly one thing: an error number. `EIO` carries no
-            message, no location and no cause. The process that called
-            `read` learns that something went wrong and nothing else.
-            Everything an operator needs to fix the problem therefore has
-            to be in the daemon's own log, and pgfs is built around that.
+            FUSE can only return an errno to the program; the reason for an EIO
+            lives in the daemon. pgfs therefore logs every unexpected failure with
+            its whole error chain, keeps expected errnos out of the log, and counts
+            both, so a spike in "file not found" can be told apart from a database
+            failing.
 
-            ## Errors that tell a story
+            ## Signals that predict failure
 
-            Every fallible step in pgfs wraps its error with what it was
-            trying to do and where, using `#[track_caller]` so the location
-            is the caller's line, not the helper's. As an error travels up
-            from the database driver through the storage layer to the FUSE
-            callback, it accumulates a chain: "lookup during readdir, at
-            this line, because fetching attributes, at that line, failed
-            because the connection closed". The rule is that an operator
-            should never need a debugger or the source code to understand a
-            failure.
-
-            The other half of the rule is to not log what is normal. A
-            shell probing for a file that does not exist is not an error,
-            and logging every `ENOENT` would bury real failures. Expected
-            conditions are answered with their errno and nothing else.
-            Only unexpected failures are logged, always at ERROR and always
-            with the full chain.
-
-            ## Spans instead of log lines
-
-            pgfs uses the `tracing` crate rather than plain logging. Each
-            FUSE callback opens a span, and each database call opens a span
-            inside it. Any message emitted underneath carries the full
-            context, and timing tools can attribute time to "FUSE"
-            versus "database". JSON output keeps the same structure for
-            machines.
-
-            ## Metrics that are cheap enough to keep on
-
-            The counters are atomic integers and the histograms are seven
-            atomic buckets, so recording costs a few nanoseconds and is
-            always on. Fixed buckets and percentiles approximated to a
-            bucket bound are coarse, but they answer the questions that
-            matter in operation: is it a 100 µs filesystem or a 10 ms one,
-            and is it getting worse. Separating `eio` from expected
-            errnos lets an operator tell a spike in "file not found" from a
-            spike in "database down". Exporting through the log keeps the
-            first iteration free of extra endpoints; the counters are plain
-            statics, so an exporter can be added without changing the
-            instrumentation.
-
-            ## Asking a running daemon
-
-            SIGUSR1 requests a snapshot without restarting anything. Signal
-            handlers are severely restricted in what they may do, so the
-            signal only sets a flag. The next FUSE callback, which runs in
-            a normal context, writes the dump. On an idle mount that means
-            the dump waits for the next access, a deliberate trade for
-            never doing real work inside signal handling.
-
-            ## Crash reports
-
-            A panic report is written to both stderr and the log, because
-            either may be the one an operator actually has. It includes the
-            version, platform and compiler, so it can be pasted into a bug
-            report as is.
+            Counting what happened is not enough: slow failures matter more. The
+            metrics include the age of the oldest request, the connection state,
+            a slow-database gauge, replica lag, the reclaim backlog and write
+            amplification, so trouble shows before it becomes an outage.
         """)

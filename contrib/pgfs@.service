@@ -1,0 +1,28 @@
+# pgfs@.service — one pgfs tree per instance (spec/ops.py NotifiesSystemd).
+#
+#   systemctl enable --now pgfs@main
+#
+# mounts the tree named by the instance at /srv/pgfs/<instance>. Put the
+# connection string in /etc/pgfs/conn (PGFS_CONN=...), and the password in
+# a pgpass file, never on the command line.
+[Unit]
+Description=pgfs tree %i
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+EnvironmentFile=/etc/pgfs/conn
+ExecStartPre=/usr/bin/mkdir -p /srv/pgfs/%i
+ExecStart=/usr/local/bin/pgfs mount %i /srv/pgfs/%i
+# SIGTERM commits every buffer, runs the synchronous barrier, unmounts and
+# releases the lease (spec/durability.py FlushesOnShutdown).
+KillSignal=SIGTERM
+TimeoutStopSec=45
+WatchdogSec=30
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,142 +1,121 @@
-//! Observability: counters, histograms, and periodic export.
-//!
-//! Every FUSE callback and DB operation records:
-//! - An atomic counter (workload composition)
-//! - Wall-clock latency into a histogram
-//!
-//! Error counters distinguish "normal" ENOENT/ENOTEMPTY from unexpected EIO.
-//! Metrics are logged at `info!` every 60 s. A liveness heartbeat counter
-//! is bumped by a background thread; FUSE callbacks check it to detect
-//! deadlock.
+//! Counters, histograms and gauges (spec/observe.py Metrics), exported
+//! as nine INFO lines every 60 s (spec/app.py ExportsPeriodicMetrics).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::Mutex;
+use std::time::Duration;
 
-// ── FUSE operation counters ────────────────────────────────────────────
+/// Per-callback operation counters, in export order.
+pub const OPS: &[&str] = &[
+    "lookup",
+    "getattr",
+    "setattr",
+    "readlink",
+    "mknod",
+    "mkdir",
+    "unlink",
+    "rmdir",
+    "symlink",
+    "rename",
+    "link",
+    "open",
+    "read",
+    "write",
+    "flush",
+    "release",
+    "fsync",
+    "readdir",
+    "readdirplus",
+    "fsyncdir",
+    "statfs",
+    "setxattr",
+    "getxattr",
+    "listxattr",
+    "removexattr",
+    "create",
+    "fallocate",
+    "lseek",
+    "copy_file_range",
+    "forget",
+];
 
-macro_rules! counters {
-    ($($name:ident),* $(,)?) => {
-        $(
-            pub static $name: AtomicU64 = AtomicU64::new(0);
-        )*
-    };
-}
+static OP_COUNTS: [AtomicU64; 30] = [const { AtomicU64::new(0) }; 30];
 
-counters! {
-    LOOKUP_COUNT, GETATTR_COUNT, SETATTR_COUNT, READ_COUNT, WRITE_COUNT,
-    CREATE_COUNT, MKDIR_COUNT, UNLINK_COUNT, RMDIR_COUNT, RENAME_COUNT,
-    READDIR_COUNT, OPEN_COUNT, FSYNC_COUNT,
-}
-
-// ── Error counters ─────────────────────────────────────────────────────
-
-/// Unexpected failures logged via log_and_reply! → EIO.
-pub static EIO_COUNT: AtomicU64 = AtomicU64::new(0);
-
-counters! {
-    ENOENT_COUNT, EEXIST_COUNT, ENOTEMPTY_COUNT, EISDIR_COUNT,
-    ENOTDIR_COUNT, EINVAL_COUNT,
-}
-
-// ── Replica routing counters ──────────────────────────────────────────
-
-/// Reads served from the replica standby (see spec/replica.py).
-pub static REPLICA_READ_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Reads that fell back to the primary because the standby was unreachable
-/// or had not caught up with the primary's WAL. Only incremented when a
-/// replica is configured (a single-node mount has nothing to fall back
-/// from). A rising count means replication is struggling.
-pub static REPLICA_FALLBACK_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Set once the first fallback has been reported at WARN (rate limit so
-/// the log doesn't spam while a standby is down).
-pub static REPLICA_FALLBACK_WARNED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-// ── Liveness heartbeat ─────────────────────────────────────────────────
-
-/// Bumped by a background thread every N seconds. FUSE callbacks check this
-/// on entry (see [`check_liveness`]); if it has not advanced within 3×N the
-/// daemon logs ERROR, flags [`DEADLOCK_DETECTED`], and a watchdog thread in
-/// main.rs performs the clean unmount.
-pub static LIVENESS: AtomicU64 = AtomicU64::new(0);
-
-/// Heartbeat cadence (N), and the stall deadline (3×N), in milliseconds.
-const HEARTBEAT_PERIOD_MS: u64 = 10_000;
-const HEARTBEAT_DEADLINE_MS: u64 = 3 * HEARTBEAT_PERIOD_MS;
-
-/// The LIVENESS value the last callback observed, and the monotonic
-/// deadline by which the next beat must arrive (millis since process
-/// boot). Used by [`check_liveness`].
-///
-/// Both are monotonic (see [`now_mono_millis`]) so a wall-clock jump (NTP
-/// step, manual `date`) can never cause a spurious "deadlock": the whole
-/// point of this check is to avoid false positives on an idle mount.
-static LAST_BEAT_SEEN: AtomicU64 = AtomicU64::new(u64::MAX);
-static BEAT_DEADLINE_AT: AtomicU64 = AtomicU64::new(u64::MAX);
-
-/// Set by a FUSE callback that caught a stalled heartbeat; the watchdog
-/// thread in main.rs polls this and performs the clean unmount.
-pub static DEADLOCK_DETECTED: AtomicBool = AtomicBool::new(false);
-
-/// Call at the top of every FUSE callback. Returns true while the liveness
-/// heartbeat is advancing; false once the counter has not advanced within
-/// 3×N seconds (N = 10 s), i.e. the daemon is wedged. The first call
-/// always returns true — it only establishes the baseline.
-pub fn check_liveness() -> bool {
-    let now_ms = now_mono_millis();
-    let counter = LIVENESS.load(Ordering::Acquire);
-    let last_counter = LAST_BEAT_SEEN.load(Ordering::Relaxed);
-    if last_counter == u64::MAX || counter != last_counter {
-        // First observation, or the heartbeat advanced since the last
-        // callback: healthy. Arm a fresh deadline 3×N out.
-        LAST_BEAT_SEEN.store(counter, Ordering::Relaxed);
-        BEAT_DEADLINE_AT.store(now_ms + HEARTBEAT_DEADLINE_MS, Ordering::Relaxed);
-        true
-    } else {
-        // Counter unchanged since the last callback. Still healthy while
-        // the deadline (3×N after the last observed beat) has not passed;
-        // past it, the heartbeat is wedged.
-        now_ms < BEAT_DEADLINE_AT.load(Ordering::Relaxed)
+pub fn count_op(op: &str) {
+    if let Some(i) = OPS.iter().position(|o| *o == op) {
+        OP_COUNTS[i].fetch_add(1, Ordering::Relaxed);
     }
 }
 
-/// Monotonic millis since process boot. Immune to wall-clock jumps, unlike
-/// `SystemTime::now()` — critical for a check whose job is avoiding false
-/// positives.
-fn now_mono_millis() -> u64 {
-    static BOOT: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    BOOT.get_or_init(Instant::now).elapsed().as_millis() as u64
+pub fn op_count(op: &str) -> u64 {
+    OPS.iter()
+        .position(|o| *o == op)
+        .map(|i| OP_COUNTS[i].load(Ordering::Relaxed))
+        .unwrap_or(0)
 }
 
-// ── Latency histogram ──────────────────────────────────────────────────
-//
-// Buckets: ≤10µs, ≤100µs, ≤1ms, ≤10ms, ≤100ms, ≤1s, >1s
+static ERRNO_COUNTS: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+
+/// Count an errno where it is replied (spec/app.py ExportsPeriodicMetrics:
+/// none stays at zero by omission).
+pub fn count_errno(errno: i32) {
+    if let Some(i) = crate::errno::CATALOGUE
+        .iter()
+        .position(|c| c.errno == errno)
+    {
+        ERRNO_COUNTS[i].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn errno_count(errno: i32) -> u64 {
+    crate::errno::CATALOGUE
+        .iter()
+        .position(|c| c.errno == errno)
+        .map(|i| ERRNO_COUNTS[i].load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+pub static REPLICA_READ_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static REPLICA_FALLBACK_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static REPLICA_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+pub static REPLICA_LAG_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static REPLICA_LAG_MS: AtomicU64 = AtomicU64::new(0);
+pub static REPLICA_TICKET_WAITS: AtomicU64 = AtomicU64::new(0);
+
+/// Database connection state of the mount (spec/failure.py DatabaseStateMachine).
+pub static DB_STATE: AtomicU8 = AtomicU8::new(0);
+pub static RECONNECTS: AtomicU64 = AtomicU64::new(0);
+pub static FENCED: AtomicU64 = AtomicU64::new(0);
+pub static SLOW_DB: AtomicBool = AtomicBool::new(false);
+pub static OLDEST_INFLIGHT_MS: AtomicU64 = AtomicU64::new(0);
+pub static CHECKSUM_FAILURES: AtomicU64 = AtomicU64::new(0);
+pub static USER_BYTES_WRITTEN: AtomicU64 = AtomicU64::new(0);
+
+/// The `metrics|space|…` line, refreshed by housekeeping (spec/space.py ReportsSpace).
+pub static SPACE_LINE: Mutex<String> = Mutex::new(String::new());
 
 const HISTO_BUCKETS: usize = 7;
 const HISTO_THRESHOLDS: [u64; HISTO_BUCKETS - 1] = [10, 100, 1_000, 10_000, 100_000, 1_000_000]; // µs
 
+/// A latency histogram with fixed buckets at ≤10µs … >1s.
 pub struct Histogram {
     counts: [AtomicU64; HISTO_BUCKETS],
+}
+
+impl Default for Histogram {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Histogram {
     pub const fn new() -> Self {
         Histogram {
-            counts: [
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-            ],
+            counts: [const { AtomicU64::new(0) }; HISTO_BUCKETS],
         }
     }
 
-    /// Record a duration in the appropriate bucket.
     pub fn record(&self, d: Duration) {
         let us = d.as_micros() as u64;
         let bucket = HISTO_THRESHOLDS
@@ -146,7 +125,6 @@ impl Histogram {
         self.counts[bucket].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Snapshot all bucket counts (for programmatic export).
     pub fn snapshot(&self) -> [u64; HISTO_BUCKETS] {
         let mut s = [0u64; HISTO_BUCKETS];
         for (i, c) in self.counts.iter().enumerate() {
@@ -155,37 +133,40 @@ impl Histogram {
         s
     }
 
-    /// Human-readable summary string: p50/p95/p99 and total count.
     pub fn summary(&self, label: &str) -> String {
-        let s = self.snapshot();
-        let total: u64 = s.iter().sum();
-        if total == 0 {
-            return format!("{label}=0 samples");
-        }
-        let mut cum = 0u64;
-        let mut p50 = 0usize;
-        let mut p95 = 0usize;
-        let mut p99 = 0usize;
-        let mut targets = [
-            (total * 50 / 100, &mut p50),
-            (total * 95 / 100, &mut p95),
-            (total * 99 / 100, &mut p99),
-        ];
-        for (i, &c) in s.iter().enumerate() {
-            cum += c;
-            for (target, ref mut done) in targets.iter_mut() {
-                if **done == 0 && cum >= *target {
-                    **done = i;
-                }
-            }
-        }
-        format!(
-            "{label} total={total} p50={}µs p95={}µs p99={}µs",
-            bucket_label(p50),
-            bucket_label(p95),
-            bucket_label(p99),
-        )
+        summarise(label, &self.snapshot())
     }
+}
+
+/// The bucket index holding percentile `pct` of `s`.
+fn percentile_bucket(s: &[u64; HISTO_BUCKETS], pct: u64) -> Option<usize> {
+    let total: u64 = s.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    let target = (total * pct).div_ceil(100).max(1);
+    let mut cum = 0;
+    for (i, &c) in s.iter().enumerate() {
+        cum += c;
+        if cum >= target {
+            return Some(i);
+        }
+    }
+    Some(HISTO_BUCKETS - 1)
+}
+
+fn summarise(label: &str, s: &[u64; HISTO_BUCKETS]) -> String {
+    let total: u64 = s.iter().sum();
+    if total == 0 {
+        return format!("{label}=0 samples");
+    }
+    let b = |p| bucket_label(percentile_bucket(s, p).unwrap_or(0));
+    format!(
+        "{label} total={total} p50={}µs p95={}µs p99={}µs",
+        b(50),
+        b(95),
+        b(99)
+    )
 }
 
 fn bucket_label(bucket: usize) -> &'static str {
@@ -200,18 +181,21 @@ fn bucket_label(bucket: usize) -> &'static str {
     }
 }
 
-/// FUSE callback latency (all ops pooled).
 pub static FUSE_LATENCY: Histogram = Histogram::new();
+pub static DB_LATENCY: Histogram = Histogram::new();
 
-/// RAII guard: records the enclosing FUSE callback's wall-clock duration
-/// into [`FUSE_LATENCY`] when it drops — i.e. on every exit path of the
-/// callback (happy path, early return, `log_and_reply!`, ...). Created at
-/// the top of every `Filesystem` method (spec/observe.py Metrics #2).
-pub struct FuseLatencyGuard(Instant);
+/// Records a FUSE callback's wall-clock time when dropped.
+pub struct FuseLatencyGuard(std::time::Instant);
+
+impl Default for FuseLatencyGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl FuseLatencyGuard {
     pub fn new() -> Self {
-        Self(Instant::now())
+        Self(std::time::Instant::now())
     }
 }
 
@@ -221,97 +205,165 @@ impl Drop for FuseLatencyGuard {
     }
 }
 
-/// DB query round-trip latency.
-pub static DB_LATENCY: Histogram = Histogram::new();
+// ── Slow database signal (spec/failure.py SlowDatabaseSignal) ───────────
 
-// ── Periodic export ────────────────────────────────────────────────────
+#[derive(Default)]
+struct StatementWindow {
+    current: [u64; HISTO_BUCKETS],
+    /// The previous 60 one-minute histograms.
+    history: Vec<[u64; HISTO_BUCKETS]>,
+    slow_minutes: u32,
+}
 
-/// Spawn a daemon thread that dumps all metrics at `info!` every 60 s.
+static STATEMENTS: Mutex<Option<HashMap<&'static str, StatementWindow>>> = Mutex::new(None);
+
+pub fn record_statement_latency(name: &'static str, d: Duration) {
+    let us = d.as_micros() as u64;
+    let bucket = HISTO_THRESHOLDS
+        .iter()
+        .position(|&t| us <= t)
+        .unwrap_or(HISTO_BUCKETS - 1);
+    if let Ok(mut g) = STATEMENTS.try_lock() {
+        g.get_or_insert_with(HashMap::new)
+            .entry(name)
+            .or_default()
+            .current[bucket] += 1;
+    }
+}
+
+/// Rotate the per-statement windows (once a minute) and update the
+/// slow_db gauge: set when a statement's last-minute p99 stays above 4×
+/// its previous-hour p99 for 5 consecutive minutes.
+pub fn rotate_statement_windows() {
+    let mut warn = Vec::new();
+    let mut any_slow = false;
+    if let Ok(mut g) = STATEMENTS.lock() {
+        for (name, w) in g.get_or_insert_with(HashMap::new).iter_mut() {
+            let mut base = [0u64; HISTO_BUCKETS];
+            for h in &w.history {
+                for i in 0..HISTO_BUCKETS {
+                    base[i] += h[i];
+                }
+            }
+            let cur = percentile_bucket(&w.current, 99);
+            let basep = percentile_bucket(&base, 99);
+            let slow = matches!((cur, basep), (Some(c), Some(b)) if w.history.len() >= 5 && c > b && bucket_upper_us(c) > 4 * bucket_upper_us(b));
+            if slow {
+                w.slow_minutes += 1;
+            } else {
+                w.slow_minutes = 0;
+            }
+            if w.slow_minutes >= 5 {
+                any_slow = true;
+                if w.slow_minutes == 5 {
+                    warn.push(format!(
+                        "{name}: p99 {}µs over the last minute vs {}µs over the previous hour",
+                        bucket_label(cur.unwrap_or(0)),
+                        bucket_label(basep.unwrap_or(0))
+                    ));
+                }
+            }
+            w.history.push(w.current);
+            if w.history.len() > 60 {
+                w.history.remove(0);
+            }
+            w.current = [0; HISTO_BUCKETS];
+        }
+    }
+    for line in warn {
+        tracing::warn!("slow database: {line} (threshold 4x for 5 minutes)");
+    }
+    let was = SLOW_DB.swap(any_slow, Ordering::Relaxed);
+    if was && !any_slow {
+        tracing::info!("slow database: latency recovered");
+    }
+}
+
+fn bucket_upper_us(b: usize) -> u64 {
+    HISTO_THRESHOLDS.get(b).copied().unwrap_or(10_000_000)
+}
+
+pub fn db_state_name(s: u8) -> &'static str {
+    match s {
+        0 => "connected",
+        1 => "broken",
+        2 => "reconnecting",
+        3 => "revalidating",
+        4 => "fenced",
+        _ => "unknown",
+    }
+}
+
+/// The nine metrics lines.
+pub fn export_lines() -> Vec<String> {
+    let ops: Vec<String> = OPS
+        .iter()
+        .enumerate()
+        .map(|(i, o)| format!("{o}={}", OP_COUNTS[i].load(Ordering::Relaxed)))
+        .collect();
+    let errs: Vec<String> = crate::errno::CATALOGUE
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            format!(
+                "{}={}",
+                c.name.to_lowercase(),
+                ERRNO_COUNTS[i].load(Ordering::Relaxed)
+            )
+        })
+        .collect();
+    let space = SPACE_LINE.lock().map(|s| s.clone()).unwrap_or_default();
+    vec![
+        format!("metrics|ops|{}", ops.join(" ")),
+        format!("metrics|errors|{}", errs.join(" ")),
+        format!(
+            "metrics|replica|reads={} fallbacks={} lag_bytes={} lag_ms={} ticket_waits={}",
+            REPLICA_READ_COUNT.load(Ordering::Relaxed),
+            REPLICA_FALLBACK_COUNT.load(Ordering::Relaxed),
+            REPLICA_LAG_BYTES.load(Ordering::Relaxed),
+            REPLICA_LAG_MS.load(Ordering::Relaxed),
+            REPLICA_TICKET_WAITS.load(Ordering::Relaxed),
+        ),
+        format!("metrics|latency|fuse={}", FUSE_LATENCY.summary("fuse")),
+        format!("metrics|latency|db={}", DB_LATENCY.summary("db")),
+        format!(
+            "metrics|db|state={} reconnects={} fenced={} slow_db={}",
+            db_state_name(DB_STATE.load(Ordering::Relaxed)),
+            RECONNECTS.load(Ordering::Relaxed),
+            FENCED.load(Ordering::Relaxed),
+            SLOW_DB.load(Ordering::Relaxed),
+        ),
+        format!(
+            "metrics|inflight|oldest_ms={}",
+            OLDEST_INFLIGHT_MS.load(Ordering::Relaxed)
+        ),
+        format!(
+            "metrics|space|{}",
+            if space.is_empty() {
+                "pending".to_string()
+            } else {
+                space
+            }
+        ),
+        format!(
+            "metrics|integrity|checksum_failures={}",
+            CHECKSUM_FAILURES.load(Ordering::Relaxed)
+        ),
+    ]
+}
+
 pub fn start_periodic_export() {
     std::thread::Builder::new()
         .name("metrics-export".into())
         .spawn(|| loop {
             std::thread::sleep(Duration::from_secs(60));
-            // Re-arm the replica-fallback WARN so the first fallback of
-            // every period is reported (spec/replica.py FallsBackToPrimary:
-            // "The first fallback per period is logged at WARN").
             REPLICA_FALLBACK_WARNED.store(false, Ordering::Relaxed);
-            tracing::info!(
-                "metrics|ops|lookup={} getattr={} setattr={} read={} write={} create={} mkdir={} unlink={} rmdir={} rename={} readdir={} open={} fsync={}",
-                LOOKUP_COUNT.load(Ordering::Relaxed),
-                GETATTR_COUNT.load(Ordering::Relaxed),
-                SETATTR_COUNT.load(Ordering::Relaxed),
-                READ_COUNT.load(Ordering::Relaxed),
-                WRITE_COUNT.load(Ordering::Relaxed),
-                CREATE_COUNT.load(Ordering::Relaxed),
-                MKDIR_COUNT.load(Ordering::Relaxed),
-                UNLINK_COUNT.load(Ordering::Relaxed),
-                RMDIR_COUNT.load(Ordering::Relaxed),
-                RENAME_COUNT.load(Ordering::Relaxed),
-                READDIR_COUNT.load(Ordering::Relaxed),
-                OPEN_COUNT.load(Ordering::Relaxed),
-                FSYNC_COUNT.load(Ordering::Relaxed),
-            );
-            tracing::info!(
-                "metrics|errors|eio={} enoent={} eexist={} enotempty={} eisdir={} enotdir={} einval={}",
-                EIO_COUNT.load(Ordering::Relaxed),
-                ENOENT_COUNT.load(Ordering::Relaxed),
-                EEXIST_COUNT.load(Ordering::Relaxed),
-                ENOTEMPTY_COUNT.load(Ordering::Relaxed),
-                EISDIR_COUNT.load(Ordering::Relaxed),
-                ENOTDIR_COUNT.load(Ordering::Relaxed),
-                EINVAL_COUNT.load(Ordering::Relaxed),
-            );
-            tracing::info!(
-                "metrics|replica|reads={} fallbacks={}",
-                REPLICA_READ_COUNT.load(Ordering::Relaxed),
-                REPLICA_FALLBACK_COUNT.load(Ordering::Relaxed),
-            );
-            tracing::info!(
-                "metrics|latency|fuse={}",
-                FUSE_LATENCY.summary("fuse"),
-            );
-            tracing::info!(
-                "metrics|latency|db={}",
-                DB_LATENCY.summary("db"),
-            );
+            rotate_statement_windows();
+            for line in export_lines() {
+                tracing::info!("{line}");
+            }
         })
         .expect("spawn metrics export thread");
-}
-
-// ── Liveness thread ────────────────────────────────────────────────────
-
-/// Spawn a daemon thread that bumps `LIVENESS` every 10 s.
-pub fn start_liveness_heartbeat() {
-    std::thread::Builder::new()
-        .name("liveness".into())
-        .spawn(|| loop {
-            LIVENESS.fetch_add(1, Ordering::Release);
-            std::thread::sleep(Duration::from_secs(10));
-        })
-        .expect("spawn liveness thread");
-}
-
-// ── State dump ─────────────────────────────────────────────────────────
-
-/// Produced on SIGUSR1 or programmatically. Suitable for `info!` logging.
-pub fn state_dump(
-    ino_cache_size: usize,
-    next_ino: u64,
-    db_status: &str,
-    uptime: Duration,
-) -> String {
-    format!(
-        "state|ino_cache={} next_ino={} db={} uptime_secs={}\n\
-         state|fuse_latency={}\n\
-         state|db_latency={}",
-        ino_cache_size,
-        next_ino,
-        db_status,
-        uptime.as_secs(),
-        FUSE_LATENCY.summary("fuse"),
-        DB_LATENCY.summary("db"),
-    )
 }
 
 #[cfg(test)]
@@ -319,78 +371,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn histogram_buckets() {
+    fn histogram_buckets_and_summary() {
         let h = Histogram::new();
-        h.record(Duration::from_micros(5)); // ≤10µs
-        h.record(Duration::from_micros(50)); // ≤100µs
-        h.record(Duration::from_micros(500)); // ≤1ms
-        h.record(Duration::from_millis(5)); // ≤10ms
-        h.record(Duration::from_millis(50)); // ≤100ms
-        h.record(Duration::from_millis(500)); // ≤1s
-        h.record(Duration::from_secs(2)); // >1s
-        let s = h.snapshot();
-        assert_eq!(s[0], 1, "≤10µs");
-        assert_eq!(s[1], 1, "≤100µs");
-        assert_eq!(s[2], 1, "≤1ms");
-        assert_eq!(s[3], 1, "≤10ms");
-        assert_eq!(s[4], 1, "≤100ms");
-        assert_eq!(s[5], 1, "≤1s");
-        assert_eq!(s[6], 1, ">1s");
-    }
-
-    #[test]
-    fn histogram_empty_summary() {
-        let h = Histogram::new();
-        let s = h.summary("test");
-        assert!(s.contains("0 samples"));
-    }
-
-    #[test]
-    fn histogram_with_data_summary() {
-        let h = Histogram::new();
-        h.record(Duration::from_micros(5)); // ≤10µs
-        let s = h.summary("test");
-        assert!(s.contains("total=1"));
-    }
-
-    #[test]
-    fn counters_increment() {
-        LOOKUP_COUNT.fetch_add(1, Ordering::Relaxed);
-        assert_eq!(LOOKUP_COUNT.load(Ordering::Relaxed), 1);
-        LOOKUP_COUNT.store(0, Ordering::Relaxed); // reset for other tests
-    }
-
-    #[test]
-    fn liveness_check_detects_stall() {
-        // NOTE: these tests mutate process-global statics (LIVENESS,
-        // BEAT_DEADLINE_AT, FUSE_LATENCY). They are only safe because no
-        // other test touches the same statics concurrently. If a future
-        // test calls check_liveness() or records FUSE_LATENCY, it must also
-        // snapshot/reset these statics.
-        // First observation initializes the baseline and reports healthy.
-        assert!(check_liveness());
-        // A beat arrives: still healthy.
-        LIVENESS.fetch_add(1, Ordering::Release);
-        assert!(check_liveness());
-        // No beat for >3×N: deadlocked. Forge a deadline that has already
-        // passed (0 = start of the process's monotonic clock) — this works
-        // regardless of how long the test process has been alive.
-        BEAT_DEADLINE_AT.store(0, Ordering::Relaxed);
-        assert!(!check_liveness());
-        // Recovery: the next beat arms a fresh deadline.
-        LIVENESS.fetch_add(1, Ordering::Release);
-        assert!(check_liveness());
-    }
-
-    #[test]
-    fn latency_guard_records_one_sample() {
-        let before = FUSE_LATENCY.snapshot();
-        {
-            let _guard = FuseLatencyGuard::new();
-            std::thread::sleep(Duration::from_micros(1));
+        for _ in 0..98 {
+            h.record(Duration::from_micros(5));
         }
-        let after = FUSE_LATENCY.snapshot();
-        let delta: u64 = after.iter().zip(before.iter()).map(|(a, b)| a - b).sum();
-        assert_eq!(delta, 1, "guard must record exactly one latency sample");
+        h.record(Duration::from_millis(5));
+        h.record(Duration::from_secs(2));
+        let s = h.summary("x");
+        assert!(s.contains("total=100"), "{s}");
+        assert!(s.contains("p50=<=10µs"), "{s}");
+        assert!(s.contains("p99=<=10kµs"), "{s}");
+    }
+
+    #[test]
+    fn export_has_nine_lines_and_every_errno() {
+        count_errno(libc::EROFS);
+        let lines = export_lines();
+        assert_eq!(lines.len(), 9);
+        assert!(lines[1].contains("erofs="));
+        assert!(lines[1].contains("etimedout="));
+        assert!(errno_count(libc::EROFS) >= 1);
+    }
+
+    #[test]
+    fn ops_are_counted() {
+        count_op("symlink");
+        assert!(op_count("symlink") >= 1);
+        assert_eq!(OPS.len(), OP_COUNTS.len());
     }
 }

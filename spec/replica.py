@@ -1,11 +1,11 @@
 """
 Replicated-mode requirements for pgfs.
 
-A pgfs mount can be backed by a primary Postgres plus a physical
-streaming standby running in Docker. Writes always go to the primary;
-reads are served from the standby when it has caught up with the
-primary's WAL, so a replicated mount is eventually consistent with a
-bounded, continuously-measured lag and never silently diverges.
+A pgfs mount can be backed by a primary Postgres plus physical
+streaming standbys. Writes always go to the primary. Reads are served
+from a standby only under an LSN ticket: the standby must have replayed
+the mount's own latest commit (design-decisions.md, topic 9; CRAQ r06,
+Aurora r19, FlightTracker r75).
 
 These Requirement classes are granular and single-responsibility,
 following the project's convention: each one is independently
@@ -13,7 +13,19 @@ footprintable, testable, and implementable.
 """
 
 from .err import PARTIAL, Feat, Req, md
-from .optimize import ReplicaFreshnessCacheReq
+from .branch import (
+    MountsSnapshots,
+)
+from .durability import (
+    ScratchMode,
+)
+from .failure import (
+    ReconnectsWithBackoff,
+    RevalidatesAfterReconnect,
+)
+from .security import (
+    RedactsSecrets,
+)
 
 
 # ── Standby provisioning ──────────────────────────────────────────────
@@ -52,15 +64,124 @@ class AcceptsReplicaConnection(Req):
     on top of `--conn`. When provided, it opens a second `postgres::Client`
     to the standby; the standby is never schema-initialized (it is a
     physical copy). When absent, the daemon behaves exactly as today: one
-    connection, all operations on the primary."""
+    connection, all operations on the primary.
+
+    It refuses `--replica` on a scratch filesystem, because unlogged
+    tables are not replicated and the standby would serve empty tables
+    (`durability.ScratchMode`, CAFault r80). It verifies the standby's
+    identity before using it (`VerifiesStandbyIdentity`)."""
+
+    deps = [ScratchMode]
+
+
+class VerifiesStandbyIdentity(Req):
+    """At connect, and after every reconnect, the daemon checks that the
+    standby belongs to this cluster:
+
+    - its system identifier (`pg_control_system()`) equals the
+      primary's;
+    - its timeline is the primary's or an ancestor of it;
+    - it is in recovery;
+    - its `meta.fs_uuid` equals the primary's.
+
+    A standby that fails any check is not used, and the daemon logs a
+    WARN naming the check. An LSN comparison alone cannot tell a standby
+    of this cluster from a node of another one after a failover.
+
+    **Sources.** Ceph r05, Raft r25."""
+
+    deps = [AcceptsReplicaConnection]
+
+
+class LsnTicketReads(Req):
+    """After each commit, the daemon records a read ticket from a second
+    autocommit statement pipelined right after the mutating function call
+    (`SELECT pgfs.<op>(…); SELECT pg_current_wal_insert_lsn(),
+    pg_current_wal_flush_lsn()`) in the same network round trip. It must
+    run as a separate statement after the mutation's transaction commits,
+    because an LSN read inside the transaction lies before the commit
+    record, and a standby that has replayed only that far does not show
+    the change yet. Tickets are tracked per inode (and on the parent
+    `ino` for name mutations — both parents for `rename` — and on the
+    mount for `statfs`), so a write to one file does not force reads of
+    unrelated files to wait or fall back.
+
+    A read may use the standby only when the standby's
+    `pg_last_wal_replay_lsn()` is at or past the inode's ticket. Because
+    Postgres's `walsender` streams WAL only up to the primary's flush
+    LSN (`pg_current_wal_flush_lsn()`), an asynchronous commit
+    (`durability.AsyncCommitWindow`) cannot reach the standby until
+    `walwriter` (every `wal_writer_delay`, default 200 ms) or a
+    synchronous commit flushes the primary's WAL. Therefore:
+
+    - if the latest known `primary_flush_lsn < ticket`, the WAL has not
+      even been flushed on the primary yet, so the daemon routes the
+      read directly to the primary without waiting `--replica-wait`;
+    - if `primary_flush_lsn ≥ ticket` and `standby_lsn < ticket`, the
+      WAL is in flight to the standby and the daemon waits up to
+      `--replica-wait` (default 20 ms) for the standby to catch up, then
+      serves the read from the primary (`FallsBackToPrimary`).
+
+    The standby's replay LSN (and the primary's flush LSN when polled) is
+    polled at most once per millisecond and shared by all workers.
+
+    **Postcondition.** Read-your-writes: no read through the mount
+    misses an operation the mount completed, whichever node serves it.
+
+    **Sources.** CRAQ r06, Aurora r19, TiDB r34, FlightTracker r75. This
+    replaces a 500 ms cached freshness verdict, which could call a
+    standby fresh while the daemon's own later write had not replayed."""
+
+    deps = [VerifiesStandbyIdentity]
+
+
+class SnapshotReadsFromAnyStandby(Req):
+    """A snapshot mount (`branch.MountsSnapshots`) may read from any
+    standby on which the snapshot's row in `snapshots(tree, name)` is
+    visible, with no per-read ticket, because `pgfs.snapshot` commits
+    while holding the exclusive layer gate and physical streaming
+    replication replays WAL in commit order, so the snapshot row's
+    presence on the standby guarantees that every transaction in the
+    snapshot has replayed and nothing in the snapshot can change. With
+    several `--replica` options, reads are spread across the standbys
+    that qualify. The mount still maintains its read-only session in
+    `mounts` on the primary (`consistency.ExclusiveTreeLease`), fails
+    closed if renewal lapses (`consistency.FencesStaleWriters`), and
+    re-checks on every reconnect that its `snapshots(tree, name)` row
+    still exists (`failure.RevalidatesAfterReconnect`)."""
+
+    deps = [LsnTicketReads, MountsSnapshots]
+
+
+class FollowsFailover(Req):
+    """With a multi-host `--conn` and `target_session_attrs=read-write`,
+    a daemon whose primary fails reconnects to whichever host is the new
+    primary (`failure.ReconnectsWithBackoff`), then revalidates
+    (`failure.RevalidatesAfterReconnect`).
+
+    **Durability.** An fsync survives the loss of the primary only if
+    the cluster requires synchronous standbys
+    (`synchronous_standby_names`). With asynchronous standbys, a
+    failover can lose commits that were acknowledged, including fsyncs.
+    The documentation states this, and the mount logs the cluster's
+    setting at start."""
+
+    deps = [ReconnectsWithBackoff, RevalidatesAfterReconnect]
 
 
 class ServesReadsFromReplica(Req):
-    """Read-only operations — `getattr`, `list` (readdir), and `read` —
-    are served from the replica client when it is fresh. Each read
-    re-evaluates freshness so the source adapts to replication state.
-    Read routing is recorded in the metrics (`REPLICA_READ_COUNT`) and a
-    DEBUG log line names the source used."""
+    """Read-only operations may be served from the standby under an LSN
+    ticket (`LsnTicketReads`): `lookup`, `getattr`, `readdir` and
+    `read`. Operations that drain buffers first
+    (`consistency.DrainsBuffersBeforeExternalising`) use the standby
+    only after the drain's commit has flushed on the primary and
+    replayed on the standby (on an asynchronous mount, a read of an
+    inode written within the last `wal_writer_delay` goes straight to
+    the primary without waiting `--replica-wait`). Read routing is
+    recorded in the metrics (`REPLICA_READ_COUNT`), and a DEBUG log line
+    names the source used."""
+
+    deps = [LsnTicketReads]
 
 
 class WritesStayOnPrimary(Req):
@@ -72,52 +193,82 @@ class WritesStayOnPrimary(Req):
 
 
 class DetectsReplicationLag(Req):
-    """A replica is fresh iff the standby is in recovery and its replay
-    position (`pg_last_wal_replay_lsn() - '0/0'::pg_lsn`) is at or ahead
-    of the primary's current position (`pg_current_wal_lsn() - '0/0'`).
-    If the standby is not in recovery (it is itself a primary), it is
-    treated as fresh. Any error querying either node means not fresh. The
-    freshness query is cheap (two scalar reads) and runs per read."""
+    """Lag is measured against the daemon's own read ticket, not the
+    primary's current position: the standby is usable for a read when
+    its replay LSN is at or past the ticket (`LsnTicketReads`). Comparing
+    against `pg_current_wal_lsn()` on a busy primary is almost never
+    true, and reading the two positions with separate queries on two
+    nodes is not atomic. A standby that is not in recovery is not a
+    standby: it is not used, and the daemon logs a WARN. Any error
+    querying the standby makes it unusable until the next successful
+    poll. Lag is also reported in bytes and in seconds
+    (`ReplicaObservability`)."""
+
+    deps = [LsnTicketReads]
 
 
 class FallsBackToPrimary(Req):
-    """When the replica is absent, unreachable, or not fresh, reads are
-    served from the primary with no error surfaced to the kernel — a
+    """When the replica is absent, unreachable, fails its identity check,
+    or has not reached the ticket within `--replica-wait`, reads are
+    served from the primary with no error surfaced to the kernel. A
     replicated mount degrades to a single-node mount. The first fallback
-    per period is logged at WARN; every fallback increments
-    `REPLICA_FALLBACK_COUNT`. A stale replica never produces stale reads,
-    only primary reads."""
+    per period is logged at WARN, and every fallback increments
+    `REPLICA_FALLBACK_COUNT`. Because of the ticket rule, a lagging
+    replica never produces stale reads, only primary reads.
+
+    If the standby is consistently slower than the primary for reads it
+    could serve (p99 over 2 times the primary's for 5 minutes), the
+    daemon stops routing to it and logs a WARN, until a probe shows it
+    has recovered.
+
+    **Sources.** IASO r92, CRUSH r03 (route on measured, not assumed,
+    health)."""
+
+    deps = [DetectsReplicationLag]
 
 
 class ReplicaObservability(Req):
-    """Replication state is observable: the 60-second metrics export
-    includes `metrics|replica|reads=.. fallbacks=..`, the startup log
-    announces replica mode and the replica connection string, and the
-    SIGUSR1 state dump reports replica freshness. Daemon startup succeeds
-    even when `--replica` points at an unreachable standby — it is logged
-    at WARN and the mount runs primary-only."""
+    """Replication state is observable:
+
+    - the 60-second metrics export includes
+      `metrics|replica|reads=… fallbacks=… lag_bytes=… lag_ms=… ticket_waits=…`;
+    - the startup log announces replica mode, with the standby's host and
+      the result of its identity check, and the connection string
+      redacted (`security.RedactsSecrets`);
+    - the SIGUSR1 state dump reports the replica's state.
+
+    Daemon startup succeeds even when `--replica` points at an
+    unreachable standby. That is logged at WARN, and the daemon retries
+    the standby in the background with backoff, rather than dropping it
+    for its lifetime."""
+
+    deps = [RedactsSecrets]
 
 
 # ── User-visible feature ──────────────────────────────────────────────
 
 class ReplicatedFilesystem(Feat):
-    """A pgfs mount can be backed by a primary Postgres and a physical
-    streaming standby in Docker. Writes go to the primary; reads are
-    served from whichever node is authoritative at that instant, falling
-    back to the primary when the standby lags. The filesystem is
-    eventually consistent with the standby's lag continuously bounded by
-    the freshness check, and a standby failure never causes data loss or
-    a kernel-visible error."""
+    """A pgfs mount can be backed by a primary Postgres and physical
+    streaming standbys. Writes go to the primary. A read goes to a
+    standby only when the standby has replayed the mount's own latest
+    commit, so the mount always reads its own writes. Snapshots can be
+    read from any standby that has them. A standby failure never causes
+    a kernel-visible error. A standby is not protection against
+    corruption: physical replication copies a damaged page faithfully,
+    which is what checksums and scrub are for."""
 
     deps = [
         StartsDockerStandby,
         RequiresPrimaryTcpListener,
         AcceptsReplicaConnection,
+        VerifiesStandbyIdentity,
+        LsnTicketReads,
         ServesReadsFromReplica,
+        SnapshotReadsFromAnyStandby,
         WritesStayOnPrimary,
         DetectsReplicationLag,
-        ReplicaFreshnessCacheReq,
         FallsBackToPrimary,
+        FollowsFailover,
         ReplicaObservability,
     ]
 
@@ -129,23 +280,26 @@ class ReplicatedFilesystem(Feat):
 
     def status_note(self):
         return (
-            "Write routing, lag detection, transparent fallback and the "
-            "Docker standby work today. File contents (`read`) are still "
-            "always served by the primary, and a standby that is unreachable "
-            "when the daemon starts is dropped for the daemon's lifetime "
-            "without a warning."
+            "Reads of names, attributes, listings and file contents go to "
+            "the standby under per-inode LSN tickets, the standby's "
+            "identity is verified, a lagging or unreachable standby falls "
+            "back to the primary with no visible error, multi-host "
+            "connection strings follow failover, and replica metrics are "
+            "exported. Not yet: demoting a standby that is consistently "
+            "slower, reading the primary's flush LSN other than from the "
+            "mount's own commits, and spreading snapshot reads over "
+            "several `--replica` standbys (only the first is used)."
         )
 
     def tutorial(self):
         return md(r"""
-            In this tutorial we will give pgfs a read replica: a second
-            PostgreSQL that follows the first by streaming its write-ahead
-            log. We will mount pgfs with both, see metadata reads go to the
-            replica, then take the replica away and see pgfs carry on
-            without it.
+            In this tutorial we will give pgfs a read replica: a second PostgreSQL
+            that follows the first by streaming its write-ahead log. We will mount
+            pgfs with both, see reads served by the standby once it has replayed
+            our writes, then take the standby away and see pgfs carry on.
 
-            We need Docker, and the project-local cluster from [Your first
-            pgfs mount](projectlocalenvironment.md).
+            We need Docker, and the project-local cluster from [Your first pgfs
+            mount](projectlocalenvironment.md).
 
             ## Step 1: start the standby
 
@@ -155,87 +309,60 @@ class ReplicatedFilesystem(Feat):
             ```
 
             The script copies the primary with `pg_basebackup`, starts a
-            `postgres:17` container on port 5433, and waits until it is
-            streaming:
-
-            ```text
-            ==> standby is in recovery (streaming)
-
-            ready. replica connection string (for --replica):
-              host=127.0.0.1 port=5433 dbname=pgfs user=alice
-            ```
-
-            If it reports that the container name `/pgfs-replica` is
-            already in use, run `docker rm pgfs-replica` and repeat.
+            `postgres:17` container on port 5433, and waits until it streams.
 
             ## Step 2: mount with the replica
 
             ```bash
             mkdir -p testdata/mnt
-            ./target/debug/pgfs --replica "$(./scripts/replica_db.sh conn)" testdata/mnt \
-                2> testdata/replica-demo.log &
+            RUST_LOG=pgfs=debug ./target/debug/pgfs mount main testdata/mnt \
+                --replica "$(./scripts/replica_db.sh conn)" 2> testdata/replica-demo.log &
             sleep 1
             grep 'replica mode' testdata/replica-demo.log
             ```
 
             ```text
-            INFO pgfs: replica mode: reads served from standby (host=127.0.0.1 port=5433 dbname=pgfs user=alice) when fresh
+            INFO pgfs::replica: replica mode: standby host=127.0.0.1 port=5433 dbname=pgfs user=alice verified
             ```
 
-            ## Step 3: write, wait, read
+            The daemon checked that the standby has the primary's system
+            identifier and `fs_uuid`, and that it is in recovery.
+
+            ## Step 3: write, then read
 
             ```bash
-            mkdir testdata/mnt/replicated
-            echo "on the primary" > testdata/mnt/replicated/a.txt
+            echo "on the primary" > testdata/mnt/a.txt
             sleep 1
-            ls -l testdata/mnt/replicated
+            cat testdata/mnt/a.txt
+            grep 'served by standby' testdata/replica-demo.log | tail -2
             ```
 
-            Writes went to the primary. After a moment the standby has
-            replayed them, and the `ls` (a directory listing plus
-            attribute lookups) is answered by the standby. Ask the daemon:
-
-            ```bash
-            kill -USR1 "$(pgrep -f 'pgfs --replica')"; ls testdata/mnt > /dev/null
-            grep 'state|ino_cache' testdata/replica-demo.log | tail -1
-            ```
-
-            ```text
-            ... db=connected (replica fresh) ...
-            ```
+            The write went to the primary. The read went to the standby only after
+            the standby had replayed past the write's LSN ticket.
 
             ## Step 4: take the standby away
 
             ```bash
             ./scripts/replica_db.sh down
-            ls -l testdata/mnt/replicated
-            cat testdata/mnt/replicated/a.txt
+            cat testdata/mnt/a.txt
+            grep 'fall back' testdata/replica-demo.log | head -1
             ```
 
-            Both commands still work. The log records the switch once:
-
-            ```text
-            WARN pgfs::db: reads falling back to primary (standby stale or unreachable)
-            ```
+            The read still works; the first fallback is logged once.
 
             ## Step 5: clean up
 
             ```bash
-            kill -TERM "$(pgrep -f 'pgfs --replica')"
-            rm -f testdata/replica-demo.log
+            kill -TERM "$(pgrep -f 'pgfs mount main testdata/mnt')"
+            ./scripts/replica_db.sh wipe
             ```
-
-            The standby's data stays in the Docker volume
-            `pgfs-replica-data`; `./scripts/replica_db.sh wipe` deletes it.
 
             ## What we did
 
-            We built a primary/standby pair, mounted pgfs across both, and
-            saw reads move to the standby when it was current and back to
-            the primary when it disappeared, with no error reaching the
-            programs using the mount. The
-            [explanation](../explanation/replicated_filesystem.md) covers
-            the consistency rules behind this.
+            We mounted pgfs across a primary and a standby, saw reads move to the
+            standby only when it had our writes, and back to the primary when it
+            went away, with no error reaching programs. The
+            [explanation](../explanation/replicated_filesystem.md) covers why.
         """)
 
     def how_to(self):
@@ -247,252 +374,125 @@ class ReplicatedFilesystem(Feat):
             ./scripts/replica_db.sh conn      # prints the --replica string
             ```
 
-            `up` restarts the primary with a loopback TCP listener if it
-            does not already have one.
-
             ## Mount with a replica
 
             ```bash
-            ./target/debug/pgfs --replica "$(./scripts/replica_db.sh conn)" testdata/mnt
+            pgfs mount main /srv/pgfs --replica "host=standby.internal dbname=pgfs sslmode=verify-full"
             ```
 
-            `scripts/pgfs.sh` does not pass `--replica`; start the binary
-            directly.
+            The standby must be a physical copy of the primary; pgfs never writes
+            to it. `--replica` is refused on a scratch filesystem, whose unlogged
+            tables do not replicate.
 
-            ## Use a standby you manage yourself
-
-            Any physical streaming standby of the primary's database
-            works:
+            ## Check what the mount thinks of the standby
 
             ```bash
-            pgfs --conn "host=primary.internal dbname=pgfs" \
-                 --replica "host=standby.internal dbname=pgfs" /srv/pgfs
+            kill -USR1 <pid>; grep 'state|replica' <daemon log> | tail -1
+            grep 'metrics|replica' <daemon log> | tail -1
             ```
 
-            pgfs never creates or alters the schema on the standby. It must
-            be a physical copy of the primary.
+            `reads` counts standby reads, `fallbacks` reads that went to the
+            primary, and `lag_bytes` / `lag_ms` the standby's distance.
 
-            ## Check that the standby is healthy
+            ## Follow a failover
+
+            Give `--conn` every host and `target_session_attrs=read-write`:
 
             ```bash
-            ./scripts/replica_db.sh status
+            pgfs mount main /srv/pgfs --conn "host=pg1,pg2 dbname=pgfs target_session_attrs=read-write"
             ```
 
-            Look for `in recovery: t` and a small `replay_lag`. Then ask
-            the daemon what it thinks:
-
-            ```bash
-            kill -USR1 <pid>; ls <mountpoint> > /dev/null
-            grep 'state|ino_cache' <daemon log> | tail -1     # replica fresh | stale or unreachable | none
-            ```
-
-            ## Tell whether reads are actually reaching the standby
-
-            Compare the counters in the minute-by-minute metrics line:
-
-            ```bash
-            grep 'metrics|replica' <daemon log> | tail -3
-            ```
-
-            `reads` growing means the standby is serving. `fallbacks`
-            growing much faster means it is lagging or unreachable.
+            After a failover the daemon reconnects to the new primary and
+            revalidates (system identifier, timeline, the op_log continuity check)
+            before serving.
 
             ## Fix a standby that never catches up
 
-            Symptom: `status` shows `in recovery: t`, the daemon reports
-            `stale or unreachable`, and the container log contains
-            `requested WAL segment ... has already been removed`:
+            If the container log says `requested WAL segment ... has already been
+            removed`, the primary recycled WAL the standby still needed. Rebuild it:
 
             ```bash
-            docker logs --tail 5 pgfs-replica
-            ```
-
-            The primary has recycled WAL the standby still needs, usually
-            because the standby was down for a long time. Rebuild it from a
-            fresh base backup:
-
-            ```bash
-            ./scripts/replica_db.sh wipe
-            docker rm pgfs-replica 2>/dev/null    # if a stopped container remains
-            ./scripts/replica_db.sh up
-            ```
-
-            ## Fix "container name /pgfs-replica is already in use"
-
-            A stopped container from an earlier run remains, and `down` only
-            removes running containers:
-
-            ```bash
-            docker rm pgfs-replica
-            ./scripts/replica_db.sh up
-            ```
-
-            ## Attach a standby to a daemon that is already running
-
-            Restart the daemon with `--replica`. The standby connection is
-            made only at startup, and a standby that was unreachable then
-            stays detached until the next restart.
-
-            ## Remove the standby
-
-            ```bash
-            ./scripts/replica_db.sh down     # stop, keep data
-            ./scripts/replica_db.sh wipe     # stop and delete the data volume
+            ./scripts/replica_db.sh wipe && ./scripts/replica_db.sh up
             ```
         """)
 
     def reference(self):
         return md(r"""
-            ## Command line
+            ## Options
 
             | Option | Meaning |
             |---|---|
-            | `--replica <libpq string>` | connection to a physical streaming standby; optional |
+            | `--replica <libpq string>` | a physical streaming standby for reads; repeatable, the first is used |
+            | `--replica-wait <ms>` | how long a read waits for the standby to reach its ticket (default 20) |
 
-            ## Operation routing
+            ## Routing
 
             | Operation | Served by |
             |---|---|
-            | `lookup`, `getattr` | standby when fresh, otherwise primary |
-            | `readdir` | standby when fresh, otherwise primary |
-            | `read` (file contents) | primary, always |
-            | `create`, `mkdir`, `write`, `flush`, `fsync`, `setattr`, `unlink`, `rmdir`, `rename` | primary |
-            | checks that decide a mutation (existence for `create`/`mkdir`/`rmdir`, source and target for `rename`, `setattr`) | primary |
+            | `lookup`, `getattr`, `readdir`, `readdirplus`, `read`, `readlink`, xattr reads | the standby when its replay LSN is at or past the inode's ticket, else the primary |
+            | every mutation, and every read inside a mutation | the primary |
 
-            ## Freshness
+            A ticket is the primary's WAL insert LSN, read in the same round trip
+            right after the mutation commits, recorded on the inode (and the
+            parents of name changes). When the primary's known flush LSN is below
+            the ticket, the read goes straight to the primary.
 
-            A standby is fresh when either query below holds; any error on
-            either node means not fresh.
+            ## Identity checks, at connect and reconnect
 
-            | Condition | Query |
+            | Check | Must hold |
             |---|---|
-            | standby is not in recovery (it is itself a primary) | `SELECT pg_is_in_recovery()` on the standby returns false |
-            | standby has replayed everything the primary has written | `pg_last_wal_replay_lsn()` on the standby ≥ `pg_current_wal_lsn()` on the primary |
-
-            | Property | Value |
-            |---|---|
-            | Verdict cache | 500 ms (`FRESHNESS_TTL_MS`) |
-            | Clock | monotonic |
-            | Staleness bound | a cached "fresh" verdict is reused for up to 500 ms, so a read can reach the standby up to 500 ms after the primary moved ahead of it, including right after this daemon's own write |
-
-            ## Fallback
-
-            | Event | Effect |
-            |---|---|
-            | standby stale or unreachable at read time | the read is served by the primary; no error reaches the kernel |
-            | first fallback in each 60 s metrics period | WARN `reads falling back to primary (standby stale or unreachable)` |
-            | later fallbacks | DEBUG `read served from primary (replica stale)` |
-            | every fallback | `metrics|replica fallbacks` incremented |
-
-            File-content reads always use the primary and count as
-            fallbacks.
-
-            ## Startup
-
-            | Situation | Behaviour |
-            |---|---|
-            | standby reachable | one standby connection is opened and held for the daemon's lifetime |
-            | standby unreachable | startup waits for the connection-pool timeout (30 s), then continues primary-only for the daemon's lifetime; the state dump reports `replica none`; no warning is logged |
-            | log line | `replica mode: reads served from standby (<conn>) when fresh`, or `replica mode: off (single primary)` |
+            | system identifier | equals the primary's |
+            | timeline | the primary's or an ancestor |
+            | `pg_is_in_recovery()` | true |
+            | `pgfs.meta.fs_uuid` | equals the primary's |
 
             ## Observability
 
-            | Signal | Content |
+            | Where | What |
             |---|---|
-            | `metrics|replica|reads=N fallbacks=N` | every 60 s |
-            | SIGUSR1 state dump | `db=connected (replica none|fresh|stale or unreachable)` |
+            | startup log | `replica mode: standby <redacted conn> verified`, or why it is not used |
+            | `metrics\|replica\|…` | `reads`, `fallbacks`, `lag_bytes`, `lag_ms`, `ticket_waits` |
+            | SIGUSR1 dump | `state\|replica=…` with usability, replay LSN and known primary flush LSN |
 
             ## `scripts/replica_db.sh`
 
-            | Command | Action |
+            | Command | Effect |
             |---|---|
-            | `up` | ensure the primary runs with TCP on 127.0.0.1:5432; create volume `pgfs-replica-data`; if empty, `pg_basebackup -R` into it; start the container; wait for streaming |
-            | `down` | remove the running container; keep the volume |
-            | `wipe` | `down`, then delete the volume |
-            | `status` | Docker availability, container state, `pg_is_in_recovery()`, replay lag, primary WAL senders |
+            | `up` | provision (if absent) and start the standby on 127.0.0.1:5433 |
+            | `down` | stop the container, keep its data volume |
+            | `wipe` | remove the container and its data volume |
+            | `status` | recovery state and replay lag |
             | `conn` | print the `--replica` connection string |
-
-            | Constant | Value |
-            |---|---|
-            | Image | `postgres:17` |
-            | Container | `pgfs-replica` |
-            | Volume | `pgfs-replica-data` |
-            | Network | host network; the standby listens on 127.0.0.1:5433 |
-            | Connection string | `host=127.0.0.1 port=5433 dbname=pgfs user=<os user>` |
-
-            ## Primary requirements
-
-            | Requirement | Provided by |
-            |---|---|
-            | TCP listener on 127.0.0.1 | `init_db.sh` (`-h 127.0.0.1`) |
-            | replication allowed from loopback | `pg_hba.conf` from `initdb --auth=trust` (`host replication all 127.0.0.1/32 trust`) |
-            | same PostgreSQL major version as the standby | both are PostgreSQL 17 |
         """)
 
     def explanation(self):
         return md(r"""
-            ## Why a physical standby
+            ## Why a read ticket
 
-            PostgreSQL's physical streaming replication ships the primary's
-            write-ahead log byte for byte, and the standby replays it. The
-            standby is therefore an exact copy of the whole cluster: same
-            tables, same rows, same schema, with no extra setup and no
-            schema to keep in sync. That is why pgfs never initialises the
-            schema on the standby. Nothing it could create would be
-            different from what replication already delivers.
+            A standby replays the primary's WAL a little behind it. A mount that
+            reads from a standby must never miss its own writes, so each mutation
+            records the LSN of its commit, and a read of that inode may use the
+            standby only once the standby has replayed that far. Comparing the
+            standby with the primary's *current* position instead is almost never
+            true on a busy primary, and two positions read by separate queries on
+            two nodes are not comparable at one instant.
 
-            ## Reads can go anywhere, decisions cannot
+            Asynchronous commits complicate this: the WAL sender streams only up to
+            the primary's flush position, so a commit not yet flushed cannot be on
+            the standby however long one waits. The daemon therefore sends such
+            reads straight to the primary instead of waiting.
 
-            A standby is always slightly behind. Serving a stale
-            directory listing is a small, recoverable inaccuracy. Making a
-            write decision from stale data is a correctness bug. If
-            `create` checked a stale standby for an existing file, it could
-            decide the name was free when it was not.
+            ## Why identity checks
 
-            So pgfs draws the line between answering and deciding. Pure
-            metadata reads may use the standby. Every mutation, and every
-            read whose result decides what a mutation does, goes to the
-            primary. A lagging standby can therefore make the mount look
-            briefly out of date, but it can never make it write the wrong
-            thing.
+            After a failover, an LSN alone cannot tell a standby of this cluster
+            from a node of another one. Checking the system identifier, the
+            timeline and `fs_uuid` makes sure the standby holds this filesystem's
+            history.
 
-            ## Measuring lag instead of assuming it
+            ## What a standby is not
 
-            Before using the standby, pgfs compares two positions in the
-            write-ahead log: how far the primary has written, and how far
-            the standby has replayed. If the standby has replayed at least
-            as far, it holds everything the primary holds, and reading from
-            it is indistinguishable from reading the primary.
-
-            That check costs three small queries. Running it before every
-            read would cost more than the reads it offloads, so the verdict
-            is cached for half a second. This is the one place where pgfs
-            trades strictness for speed. Inside that window, a read can see
-            the standby's slightly older state.
-
-            ## Failing towards availability
-
-            When the standby is stale, unreachable or broken, pgfs reads
-            from the primary and says so once per minute in the log. The
-            programs using the mount never see an error. A replicated mount
-            degrades into a single-node mount, which is still correct and
-            only less scalable.
-
-            ## What replication does not give you
-
-            The standby offloads reads; it does not protect writes. If the
-            primary fails, the mount fails. pgfs does not promote the
-            standby or redirect writes, and a promoted standby is a new
-            primary that pgfs would have to be restarted against. High
-            availability for writes is a property of the PostgreSQL
-            deployment underneath, not of pgfs.
-
-            ## Why Docker, and why host networking
-
-            The standby needs its own PostgreSQL instance with its own data
-            directory and port. A container provides that without a second
-            installation, and the named volume survives container restarts.
-            Host networking lets the container reach the primary on
-            loopback, so the primary never has to listen on a routable
-            interface.
+            A standby is a copy, not protection against corruption: physical
+            replication copies a damaged page faithfully. Checksums and
+            `pgfs scrub` are for that. A standby failure never surfaces as an error
+            in the mount; it only turns standby reads into primary reads.
         """)

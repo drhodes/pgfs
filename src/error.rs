@@ -46,17 +46,15 @@ pub fn failure(what: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!("{what} (at {}:{})", loc.file(), loc.line())
 }
 
-/// Log a failure's full story and reply to the kernel with EIO. FUSE can't
-/// carry the reason to the caller, so the daemon log is where the story
-/// lives. Use this for *unexpected* failures (DB down, bad data, ...) — the
-/// expected errnos (ENOENT, ENOTEMPTY, ...) are returned directly.
+/// Log an unexpected failure's full story (spec/app.py
+/// DistinguishesExpectedErrors). FUSE can't carry the reason to the
+/// caller, so the daemon log is where the story lives; the caller then
+/// replies the errno. Expected errnos (ENOENT, ENOTEMPTY, ...) never come
+/// here.
 #[macro_export]
 macro_rules! log_and_reply {
-    ($reply:expr, $err:expr) => {{
-        $crate::metrics::EIO_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ($err:expr) => {{
         tracing::error!("{:#}", $err);
-        $reply.error(libc::EIO);
-        return;
     }};
 }
 

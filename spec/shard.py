@@ -12,7 +12,11 @@ shared tree.
 These Requirement classes are granular and single-responsibility,
 following the project's convention: each one is independently
 footprintable, testable, and implementable. The architectural rationale
-lives in design/sharded_filesystem.md.
+lives in design/sharded_filesystem-v0.1.md.
+
+Superseded: this module describes v0.1. It is kept unchanged until the
+single-machine filesystem is complete, then rewritten to the v0.2
+design (design/sharded_filesystem.md; design-decisions.md, topic 10).
 """
 
 from .err import PLANNED, Feat, Req, md
@@ -183,10 +187,15 @@ class ShardedFilesystem(Feat):
 
     def status_note(self):
         return (
-            "Specified and designed (`design/sharded_filesystem.md`), not "
-            "implemented. The daemon does not accept `--shards` or "
-            "`--replication-factor`, and `scripts/shard_db.sh` does not exist "
-            "yet. The tutorial and how-to describe the intended interface."
+            "Superseded, not implemented. These requirements describe the "
+            "v0.1 design (`design/sharded_filesystem-v0.1.md`): quorum "
+            "fan-out, client-sequenced versions and hashing by top-level "
+            "name, all of which the literature review advises against. "
+            "The v0.2 design in `design/sharded_filesystem.md` replaces "
+            "it, with one metadata database plus data sets replicated by "
+            "Postgres. This module will be rewritten to v0.2 once the "
+            "single-machine filesystem is complete "
+            "(`design/design-decisions.md`, topic 10)."
         )
 
     def tutorial(self):

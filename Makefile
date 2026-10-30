@@ -1,6 +1,6 @@
 PGFS := ./scripts/pgfs.sh
 
-.PHONY: help up down status run build check clippy fmt init-db db-stop shell clean test test-integration ensure-db
+.PHONY: help up down status run build check clippy fmt init-db db-stop shell clean test test-integration ensure-db bench
 
 help:
 	@echo "pgfs — PostgreSQL-backed FUSE filesystem"
@@ -18,6 +18,7 @@ help:
 	@echo "  make fmt       cargo fmt"
 	@echo "  make test      cargo test (Rust unit tests)"
 	@echo "  make test-integration  run the full FUSE integration suite (scripts/run_tests.sh)"
+	@echo "  make bench     run the benchmark workloads (scripts/bench.sh)"
 	@echo "  make init-db   create/start the project-local Postgres cluster"
 	@echo "  make db-stop   stop the project-local Postgres cluster"
 	@echo "  make shell     nix develop"
@@ -72,6 +73,9 @@ test: check-nix ensure-db
 
 test-integration: check-nix
 	./scripts/run_tests.sh
+
+bench: check-nix
+	./scripts/bench.sh
 
 init-db: check-nix
 	./scripts/init_db.sh

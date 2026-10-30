@@ -50,7 +50,44 @@ class ProfileDrivenBenchmark(Profiling, Req):
     read-modify-write amplification), sequential reads, and many-small-file
     creation (round-trip bound) — each wrapped in a SIGUSR2 start/stop pair.
     The bottleneck shows up as CPU time in the flamegraph rather than as
-    wall-clock guesswork, and the span trace attributes FUSE vs DB time."""
+    wall-clock guesswork, and the span trace attributes FUSE vs DB time.
+    This script is for finding where time goes. Comparable measurements
+    over time are `BenchmarkSuite`'s job."""
+
+
+class BenchmarkSuite(Req):
+    """`make bench` runs a fixed set of named workloads on a fresh
+    filesystem, and writes the results as JSON with the commit, the
+    machine and the Postgres version:
+
+    | Workload | Measures |
+    |---|---|
+    | fio sequential read and write, 1 MiB | data-path throughput |
+    | fio random 4 KiB read and write | small I/O and read-modify-write |
+    | mdtest create, stat, unlink, 100k files | metadata operations per second |
+    | `git clone`, then `git status`, of a pinned repository | real tool workload (Bento r53) |
+    | untar of a pinned Linux kernel tarball | small-file creation (IndexFS r09) |
+    | snapshot, branch, promote and diff on a 100k-file tree | the killer feature's constant-time claim |
+
+    Each workload also runs on a passthrough FUSE filesystem over ext4
+    on the same machine, and results are reported as a ratio to it.
+    Comparing with ext4 directly would charge pgfs for FUSE itself
+    (Bento r53). Every run records WAL bytes per byte of user data
+    (`space.ReportsSpace`) and the p50 and p99 latency of each
+    operation.
+
+    **Sources.** Bento r53, IndexFS r09, To FUSE or Not r12."""
+
+
+class BenchmarkRegressionGate(Req):
+    """CI runs `BenchmarkSuite` on a fixed runner and compares each
+    result with the stored baseline. A workload more than 10% slower,
+    or with a write amplification more than 10% higher, fails the run,
+    unless the commit updates the baseline with a stated reason.
+    Absolute targets are written into the baseline after the first run
+    of the inode-keyed design."""
+
+    deps = [BenchmarkSuite]
 
 
 # ── User-visible feature ──────────────────────────────────────────────
@@ -95,13 +132,13 @@ class OnDemandProfiling(Feat):
             cargo build --release --features profiling
             ./scripts/ensure_db.sh
             mkdir -p testdata/mnt
-            ./target/release/pgfs testdata/mnt 2> testdata/profile-demo.log &
+            ./target/release/pgfs mount main testdata/mnt 2> testdata/profile-demo.log &
             sleep 1
             grep 'span trace will be written' testdata/profile-demo.log
             ```
 
             ```text
-            INFO pgfs: span trace will be written to /tmp/pgfs-trace-1793059200.json on shutdown
+            pgfs: span trace will be written to /tmp/pgfs-trace-1793059200.json on shutdown
             ```
 
             ## Step 2: profile a workload
@@ -109,7 +146,7 @@ class OnDemandProfiling(Feat):
             Start the sampler, run the workload, stop the sampler:
 
             ```bash
-            PID=$(pgrep -f 'target/release/pgfs testdata/mnt')
+            PID=$(pgrep -f 'target/release/pgfs mount main testdata/mnt')
             kill -USR2 $PID
             for i in $(seq 1 500); do echo "line $i" > testdata/mnt/p$i.txt; done
             kill -USR2 $PID
@@ -127,7 +164,7 @@ class OnDemandProfiling(Feat):
             Open the `.svg` file in a web browser. Each box is a function;
             its width is the share of samples in which it was on the stack.
             Hover over the widest towers to find which FUSE callbacks
-            (`create`, `write`, `flush`) and which `postgres` client calls
+            (`create`, `write`, `flush`) and which `tokio-postgres` client calls
             they lead to. Click a box to zoom into it.
 
             ## Step 4: stop and open the span trace

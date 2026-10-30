@@ -1,63 +1,42 @@
 # How-To: Kernel Offloading
 
 !!! warning "Status: Partially implemented"
-    Server-side `copy_file_range` and `fallocate` are implemented in the storage backend and unit-tested, but the FUSE layer does not call them yet. On a mount, copies stream through the daemon and `fallocate` fails with `EOPNOTSUPP`. Reflink, subtree clone and content search are planned.
+    `copy_file_range` maps whole blocks to the source's blobs (shared, collected by GC) and copies only partial edge blocks, in one bounded transaction; `fallocate` extends, punches holes and zeroes ranges by changing map rows. Content search is planned.
 
-> pgfs incorporates Database-Native Kernel Offloading capabilities, utilizing copy_file_range, fallocate, reflink CoW, and server-side search to eliminate userspace byte streaming and deliver sub-millisecond execution for large-scale file operations.
+> Copies and hole punching run inside PostgreSQL. `cp` shares blocks instead of copying bytes, and `fallocate` punches holes and zeroes ranges by changing block-map rows, so no file data passes through the daemon. Content search through database indexes is planned.
 
 [Tutorial](../tutorials/kerneloffloadingacceleration.md) · **How-to** · [Reference](../reference/kerneloffloadingacceleration.md) · [Explanation](../explanation/kerneloffloadingacceleration.md)
 
 ---
 
-## Copy a file
+## Copy without moving data
 
-`cp` works and the copy is exact, but today every byte passes
-through the daemon. `cp` calls `copy_file_range(2)`; pgfs does
-not implement the FUSE callback, so the kernel falls back to
-reading and writing.
+Use any tool that calls `copy_file_range(2)`: `cp` from coreutils 9,
+`sendfile`, or Python's `os.copy_file_range`. Whole blocks are shared
+when the source and destination offsets are equal modulo the block
+size; other bytes are copied by the daemon. A copy larger than 4 096
+blocks replies with the bytes copied so far, and the caller continues.
 
-## Copy a large file or tree faster today
+## Punch holes and zero ranges
 
-Copy inside the database, as in the tutorial, while nothing is
-writing to the source:
-
-```sql
-BEGIN;
-INSERT INTO entries (parent, name, kind, size)
-  SELECT parent, 'copy.bin', kind, size FROM entries WHERE parent = 'dir' AND name = 'orig.bin';
-INSERT INTO blocks (parent, name, block_no, data)
-  SELECT parent, 'copy.bin', block_no, data FROM blocks WHERE parent = 'dir' AND name = 'orig.bin';
-COMMIT;
+```bash
+fallocate --punch-hole --offset OFFSET --length LENGTH FILE
+fallocate --zero-range --offset OFFSET --length LENGTH FILE
+fallocate --length LENGTH FILE        # extend the size; no preallocation
 ```
 
-The new file appears on the mount once the attribute cache
-expires (`--attr-ttl`, default 1 s).
+`FALLOC_FL_COLLAPSE_RANGE` and `FALLOC_FL_INSERT_RANGE` reply
+EOPNOTSUPP.
 
-## Preallocate or punch holes
-
-Not available on a mount: `fallocate` fails with
-`Operation not supported`. To make a file sparse, truncate it
-and rewrite the parts you need, or extend it with
-`truncate -s`, which never stores the new bytes.
-
-## Clone with `cp --reflink`
-
-Not available: `cp --reflink=always` fails with
-`Operation not supported`. Plain `cp` (or
-`cp --reflink=auto`) works.
-
-## Search file contents in the database
-
-Not available as a filesystem interface. For text files you
-can query blocks directly:
+## See how much is shared
 
 ```sql
-SELECT DISTINCT parent || '/' || name FROM blocks
-WHERE position(convert_to('needle', 'UTF8') in data) > 0;
+SELECT count(*) FILTER (WHERE shared) AS shared, count(*) AS blobs FROM pgfs.blobs;
+SELECT gc_queue FROM pgfs.backlog();
 ```
 
-This scans every block, and it misses matches that span a
-block boundary.
+Shared blobs are freed by the background collector once no map row
+references them (`space.CollectsSharedBlobs`).
 
 ---
 

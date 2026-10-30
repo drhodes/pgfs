@@ -1,479 +1,305 @@
-//! Core storage backend trait and data types for pgfs.
+//! The storage interface the FUSE layer talks to (spec/optimize.py
+//! PgfsBackendTraitReq): one method per `pgfs.*` SQL function. The daemon
+//! cannot tell `PgBackend` (src/pg.rs) from the in-memory reference model
+//! (tests/model/), which implements the same trait.
 //!
-//! Decouples the FUSE filesystem layer (fs.rs) from the underlying
-//! database access mechanics (LocalBackend via pgrx or RemoteBackend via tokio-postgres).
+//! The trait is synchronous: each dispatch worker owns one backend and
+//! calls it from its own thread (spec/concurrency.py WorkerOwnsConnection).
 
-use async_trait::async_trait;
-use std::time::SystemTime;
-use thiserror::Error;
+use crate::errno::FsResult;
 
-#[derive(Error, Debug)]
-pub enum StorageError {
-    #[error("Entry not found")]
-    NotFound,
-    #[error("Entry already exists")]
-    AlreadyExists,
-    #[error("Directory not empty")]
-    NotEmpty,
-    #[error("Invalid argument: {0}")]
-    InvalidArgument(String),
-    #[error("Database error: {0}")]
-    DatabaseError(String),
-    #[error("IO error: {0}")]
-    IoError(std::io::ErrorKind),
+/// The kind of an inode, as stored in `inodes.kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Kind {
+    File,
+    Dir,
+    Symlink,
+    Fifo,
+    Socket,
+    CharDev,
+    BlockDev,
 }
 
-impl From<StorageError> for libc::c_int {
-    fn from(err: StorageError) -> Self {
-        match err {
-            StorageError::NotFound => libc::ENOENT,
-            StorageError::AlreadyExists => libc::EEXIST,
-            StorageError::NotEmpty => libc::ENOTEMPTY,
-            StorageError::InvalidArgument(_) => libc::EINVAL,
-            StorageError::DatabaseError(_) => libc::EIO,
-            StorageError::IoError(k) => match k {
-                std::io::ErrorKind::NotFound => libc::ENOENT,
-                std::io::ErrorKind::AlreadyExists => libc::EEXIST,
-                std::io::ErrorKind::PermissionDenied => libc::EACCES,
-                std::io::ErrorKind::InvalidInput => libc::EINVAL,
-                _ => libc::EIO,
-            },
+impl Kind {
+    pub fn from_char(c: i8) -> Kind {
+        match c as u8 {
+            b'd' => Kind::Dir,
+            b'l' => Kind::Symlink,
+            b'p' => Kind::Fifo,
+            b's' => Kind::Socket,
+            b'c' => Kind::CharDev,
+            b'b' => Kind::BlockDev,
+            _ => Kind::File,
         }
     }
+
+    pub fn as_char(self) -> i8 {
+        (match self {
+            Kind::File => b'f',
+            Kind::Dir => b'd',
+            Kind::Symlink => b'l',
+            Kind::Fifo => b'p',
+            Kind::Socket => b's',
+            Kind::CharDev => b'c',
+            Kind::BlockDev => b'b',
+        }) as i8
+    }
+
+    /// From the S_IFMT bits of a mode.
+    pub fn from_mode(mode: u32) -> Option<Kind> {
+        Some(match mode & libc::S_IFMT {
+            libc::S_IFREG | 0 => Kind::File,
+            libc::S_IFDIR => Kind::Dir,
+            libc::S_IFLNK => Kind::Symlink,
+            libc::S_IFIFO => Kind::Fifo,
+            libc::S_IFSOCK => Kind::Socket,
+            libc::S_IFCHR => Kind::CharDev,
+            libc::S_IFBLK => Kind::BlockDev,
+            _ => return None,
+        })
+    }
+
+    pub fn fuse(self) -> fuser::FileType {
+        match self {
+            Kind::File => fuser::FileType::RegularFile,
+            Kind::Dir => fuser::FileType::Directory,
+            Kind::Symlink => fuser::FileType::Symlink,
+            Kind::Fifo => fuser::FileType::NamedPipe,
+            Kind::Socket => fuser::FileType::Socket,
+            Kind::CharDev => fuser::FileType::CharDevice,
+            Kind::BlockDev => fuser::FileType::BlockDevice,
+        }
+    }
+}
+
+/// Attributes of an inode (`pgfs.attr`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attr {
+    pub ino: u64,
+    pub gen: u64,
+    pub kind: Kind,
+    /// Permission and set-id bits, without the type bits.
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub nlink: u32,
+    pub size: u64,
+    /// 512-byte units of stored data.
+    pub blocks: u64,
+    pub atime_ns: i64,
+    pub mtime_ns: i64,
+    pub ctime_ns: i64,
+    pub btime_ns: i64,
+    pub rdev: u64,
+    pub version: i64,
+}
+
+/// A view of a tree: its layer, the epoch (None: the live view) and the
+/// directory that kernel inode 1 maps to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct View {
+    pub layer: i64,
+    pub epoch: Option<i64>,
+    pub root: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+    pub name: Vec<u8>,
+    pub ino: u64,
+    pub kind: Kind,
+}
+
+/// Committed content of a byte range, block by block.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReadResult {
+    /// The file stores its content inline (block 0 only).
+    pub inline: bool,
+    /// (block number, content); a missing block is a hole.
+    pub blocks: Vec<(u64, Vec<u8>)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MakeArgs {
+    pub parent: u64,
+    pub name: Vec<u8>,
+    pub kind: Kind,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub rdev: u64,
+    pub target: Option<Vec<u8>>,
+    pub now: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileKind {
-    File = 1,
-    Directory = 2,
-    Symlink = 3,
-}
-
-impl From<FileKind> for fuser::FileType {
-    fn from(kind: FileKind) -> Self {
-        match kind {
-            FileKind::File => fuser::FileType::RegularFile,
-            FileKind::Directory => fuser::FileType::Directory,
-            FileKind::Symlink => fuser::FileType::Symlink,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct FileAttr {
+pub struct UnlinkOutcome {
     pub ino: u64,
-    pub size: u64,
-    pub blocks: u64,
-    pub atime: SystemTime,
-    pub mtime: SystemTime,
-    pub ctime: SystemTime,
-    pub kind: FileKind,
-    pub perm: u16,
     pub nlink: u32,
-    pub uid: u32,
-    pub gid: u32,
-    pub rdev: u32,
-    pub flags: u32,
+    pub orphaned: bool,
 }
 
-impl From<FileAttr> for fuser::FileAttr {
-    fn from(attr: FileAttr) -> Self {
-        fuser::FileAttr {
-            ino: attr.ino,
-            size: attr.size,
-            blocks: attr.blocks,
-            atime: attr.atime,
-            mtime: attr.mtime,
-            ctime: attr.ctime,
-            crtime: attr.ctime,
-            kind: attr.kind.into(),
-            perm: attr.perm,
-            nlink: attr.nlink,
-            uid: attr.uid,
-            gid: attr.gid,
-            rdev: attr.rdev,
-            flags: attr.flags,
-            blksize: 131072,
-        }
-    }
-}
-
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
-pub struct DirEntry {
-    pub ino: u64,
-    pub name: String,
-    pub kind: FileKind,
+pub struct RenameArgs {
+    pub parent: u64,
+    pub name: Vec<u8>,
+    pub newparent: u64,
+    pub newname: Vec<u8>,
+    pub flags: u32,
+    pub open: Vec<u64>,
+    pub dirty: Vec<u64>,
+    pub now: i64,
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Default, Clone)]
-pub struct SetAttrInput {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenameOutcome {
+    pub ino: u64,
+    /// The replaced target: (ino, remaining links, orphaned).
+    pub replaced: Option<(u64, u32, bool)>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SetAttrArgs {
+    pub ino: u64,
+    pub gen: Option<u64>,
     pub mode: Option<u32>,
     pub uid: Option<u32>,
     pub gid: Option<u32>,
     pub size: Option<u64>,
-    pub atime: Option<SystemTime>,
-    pub mtime: Option<SystemTime>,
+    /// The block now holding the end of the file, tail zeroed, or the
+    /// inline content as block 0 when an inline file grows past inline_max.
+    pub tail: Option<(u64, Vec<u8>)>,
+    pub atime_ns: Option<i64>,
+    pub mtime_ns: Option<i64>,
+    pub caller_uid: Option<u32>,
+    pub now: i64,
 }
 
-/// Helper function to zero-pad unaligned or sparse block writes (SparseWritePaddingReq).
-#[allow(dead_code)]
-pub fn prepare_sparse_block_write(
-    existing_data: Option<Vec<u8>>,
-    offset_in_block: usize,
-    payload: &[u8],
-) -> Vec<u8> {
-    let mut block = existing_data.unwrap_or_default();
-    let required_len = offset_in_block + payload.len();
-
-    if block.len() < required_len {
-        block.resize(required_len, 0);
-    }
-
-    block[offset_in_block..required_len].copy_from_slice(payload);
-    block
+#[derive(Debug, Clone, Default)]
+pub struct WriteArgs {
+    pub ino: u64,
+    pub gen: Option<u64>,
+    pub size: u64,
+    /// New inline content (the file stays inline).
+    pub inline: Option<Vec<u8>>,
+    /// Whole blocks to store as new blobs.
+    pub blocks: Vec<(u64, Vec<u8>)>,
+    /// Blocks to make read as zero, applied first.
+    pub hole: Option<(u64, u64)>,
+    pub mtime_ns: Option<i64>,
+    pub now: i64,
+    pub writer_uids: Vec<u32>,
+    pub sync: bool,
 }
 
-#[allow(dead_code)]
-#[async_trait]
-pub trait PgfsBackend: Send + Sync {
-    /// Metadata Operations
-    async fn lookup(&self, parent_ino: u64, name: &str) -> Result<Option<FileAttr>, StorageError>;
-    async fn getattr(&self, ino: u64) -> Result<FileAttr, StorageError>;
-    async fn setattr(&self, ino: u64, attr: SetAttrInput) -> Result<FileAttr, StorageError>;
+#[derive(Debug, Clone, Default)]
+pub struct CopyArgs {
+    pub ino_in: u64,
+    pub gen_in: Option<u64>,
+    pub ino_out: u64,
+    pub gen_out: Option<u64>,
+    pub src_first: u64,
+    pub dst_first: u64,
+    pub count: u64,
+    pub blocks: Vec<(u64, Vec<u8>)>,
+    pub size: u64,
+    pub now: i64,
+}
 
-    /// Directory Operations
-    async fn readdir(&self, ino: u64, offset: i64) -> Result<Vec<DirEntry>, StorageError>;
-    async fn mkdir(
-        &self,
-        parent_ino: u64,
-        name: &str,
-        mode: u32,
-        uid: u32,
-        gid: u32,
-    ) -> Result<FileAttr, StorageError>;
-    async fn rmdir(&self, parent_ino: u64, name: &str) -> Result<(), StorageError>;
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub physical_bytes: u64,
+    pub inodes: u64,
+}
 
-    /// File Mutation Operations
-    async fn create(
-        &self,
-        parent_ino: u64,
-        name: &str,
-        mode: u32,
-        uid: u32,
-        gid: u32,
-    ) -> Result<FileAttr, StorageError>;
-    async fn unlink(&self, parent_ino: u64, name: &str) -> Result<(), StorageError>;
-    async fn rename(
-        &self,
-        old_parent: u64,
-        old_name: &str,
-        new_parent: u64,
-        new_name: &str,
-    ) -> Result<(), StorageError>;
+/// XATTR_CREATE / XATTR_REPLACE.
+pub const XATTR_CREATE: i32 = 1;
+pub const XATTR_REPLACE: i32 = 2;
 
-    /// Chunked Block I/O Operations
-    async fn read_block(&self, ino: u64, block_no: u32) -> Result<Vec<u8>, StorageError>;
-    async fn write_block(
-        &self,
+/// RENAME_NOREPLACE / RENAME_EXCHANGE / RENAME_WHITEOUT.
+pub const RENAME_NOREPLACE: u32 = 1;
+pub const RENAME_EXCHANGE: u32 = 2;
+pub const RENAME_WHITEOUT: u32 = 4;
+
+pub trait PgfsBackend: Send {
+    // ── Reads ────────────────────────────────────────────────────────────
+    fn lookup(&mut self, v: &View, parent: u64, name: &[u8]) -> FsResult<Option<Attr>>;
+    fn getattr(&mut self, v: &View, ino: u64, gen: Option<u64>) -> FsResult<Option<Attr>>;
+    fn readdir(
+        &mut self,
+        v: &View,
+        dir: u64,
+        after: Option<&[u8]>,
+        limit: u32,
+    ) -> FsResult<Vec<DirEntry>>;
+    fn readdirplus(
+        &mut self,
+        v: &View,
+        dir: u64,
+        after: Option<&[u8]>,
+        limit: u32,
+    ) -> FsResult<Vec<(Vec<u8>, Attr)>>;
+    fn read_blocks(
+        &mut self,
+        v: &View,
         ino: u64,
-        block_no: u32,
-        data: &[u8],
-        offset_in_block: u32,
-    ) -> Result<u32, StorageError>;
-    async fn truncate_blocks(&self, ino: u64, new_size: u64) -> Result<(), StorageError>;
+        gen: Option<u64>,
+        first: u64,
+        last: u64,
+    ) -> FsResult<ReadResult>;
+    fn readlink(&mut self, v: &View, ino: u64) -> FsResult<Vec<u8>>;
+    fn getxattr(&mut self, v: &View, ino: u64, name: &[u8]) -> FsResult<Option<Vec<u8>>>;
+    fn listxattr(&mut self, v: &View, ino: u64) -> FsResult<Vec<Vec<u8>>>;
+    fn seek_block(&mut self, v: &View, ino: u64, block: u64, data: bool) -> FsResult<Option<u64>>;
+    fn statfs(&mut self) -> FsResult<Usage>;
 
-    /// Database-Native Offloading Operations
-    async fn copy_file_range(
-        &self,
-        ino_in: u64,
-        off_in: u64,
-        ino_out: u64,
-        off_out: u64,
-        len: u64,
-    ) -> Result<u64, StorageError> {
-        let _ = (ino_in, off_in, ino_out, off_out, len);
-        Err(StorageError::InvalidArgument(
-            "copy_file_range offloading not implemented for this backend".into(),
-        ))
-    }
-
-    async fn fallocate(
-        &self,
+    // ── Mutations, each one transaction ──────────────────────────────────
+    fn make(&mut self, layer: i64, a: &MakeArgs) -> FsResult<Attr>;
+    fn link(
+        &mut self,
+        layer: i64,
         ino: u64,
-        offset: u64,
-        length: u64,
-        mode: u32,
-    ) -> Result<(), StorageError> {
-        let _ = (ino, offset, length, mode);
-        Err(StorageError::InvalidArgument(
-            "fallocate offloading not implemented for this backend".into(),
-        ))
-    }
-}
-
-#[allow(dead_code)]
-#[derive(Clone)]
-pub struct LocalBackend {
-    db: std::sync::Arc<crate::db::Db>,
-}
-
-#[allow(dead_code)]
-impl LocalBackend {
-    pub fn new(db: crate::db::Db) -> Self {
-        Self {
-            db: std::sync::Arc::new(db),
-        }
-    }
-
-    pub fn from_arc(db: std::sync::Arc<crate::db::Db>) -> Self {
-        Self { db }
-    }
-
-    pub fn db(&self) -> &std::sync::Arc<crate::db::Db> {
-        &self.db
-    }
-}
-
-#[async_trait]
-impl PgfsBackend for LocalBackend {
-    async fn lookup(&self, parent_ino: u64, name: &str) -> Result<Option<FileAttr>, StorageError> {
-        self.db.lookup(parent_ino, name).await
-    }
-    async fn getattr(&self, ino: u64) -> Result<FileAttr, StorageError> {
-        self.db.getattr(ino).await
-    }
-    async fn setattr(&self, ino: u64, attr: SetAttrInput) -> Result<FileAttr, StorageError> {
-        self.db.setattr(ino, attr).await
-    }
-    async fn readdir(&self, ino: u64, offset: i64) -> Result<Vec<DirEntry>, StorageError> {
-        self.db.readdir(ino, offset).await
-    }
-    async fn mkdir(
-        &self,
-        parent_ino: u64,
-        name: &str,
-        mode: u32,
-        uid: u32,
-        gid: u32,
-    ) -> Result<FileAttr, StorageError> {
-        self.db.mkdir(parent_ino, name, mode, uid, gid).await
-    }
-    async fn rmdir(&self, parent_ino: u64, name: &str) -> Result<(), StorageError> {
-        self.db.rmdir(parent_ino, name).await
-    }
-    async fn create(
-        &self,
-        parent_ino: u64,
-        name: &str,
-        mode: u32,
-        uid: u32,
-        gid: u32,
-    ) -> Result<FileAttr, StorageError> {
-        self.db.create(parent_ino, name, mode, uid, gid).await
-    }
-    async fn unlink(&self, parent_ino: u64, name: &str) -> Result<(), StorageError> {
-        self.db.unlink(parent_ino, name).await
-    }
-    async fn rename(
-        &self,
-        old_parent: u64,
-        old_name: &str,
-        new_parent: u64,
-        new_name: &str,
-    ) -> Result<(), StorageError> {
-        self.db
-            .rename(old_parent, old_name, new_parent, new_name)
-            .await
-    }
-    async fn read_block(&self, ino: u64, block_no: u32) -> Result<Vec<u8>, StorageError> {
-        self.db.read_block(ino, block_no).await
-    }
-    async fn write_block(
-        &self,
+        gen: Option<u64>,
+        newparent: u64,
+        newname: &[u8],
+        now: i64,
+    ) -> FsResult<Attr>;
+    fn unlink(
+        &mut self,
+        layer: i64,
+        parent: u64,
+        name: &[u8],
+        open: &[u64],
+        dirty: &[u64],
+        now: i64,
+    ) -> FsResult<UnlinkOutcome>;
+    fn rmdir(&mut self, layer: i64, parent: u64, name: &[u8], now: i64) -> FsResult<u64>;
+    fn rename(&mut self, layer: i64, a: &RenameArgs) -> FsResult<RenameOutcome>;
+    fn setattr(&mut self, layer: i64, a: &SetAttrArgs) -> FsResult<Attr>;
+    fn write_blocks(&mut self, layer: i64, a: &WriteArgs) -> FsResult<Attr>;
+    fn copy_range(&mut self, layer: i64, a: &CopyArgs) -> FsResult<Attr>;
+    fn setxattr(
+        &mut self,
+        layer: i64,
         ino: u64,
-        block_no: u32,
-        data: &[u8],
-        offset_in_block: u32,
-    ) -> Result<u32, StorageError> {
-        self.db
-            .write_block(ino, block_no, data, offset_in_block)
-            .await
-    }
-    async fn truncate_blocks(&self, ino: u64, new_size: u64) -> Result<(), StorageError> {
-        self.db.truncate_blocks(ino, new_size).await
-    }
-}
+        name: &[u8],
+        value: &[u8],
+        flags: i32,
+        now: i64,
+    ) -> FsResult<()>;
+    fn removexattr(&mut self, layer: i64, ino: u64, name: &[u8], now: i64) -> FsResult<()>;
+    fn release_orphan(&mut self, layer: i64, ino: u64) -> FsResult<bool>;
+    /// The synchronous barrier (spec/durability.py FsyncForcesEarlierCommits).
+    fn sync_barrier(&mut self) -> FsResult<()>;
 
-#[allow(dead_code)]
-pub struct RemoteBackend {
-    conn_str: String,
-}
+    // ── Trees (spec/branch.py) ───────────────────────────────────────────
+    fn snapshot(&mut self, tree: &str, name: &str) -> FsResult<()>;
+    fn branch(&mut self, source: &str, snapshot: Option<&str>, new: &str) -> FsResult<()>;
+    fn promote(&mut self, branch: &str, tree: &str, force: bool) -> FsResult<()>;
 
-#[allow(dead_code)]
-impl RemoteBackend {
-    pub fn new(conn_str: impl Into<String>) -> Self {
-        Self {
-            conn_str: conn_str.into(),
-        }
-    }
-}
-
-#[async_trait]
-impl PgfsBackend for RemoteBackend {
-    async fn lookup(
-        &self,
-        _parent_ino: u64,
-        _name: &str,
-    ) -> Result<Option<FileAttr>, StorageError> {
-        Err(StorageError::DatabaseError(
-            "RemoteBackend over IPC connecting to ".to_string() + &self.conn_str,
-        ))
-    }
-    async fn getattr(&self, _ino: u64) -> Result<FileAttr, StorageError> {
-        Err(StorageError::NotFound)
-    }
-    async fn setattr(&self, _ino: u64, _attr: SetAttrInput) -> Result<FileAttr, StorageError> {
-        Err(StorageError::NotFound)
-    }
-    async fn readdir(&self, _ino: u64, _offset: i64) -> Result<Vec<DirEntry>, StorageError> {
-        Ok(Vec::new())
-    }
-    async fn mkdir(
-        &self,
-        _parent_ino: u64,
-        _name: &str,
-        _mode: u32,
-        _uid: u32,
-        _gid: u32,
-    ) -> Result<FileAttr, StorageError> {
-        Err(StorageError::DatabaseError(
-            "RemoteBackend not connected".into(),
-        ))
-    }
-    async fn rmdir(&self, _parent_ino: u64, _name: &str) -> Result<(), StorageError> {
-        Err(StorageError::DatabaseError(
-            "RemoteBackend not connected".into(),
-        ))
-    }
-    async fn create(
-        &self,
-        _parent_ino: u64,
-        _name: &str,
-        _mode: u32,
-        _uid: u32,
-        _gid: u32,
-    ) -> Result<FileAttr, StorageError> {
-        Err(StorageError::DatabaseError(
-            "RemoteBackend not connected".into(),
-        ))
-    }
-    async fn unlink(&self, _parent_ino: u64, _name: &str) -> Result<(), StorageError> {
-        Err(StorageError::DatabaseError(
-            "RemoteBackend not connected".into(),
-        ))
-    }
-    async fn rename(
-        &self,
-        _old_parent: u64,
-        _old_name: &str,
-        _new_parent: u64,
-        _new_name: &str,
-    ) -> Result<(), StorageError> {
-        Err(StorageError::DatabaseError(
-            "RemoteBackend not connected".into(),
-        ))
-    }
-    async fn read_block(&self, _ino: u64, _block_no: u32) -> Result<Vec<u8>, StorageError> {
-        Ok(Vec::new())
-    }
-    async fn write_block(
-        &self,
-        _ino: u64,
-        _block_no: u32,
-        _data: &[u8],
-        _offset_in_block: u32,
-    ) -> Result<u32, StorageError> {
-        Err(StorageError::DatabaseError(
-            "RemoteBackend not connected".into(),
-        ))
-    }
-    async fn truncate_blocks(&self, _ino: u64, _new_size: u64) -> Result<(), StorageError> {
-        Err(StorageError::DatabaseError(
-            "RemoteBackend not connected".into(),
-        ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_storage_error_to_libc_errno() {
-        assert_eq!(libc::c_int::from(StorageError::NotFound), libc::ENOENT);
-        assert_eq!(libc::c_int::from(StorageError::AlreadyExists), libc::EEXIST);
-        assert_eq!(libc::c_int::from(StorageError::NotEmpty), libc::ENOTEMPTY);
-        assert_eq!(
-            libc::c_int::from(StorageError::InvalidArgument("test".into())),
-            libc::EINVAL
-        );
-        assert_eq!(
-            libc::c_int::from(StorageError::DatabaseError("db error".into())),
-            libc::EIO
-        );
-    }
-
-    #[test]
-    fn test_file_kind_conversion() {
-        assert_eq!(
-            fuser::FileType::from(FileKind::File),
-            fuser::FileType::RegularFile
-        );
-        assert_eq!(
-            fuser::FileType::from(FileKind::Directory),
-            fuser::FileType::Directory
-        );
-        assert_eq!(
-            fuser::FileType::from(FileKind::Symlink),
-            fuser::FileType::Symlink
-        );
-    }
-
-    #[test]
-    fn test_prepare_sparse_block_write_zero_padding() {
-        // Write 4 bytes at offset 10 into a brand new block
-        let payload = [1u8, 2, 3, 4];
-        let block = prepare_sparse_block_write(None, 10, &payload);
-
-        assert_eq!(block.len(), 14);
-        assert_eq!(&block[0..10], &[0u8; 10]); // Preceding bytes are zero-padded
-        assert_eq!(&block[10..14], &[1u8, 2, 3, 4]); // Payload copied at offset
-    }
-
-    #[test]
-    fn test_prepare_sparse_block_write_overwrite_existing() {
-        let existing = vec![9u8; 20];
-        let payload = [5u8, 6, 7];
-        let block = prepare_sparse_block_write(Some(existing), 5, &payload);
-
-        assert_eq!(block.len(), 20);
-        assert_eq!(&block[0..5], &[9u8; 5]);
-        assert_eq!(&block[5..8], &[5u8, 6, 7]);
-        assert_eq!(&block[8..20], &[9u8; 12]);
-    }
-
-    #[test]
-    fn test_remote_backend_unimplemented_stubs() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let remote = RemoteBackend::new("postgresql://localhost:5432/test");
-            assert!(remote.getattr(1).await.is_err());
-            assert!(remote.lookup(1, "file.txt").await.is_err());
-            assert_eq!(remote.readdir(1, 0).await.unwrap().len(), 0);
-        });
+    /// The database backend pid serving this backend, for logs and the
+    /// state dump (0 when there is none).
+    fn backend_pid(&self) -> i32 {
+        0
     }
 }

@@ -1,48 +1,35 @@
 # How-To: Dual-Interface Architecture
 
-!!! danger "Status: Planned, not implemented"
-    The `PgfsBackend` trait, its error mapping and an inode-keyed implementation on `Db` exist and are unit-tested, but the FUSE layer does not route through them yet. `RemoteBackend` is a stub, the `pgrx` engine and the `io_uring` transport are at the design stage, and there is no `--backend` option.
+!!! warning "Status: Partially implemented"
+    The FUSE layer reaches storage only through the synchronous `PgfsBackend` trait. `PgBackend` (tokio-postgres, one connection per worker, LSN tickets pipelined in the same round trip) is the remote engine, and the reference model in `tests/model/` implements the same trait. The pgrx engine waits on its measurement condition and the io_uring transport on crate support.
 
-> pgfs features a Dual-Interface Storage Architecture providing a sub-100µs Local In-Process Engine (`pgrx` + zero SQL parsing + `io_uring` zero copy) and a scalable Remote Async Network Engine (`tokio-postgres` + pipelining).
+> Two storage engines sit behind one interface: a planned local engine that runs inside PostgreSQL and sends no SQL text on the hot path, and a planned remote engine that pipelines queries over the network. The FUSE layer talks only to the interface, so the engine is chosen at startup.
 
 [Tutorial](../tutorials/dualinterfacearchitecture.md) · **How-to** · [Reference](../reference/dualinterfacearchitecture.md) · [Explanation](../explanation/dualinterfacearchitecture.md)
 
 ---
 
-## Choose a backend at startup
-
-Not available yet. There is no `--backend` option; the daemon
-always uses the in-process `Db` client over libpq.
-
 ## Add an operation to the storage interface
 
-1. Add an `async fn` to `PgfsBackend` in `src/backend.rs`. If
-   not every backend can support it, give it a default body
-   that returns `StorageError::InvalidArgument`, as
-   `copy_file_range` and `fallocate` do.
-2. Implement it for `Db` in `db::backend_impl` (`src/db.rs`).
-3. Forward it in `impl PgfsBackend for LocalBackend`.
-4. Add a stub to `RemoteBackend`.
-5. Add a test next to `tests_offload` in `src/db.rs`.
+1. Write the `pgfs.*` SQL function in `sql/v1/` (a new migration for a
+   released schema).
+2. Add the method to `PgfsBackend` in `src/backend.rs`.
+3. Implement it in `PgBackend` (`src/pg.rs`): prepare the statement in
+   `statements()` and call it through `mutate` or `read`.
+4. Implement it in the reference model (`tests/model/mod.rs`).
+5. Add the operation to the model-conformance generator.
 
 ## Report a storage failure with the right errno
 
-Return the matching `StorageError` variant and convert it with
-`libc::c_int::from(err)` when replying to the kernel. Use
-`DatabaseError` (→ `EIO`) only for failures that are not a
-normal answer, and log those with their full context.
+Raise `PF0xx` from SQL (the codes are listed at the top of
+`sql/v1/10_core.sql`); `src/errno.rs` maps every SQLSTATE in one table.
 
 ## Run only the backend tests
 
 ```bash
-cargo test backend
+cargo test --test storage --test model_conformance
+cargo test --features fault-injection --test fault_injection
 ```
-
-## Follow the design
-
-The full design, including the shared-memory protocol and the
-`io_uring` data path, is in
-`design/dual_interface_architecture.md`.
 
 ---
 

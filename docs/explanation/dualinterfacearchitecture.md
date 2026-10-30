@@ -1,9 +1,9 @@
 # Explanation: Dual-Interface Architecture
 
-!!! danger "Status: Planned, not implemented"
-    The `PgfsBackend` trait, its error mapping and an inode-keyed implementation on `Db` exist and are unit-tested, but the FUSE layer does not route through them yet. `RemoteBackend` is a stub, the `pgrx` engine and the `io_uring` transport are at the design stage, and there is no `--backend` option.
+!!! warning "Status: Partially implemented"
+    The FUSE layer reaches storage only through the synchronous `PgfsBackend` trait. `PgBackend` (tokio-postgres, one connection per worker, LSN tickets pipelined in the same round trip) is the remote engine, and the reference model in `tests/model/` implements the same trait. The pgrx engine waits on its measurement condition and the io_uring transport on crate support.
 
-> pgfs features a Dual-Interface Storage Architecture providing a sub-100µs Local In-Process Engine (`pgrx` + zero SQL parsing + `io_uring` zero copy) and a scalable Remote Async Network Engine (`tokio-postgres` + pipelining).
+> Two storage engines sit behind one interface: a planned local engine that runs inside PostgreSQL and sends no SQL text on the hot path, and a planned remote engine that pipelines queries over the network. The FUSE layer talks only to the interface, so the engine is chosen at startup.
 
 [Tutorial](../tutorials/dualinterfacearchitecture.md) · [How-to](../how-to/dualinterfacearchitecture.md) · [Reference](../reference/dualinterfacearchitecture.md) · **Explanation**
 
@@ -11,59 +11,39 @@
 
 ## Two very different places to run
 
-pgfs is used in two settings with opposite constraints. On a
-single machine, the database is local and the dominant costs
-are the overheads around each query: building SQL text,
-parsing and planning it, and copying bytes between the kernel,
-the daemon and PostgreSQL. Over a network, a round-trip costs
-far more than any of that, and what matters is sending fewer
-of them: pipelining, batching and replicas.
+pgfs is used in two settings with opposite constraints. On a single
+machine the database is local, and the dominant costs are the overheads
+around each query: protocol framing, parsing and copying. Over a
+network a round trip costs far more than any of that, and what matters
+is sending fewer of them: pipelining, batching and replicas.
 
-One engine cannot be optimal for both. The dual-interface
-design gives each its own engine behind one interface.
+One engine cannot be optimal for both. The dual-interface design gives
+each its own engine behind one interface.
 
-## The local engine: no SQL on the hot path
+## The remote engine, built
 
-The planned local engine runs inside PostgreSQL itself, as a
-background worker written with `pgrx`. The FUSE daemon passes
-it compact binary requests over a shared-memory queue, and the
-worker executes pre-planned statements with binary parameters,
-so no SQL text is formatted, parsed or planned per operation.
-With `io_uring` buffer rings, file data could travel from the
-kernel into memory the worker reads directly, without
-intermediate copies. The target is operation latency under
-100 µs.
+`PgBackend` is an ordinary out-of-process client built on
+`tokio-postgres`. Each dispatch worker owns one connection for its
+whole life, prepares its statements once, and runs each operation as
+one call to a `pgfs.*` function, so the number of connections per mount
+is fixed and each operation is one round trip. Reads may go to a
+standby under the read tickets of [Replicated
+Storage](replicated_filesystem.md).
 
-## The remote engine: fewer round-trips
+## The local engine, planned
 
-The planned remote engine is an ordinary out-of-process client
-built on `tokio-postgres`. It pipelines queries over each
-connection, uses a connection pool, and reuses the replica
-freshness cache from [Replicated
-Storage](replicated_filesystem.md). It suits mounts where the
-database is on another host.
+A local engine would run inside PostgreSQL as a `pgrx` background
+worker, executing the same `pgfs.*` functions from pre-planned
+statements with binary arguments. It is justified only if a benchmark
+shows socket and protocol overhead still dominating after round trips
+and concurrency were dealt with, and only once the blast radius of a
+crashing background worker (a postmaster restart) is contained.
 
-## Why a trait comes first
+## Why a trait
 
-Both engines need the FUSE layer to stop speaking SQL-shaped
-paths and start speaking inode-shaped operations. The
-`PgfsBackend` trait is that contract. It also forces the error
-model into the open: a backend reports `NotFound` or
-`DatabaseError`, and one place decides which errno the kernel
-sees. Building the trait and an inode-keyed implementation
-first, with tests, makes the eventual switch-over a mechanical
-change in `fs.rs` rather than a rewrite.
-
-## What stands in the way
-
-The running FUSE path stores data keyed by path, with 64 KiB
-blocks, and leaves the inode columns at their defaults. The
-backend implementation expects real inode links and uses
-128 KiB blocks. Moving the FUSE layer onto the trait therefore
-also means migrating the schema
-(`InoBasedRekeyingReq` in [Performance
-Optimizations](optimizationroadmap.md)) and settling on one
-block size.
+The `PgfsBackend` trait makes the FUSE layer speak inode-shaped
+operations, and puts the error model in one place. It is also what lets
+the reference model stand in for the database in tests.
 
 ---
 

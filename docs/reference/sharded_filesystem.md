@@ -1,7 +1,7 @@
 # Reference: Sharded Filesystem
 
 !!! danger "Status: Planned, not implemented"
-    Specified and designed (`design/sharded_filesystem.md`), not implemented. The daemon does not accept `--shards` or `--replication-factor`, and `scripts/shard_db.sh` does not exist yet. The tutorial and how-to describe the intended interface.
+    Superseded, not implemented. These requirements describe the v0.1 design (`design/sharded_filesystem-v0.1.md`): quorum fan-out, client-sequenced versions and hashing by top-level name, all of which the literature review advises against. The v0.2 design in `design/sharded_filesystem.md` replaces it, with one metadata database plus data sets replicated by Postgres. This module will be rewritten to v0.2 once the single-machine filesystem is complete (`design/design-decisions.md`, topic 10).
 
 > A pgfs mount can be backed by N independent Postgres host nodes with RAID-5-like subset replication: each directory subtree is pinned to a replication set of R of the N hosts (never a full mirror on every host). Writes fan out to every member of the set; reads consult a quorum and return the newest version. Any number of clients can mount the same namespace from different machines and add files to one shared tree, and a host failure degrades reads and writes to the remaining healthy members without stale or corrupt data.
 

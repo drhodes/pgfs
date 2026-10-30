@@ -20,6 +20,7 @@ cd "$(dirname "$0")/.."
 ROOT="$PWD"
 TESTDATA="$ROOT/testdata"
 MOUNT="${PGFS_MOUNT:-$TESTDATA/mnt}"
+export PGFS_CONN="${PGFS_CONN:-host=$TESTDATA dbname=pgfs}"
 PIDFILE="$TESTDATA/pgfs.pid"
 LOG="$TESTDATA/pgfs.log"
 PGDATA="$TESTDATA/pgdata"
@@ -44,7 +45,7 @@ start_daemon() {
     rm -f "$PIDFILE"
     mkdir -p "$MOUNT"
     echo "pgfs:      starting (log: $LOG)"
-    setsid nohup "$ROOT/target/debug/pgfs" "$MOUNT" >>"$LOG" 2>&1 &
+    setsid nohup "$ROOT/target/debug/pgfs" mount main "$MOUNT" >>"$LOG" 2>&1 &
     echo $! > "$PIDFILE"
 }
 
@@ -132,7 +133,7 @@ cmd_run() {
     ensure_db
     cargo build --quiet
     echo "running pgfs in foreground at $MOUNT (Ctrl+C to quit)"
-    exec "$ROOT/target/debug/pgfs" "$MOUNT"
+    exec "$ROOT/target/debug/pgfs" mount main "$MOUNT"
 }
 
 case "${1:-}" in

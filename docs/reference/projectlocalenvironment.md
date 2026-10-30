@@ -1,7 +1,7 @@
 # Reference: Project-Local Development Environment
 
-!!! success "Status: Stable"
-    Everything on this page ships today: `scripts/init_db.sh`, `scripts/pgfs.sh`, the Makefile targets and the integration suite in `scripts/test_*.sh`.
+!!! warning "Status: Partially implemented"
+    `scripts/init_db.sh` creates the cluster with `--data-checksums`, checks `fsync` and `full_page_writes`, and formats the `pgfs` database with `pgfs mkfs`; `scripts/pgfs.sh`, the Makefile targets and the integration suite drive the mount, and `run_tests.sh` runs `pgfs check` after every test. The `--lazyfs` mode needs LazyFS installed and is not yet exercised by the suite.
 
 > A contributor goes from a fresh clone to a live pgfs mount with one command. The Postgres cluster, the mount point, the logs and the pid files all live under the project's `testdata/` directory, so nothing touches a system-wide Postgres and `rm -rf testdata` is a full reset.
 
@@ -9,101 +9,31 @@
 
 ---
 
-## Toolchain
-
-| Tool | Provided by `nix develop` | Used for |
-|---|---|---|
-| `rustc`, `cargo`, `clippy`, `rustfmt` | yes | building and checking the daemon |
-| PostgreSQL server binaries (`initdb`, `pg_ctl`, `psql`, `createdb`) | yes (PostgreSQL 17) | the project-local cluster |
-| FUSE 3 (`fusermount3`, headers, `pkg-config`) | yes | mounting |
-| Docker | no | replicated mode only (`scripts/replica_db.sh`) |
-| `uv` | no | the libspec specification and this documentation |
-
-## `testdata/` layout
-
-| Path | Contents |
-|---|---|
-| `testdata/pgdata/` | PostgreSQL cluster created by `init_db.sh` |
-| `testdata/.s.PGSQL.5432` | PostgreSQL Unix socket |
-| `testdata/postgres.log` | PostgreSQL server log |
-| `testdata/mnt/` | default mount point |
-| `testdata/pgfs.pid` | PID of the daemon started by `pgfs.sh up` |
-| `testdata/pgfs.log` | daemon stdout and stderr (appended) |
-| `testdata/<test>.log` | output of each integration test |
-| `testdata/bench-pgfs.log`, `testdata/bench.pid` | `bench_profile.sh` daemon log and PID |
-
-`testdata/` is git-ignored.
-
-## Project-local cluster
-
-| Setting | Value |
-|---|---|
-| Data directory | `testdata/pgdata` |
-| `initdb` flags | `--auth=trust --no-locale --encoding=UTF8` |
-| Listen addresses | Unix socket in `testdata/`; TCP `127.0.0.1:5432` |
-| Authentication | `trust` for local and loopback connections |
-| Roles | bootstrap superuser (owner of `pgdata`); a `SUPERUSER` role named after the invoking OS user if different |
-| Database | `pgfs` |
-| Daemon default `--conn` | `host=<current working directory>/testdata dbname=pgfs` |
-
-The default `--conn` is derived from the daemon's working
-directory. Started from anywhere other than the repository
-root, it needs an explicit `--conn`.
-
 ## Scripts
 
-| Script | Purpose |
+| Script | Does |
 |---|---|
-| `scripts/init_db.sh` | create (if absent) and start the cluster; create role and database |
-| `scripts/ensure_db.sh` | exit 0 if the cluster answers, otherwise run `init_db.sh` |
-| `scripts/pgfs.sh up` | start Postgres if needed, `cargo build`, sweep a stale mount, start the daemon, wait up to 10 s for the mount |
-| `scripts/pgfs.sh down` | SIGTERM the daemon, wait up to 10 s, then `fusermount3 -u`, then report holders and lazy-unmount |
-| `scripts/pgfs.sh status` | report mount, daemon and Postgres state; warn about ghost mounts |
-| `scripts/pgfs.sh run` | build and exec the daemon in the foreground |
-| `scripts/run_tests.sh` | run every integration test in isolation (300 s timeout each) |
-| `scripts/test_*.sh` | individual integration tests; `test_lib.sh` is the shared harness |
-| `scripts/replica_db.sh` | manage the Docker streaming standby (see [Replicated Storage](replicated_filesystem.md)) |
-| `scripts/bench_profile.sh` | profiled benchmark (see [On-Demand Profiling](ondemandprofiling.md)) |
-| `scripts/build_docs.py` | regenerate `docs/` and the `mkdocs.yml` navigation from `spec/` |
+| `scripts/init_db.sh [--lazyfs]` | create and start the cluster in `testdata/pgdata` (`--data-checksums`, socket in `testdata/`, TCP on 127.0.0.1), check `fsync` and `full_page_writes`, create and `pgfs mkfs` the `pgfs` database, print the connection string |
+| `scripts/ensure_db.sh` | `init_db.sh` unless the cluster already answers |
+| `scripts/pgfs.sh up\|down\|status\|run` | mount lifecycle, with stale-mount sweeping and escalating unmount |
+| `scripts/run_tests.sh` | every `scripts/test_*.sh` under a 300 s timeout, then `pgfs check` |
 
-## Integration tests
+## Files
 
-| Test | Covers |
+| Path | Holds |
 |---|---|
-| `test_append.sh` | `O_APPEND` offset and size correctness |
-| `test_copy_performance.sh` | end-to-end copy throughput |
-| `test_dirs.sh` | deep nesting, listing, `rmdir` semantics |
-| `test_git_init.sh` | `git init` inside the mount |
-| `test_integrity.sh` | create/write/unlink chains |
-| `test_rename.sh` | rename-overwrite with POSIX semantics |
-| `test_replica.sh` | replicated mode end to end |
-| `test_truncate.sh` | truncate and extend semantics |
+| `testdata/pgdata` | the cluster |
+| `testdata/postgres.log` | the server log |
+| `testdata/mnt` | the default mount point |
+| `testdata/pgfs.log` | the daemon log from `pgfs.sh up` |
+| `testdata/<test>.log` | each integration test's output |
 
-## Make targets
+## Environment
 
-| Target | Action |
+| Variable | Default |
 |---|---|
-| `make up` / `down` / `status` / `run` | `scripts/pgfs.sh` equivalents |
-| `make build` / `check` / `clippy` / `fmt` | `cargo build` / `check` / `clippy` / `fmt` |
-| `make test` | `ensure_db.sh`, then `cargo test` |
-| `make test-integration` | `scripts/run_tests.sh` |
-| `make init-db` | `scripts/init_db.sh` |
-| `make db-stop` | `pg_ctl -D testdata/pgdata stop` |
-| `make shell` | `nix develop` |
-| `make clean` | `cargo clean` |
-
-Every target except `down`, `status`, `db-stop`, `shell` and
-`clean` requires the Nix shell (`PGFS_ROOT` set).
-
-## Environment variables
-
-| Variable | Read by | Effect |
-|---|---|---|
-| `PGFS_MOUNT` | `pgfs.sh` | mount point (default `testdata/mnt`) |
-| `PGFS_ROOT` | `Makefile` | set by the Nix shell; `make` refuses to run without it |
-| `RUST_LOG` | daemon | log filter, e.g. `pgfs=debug` (default `pgfs=info`) |
-| `RUST_LOG_FORMAT` | daemon | `json` for newline-delimited JSON logs |
-| `RUST_BACKTRACE` | daemon | backtrace detail in crash reports |
+| `PGFS_CONN` | `host=<repo>/testdata dbname=pgfs` |
+| `PGFS_MOUNT` | `testdata/mnt` |
 
 
 ## Specification requirements
@@ -114,13 +44,22 @@ Every target except `down`, `status`, `db-stop`, `shell` and
     `spec.app.ProvidesProjectLocalCluster`
 
     `scripts/init_db.sh` creates a PostgreSQL cluster at
-    `testdata/pgdata` (`initdb --auth=trust --no-locale --encoding=UTF8`)
-    and starts it with its Unix socket in `testdata/` and a TCP listener on
-    127.0.0.1 only. It ensures a superuser role named after the invoking OS
-    user and a database named `pgfs` exist, and prints the connection
-    string. `scripts/ensure_db.sh` is the idempotent wrapper used by
-    `make test`: it exits immediately when the cluster already answers.
+    `testdata/pgdata`, with
+    `initdb --auth=trust --no-locale --encoding=UTF8 --data-checksums`.
+    It starts the cluster with its Unix socket in `testdata/` and a TCP
+    listener on 127.0.0.1 only, and checks that `fsync` and
+    `full_page_writes` are on. It ensures that a superuser role named
+    after the invoking OS user and a database named `pgfs` exist, runs
+    `pgfs mkfs` if the database is unformatted, and prints the
+    connection string.
+
+    `scripts/ensure_db.sh` is the idempotent wrapper used by
+    `make test`: it exits at once when the cluster already answers.
+    `init_db.sh --lazyfs` puts the data directory on LazyFS, so that
+    crash conformance can run locally (`verify.CrashConformance`).
     Nothing is written outside the project's `testdata/` directory.
+
+    **Sources.** LazyFS r135, protocol-aware recovery r94.
 
 ??? abstract "ProvidesLifecycleScript"
     `spec.app.ProvidesLifecycleScript`
@@ -143,17 +82,39 @@ Every target except `down`, `status`, `db-stop`, `shell` and
     isolation under a 300 s timeout, writing each test's output to
     `testdata/<test>.log`. After every test it kills any leftover daemon
     and lazily unmounts `testdata/mnt` so the next test starts clean. It
-    prints PASS/FAIL per test and exits non-zero if any test failed.
+    then runs `pgfs check`, and a violation fails the test
+    (`verify.CheckAfterEveryTest`). It prints PASS or FAIL per test and
+    exits non-zero if any test failed. This shell layer is the base. The
+    model, crash and fault suites in `verify.py` find the bug classes it
+    cannot.
 
 ??? abstract "ConnectsToPostgres"
     `spec.app.ConnectsToPostgres`
 
-    The daemon connects to a Postgres database via a libpq connection
-    string. On first connect it creates the `entries` table (ino, parent_ino,
-    parent, name, kind, size, mode, uid, gid, atime, mtime, ctime) and
-    `blocks` table (ino, parent, name, block_no, data) if they do not
-    already exist. Connection failure produces a full error story
-    including the connection string and the root cause.
+    The daemon connects to Postgres with a libpq connection string
+    from `--conn` or `PGFS_CONN`, with the timeouts and keepalives of
+    `failure.BoundsEveryWait`, and requires session-mode connections
+    (`failure.RevalidatesAfterReconnect`). Before mounting, in one round
+    trip, it checks:
+
+    - the server version (`ops.SupportedPostgresVersions`);
+    - the server's durability settings
+      (`durability.ChecksServerDurability`);
+    - the schema version (`storage.SchemaVersion`).
+
+    It never creates or alters tables (`ops.RefusesUnformattedDatabase`;
+    on a scratch filesystem whose unlogged tables were wiped by a crash,
+    it calls `pgfs.scratch_reset()`, `durability.ScratchMode`). Then it
+    registers its mount session or acquires the tree's lease
+    (`consistency.ExclusiveTreeLease`).
+
+    **Errors.** A connection failure exits with status 2 and a full
+    error chain: the operation, the host and database, and the root
+    cause. The connection string is redacted (`security.RedactsSecrets`).
+
+    The schema is `storage.StorageLayout`. The first schema, the
+    path-keyed `entries` and `blocks` tables created implicitly at
+    mount, is retired.
 
 ---
 

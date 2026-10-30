@@ -100,6 +100,8 @@
     creation (round-trip bound) — each wrapped in a SIGUSR2 start/stop pair.
     The bottleneck shows up as CPU time in the flamegraph rather than as
     wall-clock guesswork, and the span trace attributes FUSE vs DB time.
+    This script is for finding where time goes. Comparable measurements
+    over time are `BenchmarkSuite`'s job.
 
 ---
 

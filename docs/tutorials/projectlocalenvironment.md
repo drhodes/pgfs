@@ -1,7 +1,7 @@
 # Tutorial: Project-Local Development Environment
 
-!!! success "Status: Stable"
-    Everything on this page ships today: `scripts/init_db.sh`, `scripts/pgfs.sh`, the Makefile targets and the integration suite in `scripts/test_*.sh`.
+!!! warning "Status: Partially implemented"
+    `scripts/init_db.sh` creates the cluster with `--data-checksums`, checks `fsync` and `full_page_writes`, and formats the `pgfs` database with `pgfs mkfs`; `scripts/pgfs.sh`, the Makefile targets and the integration suite drive the mount, and `run_tests.sh` runs `pgfs check` after every test. The `--lazyfs` mode needs LazyFS installed and is not yet exercised by the suite.
 
 > A contributor goes from a fresh clone to a live pgfs mount with one command. The Postgres cluster, the mount point, the logs and the pid files all live under the project's `testdata/` directory, so nothing touches a system-wide Postgres and `rm -rf testdata` is a full reset.
 
@@ -9,28 +9,9 @@
 
 ---
 
-In this tutorial we will go from a fresh checkout to a mounted
-pgfs filesystem, store a file in it, find that file as rows in
-PostgreSQL, and take everything down again. It takes about five
-minutes, most of which is the first compile.
-
-All commands run from the root of the repository.
-
-## Before we start
-
-pgfs asks the kernel to remove its mount automatically if the
-daemon ever dies. Unprivileged users may only do that when
-`/etc/fuse.conf` allows it. Check:
-
-```bash
-grep '^user_allow_other' /etc/fuse.conf
-```
-
-If that prints nothing, enable it once:
-
-```bash
-sudo sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf
-```
+In this tutorial we will go from a fresh clone to a mounted pgfs
+filesystem, write a file, find it in PostgreSQL, and take everything
+down again. Everything lives under `testdata/`.
 
 ## Step 1: enter the development shell
 
@@ -38,37 +19,18 @@ sudo sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf
 nix develop
 ```
 
-The shell prints a banner with the Rust, PostgreSQL and FUSE
-versions it provides. Everything that follows uses those tools.
-
-## Step 2: bring the filesystem up
+## Step 2: bring it up
 
 ```bash
 ./scripts/pgfs.sh up
 ```
 
-The first run creates a PostgreSQL cluster in `testdata/pgdata`,
-compiles pgfs, and mounts it. The last lines look like this:
+This creates the cluster in `testdata/pgdata` (with data checksums),
+starts it on a Unix socket in `testdata/` and on 127.0.0.1, formats the
+`pgfs` database with `pgfs mkfs`, builds the binary and mounts the tree
+`main` at `testdata/mnt`.
 
-```text
-pgfs:      starting (log: /path/to/pgfs/testdata/pgfs.log)
-mounted:   /path/to/pgfs/testdata/mnt
-postgres:  PostgreSQL 17.10 on
-```
-
-Ask the script what is running:
-
-```bash
-./scripts/pgfs.sh status
-```
-
-```text
-mount:     active
-daemon:    running (pid 1519591)
-postgres:  running
-```
-
-## Step 3: store a file
+## Step 3: write a file
 
 ```bash
 mkdir testdata/mnt/tutorial
@@ -82,32 +44,20 @@ hello from a database
 
 ## Step 4: find the file in PostgreSQL
 
-The file we just wrote is a row in the `entries` table:
-
 ```bash
 psql -h "$PWD/testdata" -d pgfs -c \
-  "SELECT parent, name, kind, size FROM entries WHERE parent = 'tutorial'"
+  "SELECT path, ino, kind, size FROM pgfs.files WHERE tree = 'main' AND path LIKE '/tutorial%'"
 ```
 
 ```text
-  parent  |   name    | kind | size
-----------+-----------+------+------
- tutorial | hello.txt | file |   22
+        path         | ino | kind | size
+---------------------+-----+------+------
+ /tutorial           |   2 | d    |    0
+ /tutorial/hello.txt |   3 | f    |   22
 ```
 
-Its 22 bytes of content are a row in the `blocks` table:
-
-```bash
-psql -h "$PWD/testdata" -d pgfs -c \
-  "SELECT name, block_no, convert_from(data, 'UTF8') FROM blocks WHERE parent = 'tutorial'"
-```
-
-```text
-   name    | block_no |     convert_from
------------+----------+-----------------------
- hello.txt |        0 | hello from a database+
-           |          |
-```
+A file this small lives inside its inode row
+([Storage Layout](storagelayout.md)).
 
 ## Step 5: take it down
 
@@ -123,14 +73,10 @@ daemon:    not running
 postgres:  running
 ```
 
-PostgreSQL keeps running so the next `up` is quick.
-
 ## What we did
 
-We built pgfs, mounted it, wrote a file through the ordinary
-filesystem interface, and saw the same data as rows in two SQL
-tables. Next, the [Regular Files](flat_filesystem.md) tutorial
-explores reading, writing and truncating files in more depth.
+We built a private PostgreSQL, formatted it, mounted it, and saw a file
+become rows. `rm -rf testdata` undoes all of it.
 
 ---
 
