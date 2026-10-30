@@ -39,6 +39,9 @@ Run the daemon as root: files must be owned by root inside the tree, and
 
 ### Boot a machine with root on pgfs (sketch)
 
+The full plan, with what is missing and the order to try it in, is in
+[Booting an OS on bare metal from pgfs](bare-metal-root.md).
+
 1. Keep `/boot` (kernel and initramfs) on a local disk or on the network.
 2. In the initramfs: bring up networking, then run
    `pgfs mount os /sysroot --allow-other --suid` (the booted system mounts
